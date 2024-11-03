@@ -61,7 +61,7 @@ blocks:
   id: variable
   parameters:
     comment: ''
-    value: 76.8e6
+    value: 64e6
   states:
     bus_sink: false
     bus_source: false
@@ -173,7 +173,7 @@ blocks:
     is_continuous: 'True'
     marching_periods: 'True'
     metadata: '{}'
-    min_chunksize: '512'
+    min_chunksize: '128'
     nchan: '1'
     sample_rate_denominator: '1'
     sample_rate_numerator: int(samp_rate)

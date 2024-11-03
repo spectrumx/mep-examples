@@ -85,7 +85,7 @@ blocks:
   id: variable
   parameters:
     comment: ''
-    value: 76.8e6
+    value: 32e6
   states:
     bus_sink: false
     bus_source: false
@@ -142,7 +142,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [496, 184.0]
+    coordinate: [520, 184.0]
     rotation: 0
     state: enabled
 - name: blocks_message_debug_1
@@ -198,7 +198,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [272, 176.0]
+    coordinate: [344, 176.0]
     rotation: 0
     state: enabled
 - name: network_udp_source_0_0
@@ -392,11 +392,11 @@ blocks:
     affinity: ''
     alias: ''
     comment: ''
-    decim: '400'
+    decim: '1000'
     fbw: '0'
-    interp: '1'
-    maxoutbuf: '66048'
-    minoutbuf: '8192'
+    interp: '3'
+    maxoutbuf: '8191'
+    minoutbuf: '0'
     taps: '[]'
     type: ccc
   states:
