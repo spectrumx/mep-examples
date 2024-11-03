@@ -81,14 +81,14 @@ blocks:
     coordinate: [344, 4.0]
     rotation: 0
     state: enabled
-- name: blocks_interleaved_short_to_complex_0
+- name: blocks_interleaved_short_to_complex_0_0
   id: blocks_interleaved_short_to_complex
   parameters:
     affinity: ''
     alias: ''
     comment: ''
-    maxoutbuf: '0'
-    minoutbuf: '0'
+    maxoutbuf: '66048'
+    minoutbuf: '8192'
     scale_factor: '32767'
     swap: 'False'
     vector_input: 'True'
@@ -96,28 +96,10 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [648, 180.0]
+    coordinate: [496, 192.0]
     rotation: 0
     state: enabled
-- name: blocks_stream_to_vector_0
-  id: blocks_stream_to_vector
-  parameters:
-    affinity: ''
-    alias: ''
-    comment: ''
-    maxoutbuf: '0'
-    minoutbuf: '0'
-    num_items: '2'
-    type: short
-    vlen: '1'
-  states:
-    bus_sink: false
-    bus_source: false
-    bus_structure: null
-    coordinate: [232, 192.0]
-    rotation: 0
-    state: enabled
-- name: blocks_throttle2_0
+- name: blocks_throttle2_0_0
   id: blocks_throttle2
   parameters:
     affinity: ''
@@ -126,8 +108,8 @@ blocks:
     ignoretag: 'True'
     limit: auto
     maximum: '0.1'
-    maxoutbuf: '0'
-    minoutbuf: '0'
+    maxoutbuf: '16384'
+    minoutbuf: '8192'
     samples_per_second: samp_rate
     type: short
     vlen: '2'
@@ -135,10 +117,10 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [424, 172.0]
+    coordinate: [272, 184.0]
     rotation: 0
     state: enabled
-- name: network_udp_source_0
+- name: network_udp_source_0_0
   id: network_udp_source
   parameters:
     affinity: ''
@@ -146,19 +128,19 @@ blocks:
     comment: ''
     header: '0'
     ipv6: 'False'
-    maxoutbuf: 2*int(samp_rate)
-    minoutbuf: int(samp_rate)
+    maxoutbuf: '16384'
+    minoutbuf: '8192'
     notify_missed: 'True'
     payloadsize: packet_size
     port: '60133'
     src_zeros: 'False'
     type: short
-    vlen: '1'
+    vlen: '2'
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [0, 156.0]
+    coordinate: [0, 160.0]
     rotation: 0
     state: true
 - name: qtgui_freq_sink_x_0
@@ -239,7 +221,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [952, 348.0]
+    coordinate: [808, 360.0]
     rotation: 0
     state: enabled
 - name: qtgui_time_sink_x_0
@@ -336,7 +318,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [952, 252.0]
+    coordinate: [808, 272.0]
     rotation: 0
     state: enabled
 - name: qtgui_waterfall_sink_x_0
@@ -397,7 +379,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [952, 172.0]
+    coordinate: [808, 184.0]
     rotation: 0
     state: true
 - name: tab_widget
@@ -436,12 +418,11 @@ blocks:
     state: enabled
 
 connections:
-- [blocks_interleaved_short_to_complex_0, '0', qtgui_freq_sink_x_0, '0']
-- [blocks_interleaved_short_to_complex_0, '0', qtgui_time_sink_x_0, '0']
-- [blocks_interleaved_short_to_complex_0, '0', qtgui_waterfall_sink_x_0, '0']
-- [blocks_stream_to_vector_0, '0', blocks_throttle2_0, '0']
-- [blocks_throttle2_0, '0', blocks_interleaved_short_to_complex_0, '0']
-- [network_udp_source_0, '0', blocks_stream_to_vector_0, '0']
+- [blocks_interleaved_short_to_complex_0_0, '0', qtgui_freq_sink_x_0, '0']
+- [blocks_interleaved_short_to_complex_0_0, '0', qtgui_time_sink_x_0, '0']
+- [blocks_interleaved_short_to_complex_0_0, '0', qtgui_waterfall_sink_x_0, '0']
+- [blocks_throttle2_0_0, '0', blocks_interleaved_short_to_complex_0_0, '0']
+- [network_udp_source_0_0, '0', blocks_throttle2_0_0, '0']
 
 metadata:
   file_format: 1

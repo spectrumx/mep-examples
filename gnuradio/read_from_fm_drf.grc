@@ -11,7 +11,7 @@ options:
     gen_linking: dynamic
     generate_options: qt_gui
     hier_block_src_path: '.:'
-    id: rx_fm
+    id: read_from_fm_drf
     max_nouts: '0'
     output_language: python
     placement: (0,0)
@@ -22,13 +22,13 @@ options:
     run_options: prompt
     sizing_mode: fixed
     thread_safe_setters: ''
-    title: ''
+    title: read_from_drf
     window_size: (1000,1000)
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [0, 4.0]
+    coordinate: [0, 12.0]
     rotation: 0
     state: enabled
 
@@ -42,7 +42,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [520, 4.0]
+    coordinate: [544, 24.0]
     rotation: 0
     state: enabled
 - name: center_f
@@ -54,7 +54,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [168, 4.0]
+    coordinate: [184, 20.0]
     rotation: 0
     state: enabled
 - name: dec_rate
@@ -66,7 +66,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [440, 4.0]
+    coordinate: [456, 20.0]
     rotation: 0
     state: enabled
 - name: packet_size
@@ -78,7 +78,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [248, 4.0]
+    coordinate: [264, 20.0]
     rotation: 0
     state: true
 - name: samp_rate
@@ -90,7 +90,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [344, 4.0]
+    coordinate: [360, 20.0]
     rotation: 0
     state: enabled
 - name: analog_wfm_rcv_0
@@ -107,7 +107,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [1008, 320.0]
+    coordinate: [800, 416.0]
     rotation: 0
     state: enabled
 - name: audio_sink_0
@@ -124,17 +124,17 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [1248, 320.0]
+    coordinate: [1056, 416.0]
     rotation: 0
     state: enabled
-- name: blocks_interleaved_short_to_complex_0
+- name: blocks_interleaved_short_to_complex_0_0
   id: blocks_interleaved_short_to_complex
   parameters:
     affinity: ''
     alias: ''
     comment: ''
-    maxoutbuf: '66048'
-    minoutbuf: '8192'
+    maxoutbuf: '0'
+    minoutbuf: '0'
     scale_factor: '32767'
     swap: 'False'
     vector_input: 'True'
@@ -142,88 +142,127 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [496, 184.0]
+    coordinate: [384, 152.0]
     rotation: 0
     state: enabled
-- name: blocks_message_debug_1
-  id: blocks_message_debug
+- name: gr_digital_rf_digital_rf_source_0
+  id: gr_digital_rf_digital_rf_source
   parameters:
     affinity: ''
     alias: ''
+    channel0: ch0
+    channel1: ch1
+    channel10: ch10
+    channel11: ch11
+    channel12: ch12
+    channel13: ch13
+    channel14: ch14
+    channel15: ch15
+    channel16: ch16
+    channel17: ch17
+    channel18: ch18
+    channel19: ch19
+    channel2: ch2
+    channel20: ch20
+    channel21: ch21
+    channel22: ch22
+    channel23: ch23
+    channel24: ch24
+    channel25: ch25
+    channel26: ch26
+    channel27: ch27
+    channel28: ch28
+    channel29: ch29
+    channel3: ch3
+    channel30: ch30
+    channel31: ch31
+    channel4: ch4
+    channel5: ch5
+    channel6: ch6
+    channel7: ch7
+    channel8: ch8
+    channel9: ch9
     comment: ''
-    en_uvec: 'True'
-    log_level: info
-  states:
-    bus_sink: false
-    bus_source: false
-    bus_structure: null
-    coordinate: [1096, 448.0]
-    rotation: 0
-    state: enabled
-- name: blocks_probe_rate_0
-  id: blocks_probe_rate
-  parameters:
-    affinity: ''
-    alias: ''
-    alpha: '0.15'
-    comment: ''
+    end0: ''
+    end1: ''
+    end10: ''
+    end11: ''
+    end12: ''
+    end13: ''
+    end14: ''
+    end15: ''
+    end16: ''
+    end17: ''
+    end18: ''
+    end19: ''
+    end2: ''
+    end20: ''
+    end21: ''
+    end22: ''
+    end23: ''
+    end24: ''
+    end25: ''
+    end26: ''
+    end27: ''
+    end28: ''
+    end29: ''
+    end3: ''
+    end30: ''
+    end31: ''
+    end4: ''
+    end5: ''
+    end6: ''
+    end7: ''
+    end8: ''
+    end9: ''
+    gapless: 'False'
+    hide_msg_port: 'True'
     maxoutbuf: '0'
+    min_chunksize: '0'
     minoutbuf: '0'
-    mintime: '1000.0'
-    name: ''
-    type: complex
-    vlen: '1'
+    nchan: '1'
+    repeat: 'False'
+    start0: ''
+    start1: ''
+    start10: ''
+    start11: ''
+    start12: ''
+    start13: ''
+    start14: ''
+    start15: ''
+    start16: ''
+    start17: ''
+    start18: ''
+    start19: ''
+    start2: ''
+    start20: ''
+    start21: ''
+    start22: ''
+    start23: ''
+    start24: ''
+    start25: ''
+    start26: ''
+    start27: ''
+    start28: ''
+    start29: ''
+    start3: ''
+    start30: ''
+    start31: ''
+    start4: ''
+    start5: ''
+    start6: ''
+    start7: ''
+    start8: ''
+    start9: ''
+    throttle: 'True'
+    top_level_dir: /mnt/ramdisk/drf_fm_buffer
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [784, 456.0]
+    coordinate: [0, 160.0]
     rotation: 0
     state: enabled
-- name: blocks_throttle2_0
-  id: blocks_throttle2
-  parameters:
-    affinity: ''
-    alias: ''
-    comment: ''
-    ignoretag: 'True'
-    limit: auto
-    maximum: '0.1'
-    maxoutbuf: '16384'
-    minoutbuf: '8192'
-    samples_per_second: samp_rate
-    type: short
-    vlen: '2'
-  states:
-    bus_sink: false
-    bus_source: false
-    bus_structure: null
-    coordinate: [272, 176.0]
-    rotation: 0
-    state: enabled
-- name: network_udp_source_0_0
-  id: network_udp_source
-  parameters:
-    affinity: ''
-    alias: ''
-    comment: ''
-    header: '0'
-    ipv6: 'False'
-    maxoutbuf: '16384'
-    minoutbuf: '8192'
-    notify_missed: 'True'
-    payloadsize: packet_size
-    port: '60133'
-    src_zeros: 'False'
-    type: short
-    vlen: '2'
-  states:
-    bus_sink: false
-    bus_source: false
-    bus_structure: null
-    coordinate: [0, 152.0]
-    rotation: 0
-    state: true
 - name: qtgui_freq_sink_x_0
   id: qtgui_freq_sink_x
   parameters:
@@ -302,11 +341,11 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [784, 176.0]
+    coordinate: [800, 240.0]
     rotation: 0
     state: enabled
-- name: qtgui_freq_sink_x_1
-  id: qtgui_freq_sink_x
+- name: qtgui_waterfall_sink_x_0
+  id: qtgui_waterfall_sink_x
   parameters:
     affinity: ''
     alias: ''
@@ -320,70 +359,50 @@ blocks:
     alpha7: '1.0'
     alpha8: '1.0'
     alpha9: '1.0'
-    autoscale: 'True'
-    average: '1.0'
     axislabels: 'True'
-    bw: audio_samp_rate*2
-    color1: '"blue"'
-    color10: '"dark blue"'
-    color2: '"red"'
-    color3: '"green"'
-    color4: '"black"'
-    color5: '"cyan"'
-    color6: '"magenta"'
-    color7: '"yellow"'
-    color8: '"dark red"'
-    color9: '"dark green"'
+    bw: samp_rate
+    color1: '0'
+    color10: '0'
+    color2: '0'
+    color3: '0'
+    color4: '0'
+    color5: '0'
+    color6: '0'
+    color7: '0'
+    color8: '0'
+    color9: '0'
     comment: ''
-    ctrlpanel: 'True'
-    fc: '0'
-    fftsize: '1024'
+    fc: center_f
+    fftsize: '8192'
     freqhalf: 'True'
     grid: 'False'
     gui_hint: ''
-    label: Relative Gain
+    int_max: '10'
+    int_min: '-140'
     label1: ''
-    label10: ''''''
-    label2: ''''''
-    label3: ''''''
-    label4: ''''''
-    label5: ''''''
-    label6: ''''''
-    label7: ''''''
-    label8: ''''''
-    label9: ''''''
+    label10: ''
+    label2: ''
+    label3: ''
+    label4: ''
+    label5: ''
+    label6: ''
+    label7: ''
+    label8: ''
+    label9: ''
     legend: 'True'
     maxoutbuf: '0'
     minoutbuf: '0'
     name: '""'
     nconnections: '1'
-    norm_window: 'False'
     showports: 'False'
-    tr_chan: '0'
-    tr_level: '0.0'
-    tr_mode: qtgui.TRIG_MODE_FREE
-    tr_tag: '""'
     type: complex
-    units: dB
     update_time: '0.10'
-    width1: '1'
-    width10: '1'
-    width2: '1'
-    width3: '1'
-    width4: '1'
-    width5: '1'
-    width6: '1'
-    width7: '1'
-    width8: '1'
-    width9: '1'
     wintype: window.WIN_BLACKMAN_hARRIS
-    ymax: '10'
-    ymin: '-140'
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [1008, 216.0]
+    coordinate: [800, 144.0]
     rotation: 0
     state: enabled
 - name: rational_resampler_xxx_0
@@ -395,28 +414,26 @@ blocks:
     decim: '400'
     fbw: '0'
     interp: '1'
-    maxoutbuf: '66048'
-    minoutbuf: '8192'
+    maxoutbuf: '0'
+    minoutbuf: '0'
     taps: '[]'
     type: ccc
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [784, 304.0]
+    coordinate: [584, 400.0]
     rotation: 0
     state: enabled
 
 connections:
 - [analog_wfm_rcv_0, '0', audio_sink_0, '0']
-- [blocks_interleaved_short_to_complex_0, '0', blocks_probe_rate_0, '0']
-- [blocks_interleaved_short_to_complex_0, '0', qtgui_freq_sink_x_0, '0']
-- [blocks_interleaved_short_to_complex_0, '0', rational_resampler_xxx_0, '0']
-- [blocks_probe_rate_0, rate, blocks_message_debug_1, print]
-- [blocks_throttle2_0, '0', blocks_interleaved_short_to_complex_0, '0']
-- [network_udp_source_0_0, '0', blocks_throttle2_0, '0']
+- [blocks_interleaved_short_to_complex_0_0, '0', qtgui_freq_sink_x_0, '0']
+- [blocks_interleaved_short_to_complex_0_0, '0', qtgui_waterfall_sink_x_0, '0']
+- [blocks_interleaved_short_to_complex_0_0, '0', rational_resampler_xxx_0, '0']
+- [gr_digital_rf_digital_rf_source_0, '0', blocks_interleaved_short_to_complex_0_0,
+  '0']
 - [rational_resampler_xxx_0, '0', analog_wfm_rcv_0, '0']
-- [rational_resampler_xxx_0, '0', qtgui_freq_sink_x_1, '0']
 
 metadata:
   file_format: 1
