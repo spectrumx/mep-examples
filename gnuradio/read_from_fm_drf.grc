@@ -11,7 +11,7 @@ options:
     gen_linking: dynamic
     generate_options: qt_gui
     hier_block_src_path: '.:'
-    id: read_from_drf
+    id: read_from_fm_drf
     max_nouts: '0'
     output_language: python
     placement: (0,0)
@@ -33,11 +33,23 @@ options:
     state: enabled
 
 blocks:
+- name: audio_samp_rate
+  id: variable
+  parameters:
+    comment: ''
+    value: 96e3
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [544, 24.0]
+    rotation: 0
+    state: enabled
 - name: center_f
   id: variable
   parameters:
     comment: ''
-    value: '0'
+    value: 90.1e6
   states:
     bus_sink: false
     bus_source: false
@@ -81,6 +93,40 @@ blocks:
     coordinate: [360, 20.0]
     rotation: 0
     state: enabled
+- name: analog_wfm_rcv_0
+  id: analog_wfm_rcv
+  parameters:
+    affinity: ''
+    alias: ''
+    audio_decimation: '2'
+    comment: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    quad_rate: audio_samp_rate*2
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [800, 416.0]
+    rotation: 0
+    state: enabled
+- name: audio_sink_0
+  id: audio_sink
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    device_name: plughw:0,0
+    num_inputs: '1'
+    ok_to_block: 'True'
+    samp_rate: int(audio_samp_rate)
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [1056, 416.0]
+    rotation: 0
+    state: enabled
 - name: blocks_interleaved_short_to_complex_0_0
   id: blocks_interleaved_short_to_complex
   parameters:
@@ -96,10 +142,10 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [384, 184.0]
+    coordinate: [384, 152.0]
     rotation: 0
     state: enabled
-- name: gr_digital_rf_digital_rf_source_0_0
+- name: gr_digital_rf_digital_rf_source_0
   id: gr_digital_rf_digital_rf_source
   parameters:
     affinity: ''
@@ -209,12 +255,12 @@ blocks:
     start8: ''
     start9: ''
     throttle: 'True'
-    top_level_dir: /mnt/ramdisk/drf_ring_buffer
+    top_level_dir: /mnt/ramdisk/drf_fm_buffer
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [0, 192.0]
+    coordinate: [0, 160.0]
     rotation: 0
     state: enabled
 - name: qtgui_freq_sink_x_0
@@ -295,10 +341,10 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [800, 272.0]
+    coordinate: [800, 240.0]
     rotation: 0
     state: enabled
-- name: qtgui_waterfall_sink_x_0_0
+- name: qtgui_waterfall_sink_x_0
   id: qtgui_waterfall_sink_x
   parameters:
     affinity: ''
@@ -356,15 +402,38 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [800, 176.0]
+    coordinate: [800, 144.0]
+    rotation: 0
+    state: enabled
+- name: rational_resampler_xxx_0
+  id: rational_resampler_xxx
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    decim: '400'
+    fbw: '0'
+    interp: '1'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    taps: '[]'
+    type: ccc
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [584, 400.0]
     rotation: 0
     state: enabled
 
 connections:
+- [analog_wfm_rcv_0, '0', audio_sink_0, '0']
 - [blocks_interleaved_short_to_complex_0_0, '0', qtgui_freq_sink_x_0, '0']
-- [blocks_interleaved_short_to_complex_0_0, '0', qtgui_waterfall_sink_x_0_0, '0']
-- [gr_digital_rf_digital_rf_source_0_0, '0', blocks_interleaved_short_to_complex_0_0,
+- [blocks_interleaved_short_to_complex_0_0, '0', qtgui_waterfall_sink_x_0, '0']
+- [blocks_interleaved_short_to_complex_0_0, '0', rational_resampler_xxx_0, '0']
+- [gr_digital_rf_digital_rf_source_0, '0', blocks_interleaved_short_to_complex_0_0,
   '0']
+- [rational_resampler_xxx_0, '0', analog_wfm_rcv_0, '0']
 
 metadata:
   file_format: 1

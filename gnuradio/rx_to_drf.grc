@@ -1,0 +1,226 @@
+options:
+  parameters:
+    author: Rainville
+    catch_exceptions: 'True'
+    category: '[GRC Hier Blocks]'
+    cmake_opt: ''
+    comment: ''
+    copyright: ''
+    description: ''
+    gen_cmake: 'On'
+    gen_linking: dynamic
+    generate_options: no_gui
+    hier_block_src_path: '.:'
+    id: rx_to_drf
+    max_nouts: '0'
+    output_language: python
+    placement: (0,0)
+    qt_qss_theme: ''
+    realtime_scheduling: ''
+    run: 'True'
+    run_command: '{python} -u {filename}'
+    run_options: prompt
+    sizing_mode: fixed
+    thread_safe_setters: ''
+    title: ''
+    window_size: (1000,1000)
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [0, 4.0]
+    rotation: 0
+    state: enabled
+
+blocks:
+- name: center_f
+  id: variable
+  parameters:
+    comment: ''
+    value: '0'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [168, 4.0]
+    rotation: 0
+    state: enabled
+- name: packet_size
+  id: variable
+  parameters:
+    comment: ''
+    value: 8192//2
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [248, 4.0]
+    rotation: 0
+    state: true
+- name: samp_rate
+  id: variable
+  parameters:
+    comment: ''
+    value: 76.8e6
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [344, 4.0]
+    rotation: 0
+    state: enabled
+- name: blocks_message_debug_1
+  id: blocks_message_debug
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    en_uvec: 'True'
+    log_level: info
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [800, 328.0]
+    rotation: 0
+    state: enabled
+- name: blocks_probe_rate_0
+  id: blocks_probe_rate
+  parameters:
+    affinity: ''
+    alias: ''
+    alpha: '0.15'
+    comment: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    mintime: '1000.0'
+    name: ''
+    type: short
+    vlen: '2'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [464, 328.0]
+    rotation: 0
+    state: enabled
+- name: blocks_throttle2_0
+  id: blocks_throttle2
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    ignoretag: 'True'
+    limit: auto
+    maximum: '0.1'
+    maxoutbuf: '16384'
+    minoutbuf: '8192'
+    samples_per_second: samp_rate
+    type: short
+    vlen: '2'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [256, 160.0]
+    rotation: 0
+    state: enabled
+- name: gr_digital_rf_digital_rf_sink_0_0
+  id: gr_digital_rf_digital_rf_sink
+  parameters:
+    affinity: ''
+    alias: ''
+    center_freqs: '[center_f]'
+    channel0: ch0
+    channel1: ch1
+    channel10: ch10
+    channel11: ch11
+    channel12: ch12
+    channel13: ch13
+    channel14: ch14
+    channel15: ch15
+    channel16: ch16
+    channel17: ch17
+    channel18: ch18
+    channel19: ch19
+    channel2: ch2
+    channel20: ch20
+    channel21: ch21
+    channel22: ch22
+    channel23: ch23
+    channel24: ch24
+    channel25: ch25
+    channel26: ch26
+    channel27: ch27
+    channel28: ch28
+    channel29: ch29
+    channel3: ch3
+    channel30: ch30
+    channel31: ch31
+    channel4: ch4
+    channel5: ch5
+    channel6: ch6
+    channel7: ch7
+    channel8: ch8
+    channel9: ch9
+    checksum: 'False'
+    comment: ''
+    compression_level: '0'
+    debug: 'False'
+    file_cadence_ms: '1000'
+    ignore_tags: 'False'
+    input: sc16
+    is_continuous: 'True'
+    marching_periods: 'True'
+    metadata: '{}'
+    min_chunksize: '512'
+    nchan: '1'
+    sample_rate_denominator: '1'
+    sample_rate_numerator: int(samp_rate)
+    start: '''now'''
+    stop_on_skipped: 'False'
+    stop_on_time_tag: 'False'
+    subdir_cadence_s: '3600'
+    top_level_dir: /mnt/ramdisk/drf_ring_buffer
+    uuid: ''
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [464, 144.0]
+    rotation: 0
+    state: enabled
+- name: network_udp_source_0_0
+  id: network_udp_source
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    header: '0'
+    ipv6: 'False'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    notify_missed: 'True'
+    payloadsize: packet_size
+    port: '60133'
+    src_zeros: 'False'
+    type: short
+    vlen: '2'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [0, 136.0]
+    rotation: 0
+    state: true
+
+connections:
+- [blocks_probe_rate_0, rate, blocks_message_debug_1, print]
+- [blocks_throttle2_0, '0', blocks_probe_rate_0, '0']
+- [blocks_throttle2_0, '0', gr_digital_rf_digital_rf_sink_0_0, '0']
+- [network_udp_source_0_0, '0', blocks_throttle2_0, '0']
+
+metadata:
+  file_format: 1
+  grc_version: 3.10.10.0
