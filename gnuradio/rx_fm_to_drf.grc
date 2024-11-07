@@ -1,6 +1,6 @@
 options:
   parameters:
-    author: Rainville
+    author: rainville
     catch_exceptions: 'True'
     category: '[GRC Hier Blocks]'
     cmake_opt: ''
@@ -28,7 +28,7 @@ options:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [0, 0.0]
+    coordinate: [0, 12.0]
     rotation: 0
     state: enabled
 
@@ -37,12 +37,12 @@ blocks:
   id: variable
   parameters:
     comment: ''
-    value: 90.1e6
+    value: '98.06'
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [160, 0.0]
+    coordinate: [192, 4.0]
     rotation: 0
     state: enabled
 - name: packet_size
@@ -54,7 +54,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [248, 0.0]
+    coordinate: [296, 4.0]
     rotation: 0
     state: true
 - name: samp_rate
@@ -66,7 +66,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [344, 0.0]
+    coordinate: [400, 4.0]
     rotation: 0
     state: enabled
 - name: blocks_message_debug_1
@@ -81,7 +81,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [800, 344.0]
+    coordinate: [800, 336.0]
     rotation: 0
     state: enabled
 - name: blocks_probe_rate_0
@@ -89,11 +89,11 @@ blocks:
   parameters:
     affinity: ''
     alias: ''
-    alpha: '0.15'
+    alpha: '0.1'
     comment: ''
     maxoutbuf: '0'
     minoutbuf: '0'
-    mintime: '1000.0'
+    mintime: '2000.0'
     name: ''
     type: short
     vlen: '2'
@@ -173,7 +173,7 @@ blocks:
     is_continuous: 'True'
     marching_periods: 'True'
     metadata: '{}'
-    min_chunksize: '128'
+    min_chunksize: '512'
     nchan: '1'
     sample_rate_denominator: '1'
     sample_rate_numerator: int(samp_rate)
@@ -181,7 +181,7 @@ blocks:
     stop_on_skipped: 'False'
     stop_on_time_tag: 'False'
     subdir_cadence_s: '3600'
-    top_level_dir: /mnt/ramdisk/drf_fm_buffer
+    top_level_dir: /data/drf_fm_buffer
     uuid: ''
     vlen: '1'
   states:

@@ -37,24 +37,12 @@ blocks:
   id: variable
   parameters:
     comment: ''
-    value: 38.4e6
+    value: 98.0e6
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
     coordinate: [168, 4.0]
-    rotation: 0
-    state: enabled
-- name: dec_rate
-  id: variable
-  parameters:
-    comment: ''
-    value: '1'
-  states:
-    bus_sink: false
-    bus_source: false
-    bus_structure: null
-    coordinate: [440, 4.0]
     rotation: 0
     state: enabled
 - name: packet_size
@@ -73,7 +61,7 @@ blocks:
   id: variable
   parameters:
     comment: ''
-    value: 76.8e6
+    value: 64e6
   states:
     bus_sink: false
     bus_source: false
@@ -97,6 +85,41 @@ blocks:
     bus_source: false
     bus_structure: null
     coordinate: [496, 192.0]
+    rotation: 0
+    state: enabled
+- name: blocks_message_debug_1
+  id: blocks_message_debug
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    en_uvec: 'True'
+    log_level: info
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [1112, 424.0]
+    rotation: 0
+    state: enabled
+- name: blocks_probe_rate_0
+  id: blocks_probe_rate
+  parameters:
+    affinity: ''
+    alias: ''
+    alpha: '0.12'
+    comment: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    mintime: '2000.0'
+    name: ''
+    type: short
+    vlen: '2'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [816, 460.0]
     rotation: 0
     state: enabled
 - name: blocks_throttle2_0_0
@@ -161,7 +184,7 @@ blocks:
     autoscale: 'True'
     average: '0.2'
     axislabels: 'True'
-    bw: samp_rate/dec_rate
+    bw: samp_rate
     color1: '"blue"'
     color10: '"dark blue"'
     color2: '"red"'
@@ -280,7 +303,7 @@ blocks:
     name: '""'
     nconnections: '1'
     size: '512'
-    srate: samp_rate/dec_rate
+    srate: samp_rate
     stemplot: 'False'
     style1: '1'
     style10: '1'
@@ -337,7 +360,7 @@ blocks:
     alpha8: '1.0'
     alpha9: '1.0'
     axislabels: 'True'
-    bw: samp_rate/dec_rate
+    bw: samp_rate
     color1: '0'
     color10: '0'
     color2: '0'
@@ -373,15 +396,15 @@ blocks:
     nconnections: '1'
     showports: 'False'
     type: complex
-    update_time: '0.1'
+    update_time: '0.10'
     wintype: window.WIN_BLACKMAN_hARRIS
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [808, 184.0]
+    coordinate: [808, 172.0]
     rotation: 0
-    state: true
+    state: enabled
 - name: tab_widget
   id: qtgui_tab_widget
   parameters:
@@ -421,7 +444,9 @@ connections:
 - [blocks_interleaved_short_to_complex_0_0, '0', qtgui_freq_sink_x_0, '0']
 - [blocks_interleaved_short_to_complex_0_0, '0', qtgui_time_sink_x_0, '0']
 - [blocks_interleaved_short_to_complex_0_0, '0', qtgui_waterfall_sink_x_0, '0']
+- [blocks_probe_rate_0, rate, blocks_message_debug_1, print]
 - [blocks_throttle2_0_0, '0', blocks_interleaved_short_to_complex_0_0, '0']
+- [blocks_throttle2_0_0, '0', blocks_probe_rate_0, '0']
 - [network_udp_source_0_0, '0', blocks_throttle2_0_0, '0']
 
 metadata:
