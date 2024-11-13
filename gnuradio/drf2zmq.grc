@@ -1,0 +1,188 @@
+options:
+  parameters:
+    author: John Swoboda
+    catch_exceptions: 'True'
+    category: '[GRC Hier Blocks]'
+    cmake_opt: ''
+    comment: ''
+    copyright: ''
+    description: ''
+    gen_cmake: 'On'
+    gen_linking: dynamic
+    generate_options: qt_gui
+    hier_block_src_path: '.:'
+    id: drf2zmq
+    max_nouts: '0'
+    output_language: python
+    placement: (0,0)
+    qt_qss_theme: ''
+    realtime_scheduling: ''
+    run: 'True'
+    run_command: '{python} -u {filename}'
+    run_options: prompt
+    sizing_mode: fixed
+    thread_safe_setters: ''
+    title: Digital RF to ZeroMQ
+    window_size: (1000,1000)
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [8, 8]
+    rotation: 0
+    state: enabled
+
+blocks:
+- name: blocks_message_debug_0
+  id: blocks_message_debug
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    en_uvec: 'True'
+    log_level: info
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [648, 320.0]
+    rotation: 0
+    state: true
+- name: drfdir
+  id: parameter
+  parameters:
+    alias: ''
+    comment: ''
+    hide: none
+    label: drfdir
+    short_id: ''
+    type: str
+    value: '"/Users/swoboj/Documents/Python/spectrumx/mep_tx/example/txchan0"'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [88, 324.0]
+    rotation: 0
+    state: enabled
+- name: en_time
+  id: parameter
+  parameters:
+    alias: ''
+    comment: ''
+    hide: none
+    label: en_time
+    short_id: ''
+    type: str
+    value: '""'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [128, 420.0]
+    rotation: 0
+    state: true
+- name: gr_digital_rf_digital_rf_channel_source_0
+  id: gr_digital_rf_digital_rf_channel_source
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    dir: drfdir
+    end: en_time
+    gapless: 'False'
+    hide_msg_port: 'False'
+    maxoutbuf: '0'
+    min_chunksize: '0'
+    minoutbuf: '0'
+    repeat: 'True'
+    start: st_time
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [352, 208.0]
+    rotation: 0
+    state: enabled
+- name: pubaddr
+  id: parameter
+  parameters:
+    alias: ''
+    comment: ''
+    hide: none
+    label: pubaddr
+    short_id: ''
+    type: str
+    value: '"tcp://127.0.0.1:5561"'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [24, 176.0]
+    rotation: 0
+    state: true
+- name: samp_rate
+  id: parameter
+  parameters:
+    alias: ''
+    comment: ''
+    hide: none
+    label: samp_rate
+    short_id: ''
+    type: eng_float
+    value: '1000000'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [184, 16.0]
+    rotation: 0
+    state: true
+- name: st_time
+  id: parameter
+  parameters:
+    alias: ''
+    comment: ''
+    hide: none
+    label: st_time
+    short_id: ''
+    type: str
+    value: '""'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [40, 420.0]
+    rotation: 0
+    state: true
+- name: zeromq_pub_sink_0
+  id: zeromq_pub_sink
+  parameters:
+    address: pubaddr
+    affinity: ''
+    alias: ''
+    bind: 'True'
+    comment: ''
+    drop_on_hwm: 'True'
+    hwm: '-1'
+    key: ''
+    pass_tags: 'False'
+    timeout: '100'
+    type: short
+    vlen: '2'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [1080, 184.0]
+    rotation: 0
+    state: enabled
+
+connections:
+- [gr_digital_rf_digital_rf_channel_source_0, '0', zeromq_pub_sink_0, '0']
+- [gr_digital_rf_digital_rf_channel_source_0, properties, blocks_message_debug_0,
+  print]
+
+metadata:
+  file_format: 1
+  grc_version: 3.10.7.0
