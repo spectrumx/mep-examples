@@ -11,7 +11,7 @@ options:
     gen_linking: dynamic
     generate_options: qt_gui
     hier_block_src_path: '.:'
-    id: default
+    id: view_sr10MHz
     max_nouts: '0'
     output_language: python
     placement: (0,0)
@@ -22,7 +22,7 @@ options:
     run_options: prompt
     sizing_mode: fixed
     thread_safe_setters: ''
-    title: 1 MHz sample rate stream
+    title: 10 MHz sample rate stream
     window_size: (1000,1000)
   states:
     bus_sink: false
@@ -37,7 +37,7 @@ blocks:
   id: variable
   parameters:
     comment: ''
-    value: 1e6
+    value: 10e6
   states:
     bus_sink: false
     bus_source: false
@@ -72,7 +72,7 @@ blocks:
     affinity: ''
     alias: ''
     comment: ''
-    dir: /data/ringbuffer/mep/sr1MHz
+    dir: /data/ringbuffer/mep/sr10MHz
     end: ''
     gapless: 'False'
     hide_msg_port: 'True'
