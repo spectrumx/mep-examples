@@ -685,6 +685,12 @@ if __name__ == '__main__':
   time.sleep(1.0)
   print("tuning to 8.201 GHz")
   LMX2820ChangeFreq(spi,CSpin,LMX,8.201e9)
+
+  print("setting power level to '1'")
+  pwr_int = 1
+  NewValue = pwr_int << 1
+  NewValue = NewValue | 0x110
+  LMX2820WriteSingeRegister(spi, CSpin, LMX, 79, NewValue)
 #
 # ----------------------------------
 #     END OF FILE
