@@ -6,9 +6,6 @@ trap "trap - SIGTERM && kill -- -$$" SIGINT SIGTERM EXIT
 eval "$(command conda 'shell.bash' 'hook' 2> /dev/null)"
 conda activate base
 
-drf ringbuffer --force_polling -c 1 /data/ringbuffer &
-find /data/ringbuffer -type f -name "tmp.rf*.h5" -exec rm "{}" \;
-
 while true; do
     read -p "# Enter the sample rate in MHz (1, 10, or, 20): " sr
     case $sr in
@@ -43,13 +40,15 @@ while true; do
         * )
             echo "Experiment name is '$exp'"
             drf mirror --force_polling --link cp "/data/ringbuffer/mep/sr${sr}MHz" "/data/recordings/${exp}/sr${sr}MHz" &
-            sleep 2
             break
         ;;
     esac
 done
 
+drf ringbuffer --force_polling -c 1 /data/ringbuffer &
+find /data/ringbuffer -type f -name "tmp.rf*.h5" -exec rm "{}" \;
+sleep 2
 
-/opt/holohub/build/applications/mimo_radar_pipeline/cpp/mimo_radar_pipeline $@ &
+/opt/holohub/build/applications/mimo_radar_pipeline/cpp/mimo_radar_pipeline "sr${sr}MHz" &
 
 sleep infinity
