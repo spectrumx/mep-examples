@@ -6,23 +6,24 @@ options:
     cmake_opt: ''
     comment: ''
     copyright: ''
-    description: ''
+    description: 'This grc flow graph is outputing a signal to zmq. The final sampling
+      frequency out must be 38.4 MHz. '
     gen_cmake: 'On'
     gen_linking: dynamic
     generate_options: qt_gui
     hier_block_src_path: '.:'
-    id: drf2zmq
+    id: zmqfeeder
     max_nouts: '0'
     output_language: python
     placement: (0,0)
     qt_qss_theme: ''
     realtime_scheduling: ''
-    run: 'True'
+    run: 'False'
     run_command: '{python} -u {filename}'
     run_options: prompt
     sizing_mode: fixed
     thread_safe_setters: ''
-    title: Digital RF to ZeroMQ
+    title: ZeroMQ feed
     window_size: (1000,1000)
   states:
     bus_sink: false
@@ -40,7 +41,7 @@ blocks:
     alias: ''
     amp: '1'
     comment: ''
-    freq: '10000'
+    freq: '1000000'
     maxoutbuf: '0'
     minoutbuf: '0'
     offset: '0'
@@ -48,12 +49,12 @@ blocks:
     samp_rate: samp_rate
     showports: 'False'
     type: complex
-    waveform: analog.GR_TRI_WAVE
+    waveform: analog.GR_COS_WAVE
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [504, 116.0]
+    coordinate: [488, 148.0]
     rotation: 0
     state: true
 - name: blocks_complex_to_interleaved_short_0
@@ -64,13 +65,13 @@ blocks:
     comment: ''
     maxoutbuf: '0'
     minoutbuf: '0'
-    scale_factor: '1024'
+    scale_factor: '8192'
     vector_output: 'True'
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [1016, 192.0]
+    coordinate: [1032, 296.0]
     rotation: 0
     state: true
 - name: blocks_message_debug_0
@@ -106,7 +107,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [744, 152.0]
+    coordinate: [712, 152.0]
     rotation: 0
     state: true
 - name: drfdir
@@ -160,6 +161,35 @@ blocks:
     coordinate: [24, 176.0]
     rotation: 0
     state: true
+- name: qtgui_sink_x_0
+  id: qtgui_sink_x
+  parameters:
+    affinity: ''
+    alias: ''
+    bw: samp_rate
+    comment: ''
+    fc: '0'
+    fftsize: '1024'
+    gui_hint: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    name: '""'
+    plotconst: 'True'
+    plotfreq: 'True'
+    plottime: 'True'
+    plotwaterfall: 'True'
+    rate: '10'
+    showports: 'False'
+    showrf: 'False'
+    type: complex
+    wintype: window.WIN_BLACKMAN_hARRIS
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [1112, 536.0]
+    rotation: 0
+    state: true
 - name: rational_resampler_xxx_0
   id: rational_resampler_xxx
   parameters:
@@ -179,7 +209,7 @@ blocks:
     bus_structure: null
     coordinate: [864, 216.0]
     rotation: 0
-    state: true
+    state: disabled
 - name: samp_rate
   id: parameter
   parameters:
@@ -189,7 +219,7 @@ blocks:
     label: samp_rate
     short_id: ''
     type: eng_float
-    value: '4800000'
+    value: 38.4e6
   states:
     bus_sink: false
     bus_source: false
@@ -240,8 +270,11 @@ blocks:
 connections:
 - [analog_sig_source_x_0, '0', blocks_throttle2_0, '0']
 - [blocks_complex_to_interleaved_short_0, '0', zeromq_pub_sink_0, '0']
+- [blocks_throttle2_0, '0', blocks_complex_to_interleaved_short_0, '0']
+- [blocks_throttle2_0, '0', qtgui_sink_x_0, '0']
 - [blocks_throttle2_0, '0', rational_resampler_xxx_0, '0']
 - [rational_resampler_xxx_0, '0', blocks_complex_to_interleaved_short_0, '0']
+- [rational_resampler_xxx_0, '0', qtgui_sink_x_0, '0']
 
 metadata:
   file_format: 1
