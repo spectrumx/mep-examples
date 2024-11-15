@@ -49,6 +49,6 @@ drf ringbuffer --force_polling -c 1 /data/ringbuffer &
 find /data/ringbuffer -type f -name "tmp.rf*.h5" -exec rm "{}" \;
 sleep 2
 
-/opt/holohub/build/applications/mimo_radar_pipeline/cpp/mimo_radar_pipeline "sr${sr}MHz" &
+/opt/holohub/build/applications/mimo_radar_pipeline/cpp/mimo_radar_pipeline "sr${sr}MHz.yaml" &
 
 sleep infinity
