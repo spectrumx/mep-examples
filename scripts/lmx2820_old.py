@@ -1,3 +1,4 @@
+#!/usr/bin/python
 #
 # mit haystack observatory
 # rps 10/25/2024
@@ -562,7 +563,7 @@ def LMX2820setREGSforNewFreq(LMX,newFreq):
 #
 #Write a single register to the LMX
 def LMX2820WriteSingeRegister(spi, CS, LMX, address, NewValue):
-    debug_f = True
+    debug_f = False
 
     b2 = address & 0xFF              # 1 byte address
     b1 = (NewValue & 0xFF00) >> 8    # MSB
@@ -592,7 +593,7 @@ def LMX2820WriteSingeRegister(spi, CS, LMX, address, NewValue):
         pass
       else:
         raise
-    try: 
+    try:
       CSpin.switch_to_output(value=True)
     except Exception as eobj:
       if (SIMU):
@@ -649,7 +650,7 @@ if __name__ == '__main__':
 
   #ctrl = SpiController(5)
 
- 
+
   try:
     spi = busio.SPI(board.SCK,  # clock
                     board.MOSI, # mosi
@@ -682,8 +683,6 @@ if __name__ == '__main__':
   LMX2820StartUp(LMX,spi,CSpin)
 
   time.sleep(1.0)
-  print("tuning to 7 GHz")
-  LMX2820ChangeFreq(spi,CSpin,LMX,7e9)
   print("tuning to 8 GHz")
   LMX2820ChangeFreq(spi,CSpin,LMX,8e9)
 #
