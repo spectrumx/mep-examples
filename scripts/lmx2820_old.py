@@ -683,8 +683,8 @@ if __name__ == '__main__':
   LMX2820StartUp(LMX,spi,CSpin)
 
   time.sleep(1.0)
-  print("tuning to 8.235 GHz")
-  LMX2820ChangeFreq(spi,CSpin,LMX,8.235e9)
+  print("tuning to 8.201 GHz")
+  LMX2820ChangeFreq(spi,CSpin,LMX,8.201e9)
 #
 # ----------------------------------
 #     END OF FILE
