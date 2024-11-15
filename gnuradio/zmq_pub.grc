@@ -70,7 +70,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [896, 136.0]
+    coordinate: [1016, 192.0]
     rotation: 0
     state: true
 - name: blocks_message_debug_0
@@ -106,7 +106,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [752, 184.0]
+    coordinate: [744, 152.0]
     rotation: 0
     state: true
 - name: drfdir
@@ -160,6 +160,26 @@ blocks:
     coordinate: [24, 176.0]
     rotation: 0
     state: true
+- name: rational_resampler_xxx_0
+  id: rational_resampler_xxx
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    decim: '1'
+    fbw: '0'
+    interp: '8'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    taps: '[]'
+    type: ccc
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [864, 216.0]
+    rotation: 0
+    state: true
 - name: samp_rate
   id: parameter
   parameters:
@@ -169,7 +189,7 @@ blocks:
     label: samp_rate
     short_id: ''
     type: eng_float
-    value: '1920000'
+    value: '4800000'
   states:
     bus_sink: false
     bus_source: false
@@ -213,14 +233,15 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [1080, 184.0]
+    coordinate: [1184, 180.0]
     rotation: 0
     state: enabled
 
 connections:
 - [analog_sig_source_x_0, '0', blocks_throttle2_0, '0']
 - [blocks_complex_to_interleaved_short_0, '0', zeromq_pub_sink_0, '0']
-- [blocks_throttle2_0, '0', blocks_complex_to_interleaved_short_0, '0']
+- [blocks_throttle2_0, '0', rational_resampler_xxx_0, '0']
+- [rational_resampler_xxx_0, '0', blocks_complex_to_interleaved_short_0, '0']
 
 metadata:
   file_format: 1
