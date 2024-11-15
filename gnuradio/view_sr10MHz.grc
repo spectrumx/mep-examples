@@ -105,7 +105,7 @@ blocks:
     plotfreq: 'True'
     plottime: 'True'
     plotwaterfall: 'True'
-    rate: '50'
+    rate: '30'
     showports: 'False'
     showrf: 'False'
     type: complex
