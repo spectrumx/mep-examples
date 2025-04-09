@@ -1,4 +1,11 @@
 #!/bin/bash
+
+# NOTE: you should probably have a ramdisk mounted to /data/ringbuffer, e.g. add
+#
+#   tmpfs /data/ringbuffer tmpfs nodev,nosuid,noexec,size=1G 0 0
+#
+# to /etc/fstab
+
 set -E
 
 trap "trap - SIGTERM && kill -- -$$" SIGINT SIGTERM EXIT
@@ -39,16 +46,16 @@ while true; do
         ;;
         * )
             echo "Experiment name is '$exp'"
-            drf mirror --force_polling --link cp "/data/ringbuffer/mep/sr${sr}MHz" "/data/recordings/${exp}/sr${sr}MHz" &
+            drf mirror mv "/data/ringbuffer/mep/sr${sr}MHz" "/data/recordings/${exp}/sr${sr}MHz" &
             break
         ;;
     esac
 done
 
-drf ringbuffer --force_polling -c 1 /data/ringbuffer &
+drf ringbuffer --size 500MB /data/ringbuffer &
 find /data/ringbuffer -type f -name "tmp.rf*.h5" -exec rm "{}" \;
 sleep 2
 
-/opt/holohub/build/applications/mimo_radar_pipeline/cpp/mimo_radar_pipeline "sr${sr}MHz.yaml" &
+/opt/holohub/build/applications/sdr_mep_recorder/sdr_mep_recorder "sr${sr}MHz.yaml" &
 
 sleep infinity
