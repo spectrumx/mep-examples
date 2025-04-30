@@ -8,13 +8,16 @@
 
 set -E
 
-trap "trap - SIGTERM && kill -- -$$" SIGINT SIGTERM EXIT
+export HOLOSCAN_EXECUTOR_LOG_LEVEL=WARN
+export HOLOSCAN_LOG_LEVEL=INFO
+export HOLOSCAN_LOG_FORMAT=DEFAULT
+
+trap "trap - SIGTERM && kill -SIGTERM -$$" SIGINT SIGTERM EXIT
 
 eval "$(command conda 'shell.bash' 'hook' 2> /dev/null)"
-conda activate base
 
 while true; do
-    read -p "# Enter the sample rate in MHz (1, 10, or, 20): " sr
+    read -p "# Enter the sample rate in MHz (1, 10, 16, 20, or 64): " sr
     case $sr in
         1 )
             echo "1 MHz"
@@ -24,12 +27,20 @@ while true; do
             echo "10 MHz"
             break
         ;;
+        16 )
+            echo "16 MHz"
+            break
+        ;;
         20 )
             echo "20 MHz"
             break
         ;;
+        64 )
+            echo "64 MHz"
+            break
+        ;;
         * )
-            echo "Answer either '1', '10', or '20'!"
+            echo "Answer either '1', '10', '16', '20', or '64'!"
         ;;
     esac
 done
@@ -46,16 +57,17 @@ while true; do
         ;;
         * )
             echo "Experiment name is '$exp'"
-            drf mirror mv "/data/ringbuffer/mep/sr${sr}MHz" "/data/recordings/${exp}/sr${sr}MHz" &
+            conda run -n base --no-capture-output drf mirror --link cp "/data/ringbuffer/mep/sr${sr}MHz" "/data/recordings/${exp}/sr${sr}MHz" &
             break
         ;;
     esac
 done
 
-drf ringbuffer --size 500MB /data/ringbuffer &
+conda run -n base --no-capture-output drf ringbuffer -c 1 /data/ringbuffer &
 find /data/ringbuffer -type f -name "tmp.rf*.h5" -exec rm "{}" \;
 sleep 2
 
-/opt/holohub/build/applications/sdr_mep_recorder/sdr_mep_recorder "sr${sr}MHz.yaml" &
+export PYTHONPATH=/opt/nvidia/holoscan/python/lib:/opt/holohub/build/python/lib
+python /opt/holohub/applications/sdr_mep_recorder/sdr_mep_recorder.py "/opt/holohub/applications/sdr_mep_recorder/configs/sr${sr}MHz.yaml" &
 
 sleep infinity
