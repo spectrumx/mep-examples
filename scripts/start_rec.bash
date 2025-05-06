@@ -67,6 +67,9 @@ conda run -n base --no-capture-output drf ringbuffer -c 1 /data/ringbuffer &
 find /data/ringbuffer -type f -name "tmp.rf*.h5" -exec rm "{}" \;
 sleep 2
 
+mkdir -p /data/ringbuffer/mep
+cd /data/ringbuffer/mep
+
 export PYTHONPATH=/opt/nvidia/holoscan/python/lib:/opt/holohub/build/python/lib
 python /opt/holohub/applications/sdr_mep_recorder/sdr_mep_recorder.py "/opt/holohub/applications/sdr_mep_recorder/configs/sr${sr}MHz.yaml" &
 
