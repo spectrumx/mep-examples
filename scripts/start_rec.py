@@ -9,7 +9,6 @@ def main():
     parser = argparse.ArgumentParser(
         prog="start_rec",
         description="Enable and configure recording for the SpectrumX Mobile Experiment Platform (MEP)",
-        default_env=True,
     )
     parser.add_argument(
         "-f", "--center_frequency", type=float, help="Channel center frequency, in MHz"
