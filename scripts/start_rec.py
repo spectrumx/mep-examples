@@ -54,7 +54,8 @@ def main():
     )
 
     sub_config = subprocess.Popen(
-        "mosquitto_sub -t recorder/config/response | jq --color-output"
+        "mosquitto_sub -t recorder/config/response | jq --color-output",
+        shell=True,
     )
 
     payload = {
@@ -79,7 +80,8 @@ def main():
     sub_config.wait()
 
     sub_status = subprocess.Popen(
-        "mosquitto_sub -t recorder/status | jq --color-output"
+        "mosquitto_sub -t recorder/status | jq --color-output",
+        shell=True,
     )
 
     payload = {
