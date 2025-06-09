@@ -3,6 +3,7 @@
 import argparse
 import json
 import subprocess
+import time
 
 
 def main():
@@ -37,6 +38,20 @@ def main():
     config_name = f"sr{args.sample_rate}MHz"
 
     payload = {
+        "task_name": "disable",
+    }
+    subprocess.run(
+        [
+            "mosquitto_pub",
+            "-t",
+            "recorder/command",
+            "-m",
+            json.dumps(payload),
+        ]
+    )
+    time.sleep(0.1)
+
+    payload = {
         "task_name": "config.load",
         "arguments": {
             "name": f"{config_name}",
@@ -52,9 +67,10 @@ def main():
             json.dumps(payload),
         ]
     )
+    time.sleep(0.1)
 
-    sub_config = subprocess.Popen(
-        "mosquitto_sub -t recorder/config/response | jq --color-output",
+    sub_listen = subprocess.Popen(
+        "mosquitto_sub -t recorder/config/response -t recorder/status -C 3 -W 1 | jq --color-output",
         shell=True,
     )
 
@@ -76,14 +92,6 @@ def main():
         ]
     )
 
-    sub_config.terminate()
-    sub_config.wait()
-
-    sub_status = subprocess.Popen(
-        "mosquitto_sub -t recorder/status | jq --color-output",
-        shell=True,
-    )
-
     payload = {
         "task_name": "enable",
     }
@@ -97,8 +105,9 @@ def main():
         ]
     )
 
-    sub_status.terminate()
-    sub_status.wait()
+    sub_listen.wait()
+
+    print("Done")
 
 
 if __name__ == "__main__":
