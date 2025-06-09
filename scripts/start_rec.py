@@ -36,21 +36,6 @@ def main():
 
     config_name = f"sr{args.sample_rate}MHz"
 
-    sub_status = subprocess.Popen(
-        [
-            "mosquitto_sub",
-            "-t",
-            "recorder/status",
-        ]
-    )
-    sub_config = subprocess.Popen(
-        [
-            "mosquitto_sub",
-            "-t",
-            "recorder/config/response",
-        ]
-    )
-
     payload = {
         "task_name": "config.load",
         "arguments": {
@@ -66,6 +51,10 @@ def main():
             "-m",
             json.dumps(payload),
         ]
+    )
+
+    sub_config = subprocess.Popen(
+        "mosquitto_sub -t recorder/config/response | jq --color-output"
     )
 
     payload = {
@@ -86,6 +75,13 @@ def main():
         ]
     )
 
+    sub_config.terminate()
+    sub_config.wait()
+
+    sub_status = subprocess.Popen(
+        "mosquitto_sub -t recorder/status | jq --color-output"
+    )
+
     payload = {
         "task_name": "enable",
     }
@@ -99,8 +95,6 @@ def main():
         ]
     )
 
-    sub_config.terminate()
-    sub_config.wait()
     sub_status.terminate()
     sub_status.wait()
 
