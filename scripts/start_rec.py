@@ -35,6 +35,10 @@ def main():
     elif args.channel == "B":
         dst_port = 60133
 
+    valid_srs = (1, 2, 4, 8, 10, 16, 20, 64)
+    if args.sample_rate not in valid_srs:
+        raise ValueError(f"Sample rate must be one of: {valid_srs} MHz")
+
     config_name = f"sr{args.sample_rate}MHz"
 
     payload = {
