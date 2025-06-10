@@ -12,11 +12,9 @@ def main():
         description="Enable and configure recording for the SpectrumX Mobile Experiment Platform (MEP)",
     )
     parser.add_argument(
-        "-f", "--center_frequency", type=float, help="Channel center frequency, in MHz"
-    )
-    parser.add_argument(
         "-c",
         "--channel",
+        required=True,
         help="RFSoC channel to tune (e.g. 'A', 'B', 'C', or 'D')",
     )
     parser.add_argument(
