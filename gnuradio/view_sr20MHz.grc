@@ -11,7 +11,7 @@ options:
     gen_linking: dynamic
     generate_options: qt_gui
     hier_block_src_path: '.:'
-    id: view_sr20MHz
+    id: view_sr2MHz
     max_nouts: '0'
     output_language: python
     placement: (0,0)
@@ -22,7 +22,7 @@ options:
     run_options: prompt
     sizing_mode: fixed
     thread_safe_setters: ''
-    title: 20 MHz sample rate stream
+    title: 1 MHz sample rate stream
     window_size: (1000,1000)
   states:
     bus_sink: false
@@ -37,24 +37,12 @@ blocks:
   id: variable
   parameters:
     comment: ''
-    value: tuner_freq + rfsoc_freq
+    value: 93.3e6
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [304, 12.0]
-    rotation: 0
-    state: enabled
-- name: rfsoc_freq
-  id: variable
-  parameters:
-    comment: ''
-    value: 1090e6
-  states:
-    bus_sink: false
-    bus_source: false
-    bus_structure: null
-    coordinate: [152, 244.0]
+    coordinate: [296, 16.0]
     rotation: 0
     state: enabled
 - name: samp_rate
@@ -69,30 +57,6 @@ blocks:
     coordinate: [200, 12]
     rotation: 0
     state: enabled
-- name: tuner_freq
-  id: variable
-  parameters:
-    comment: ''
-    value: 6126.6e6
-  states:
-    bus_sink: false
-    bus_source: false
-    bus_structure: null
-    coordinate: [40, 244.0]
-    rotation: 0
-    state: enabled
-- name: tuner_freq
-  id: variable
-  parameters:
-    comment: ''
-    value: 7130e6
-  states:
-    bus_sink: false
-    bus_source: false
-    bus_structure: null
-    coordinate: [40, 308.0]
-    rotation: 0
-    state: disabled
 - name: blocks_throttle2_0
   id: blocks_throttle2
   parameters:
@@ -111,7 +75,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [416, 116.0]
+    coordinate: [264, 120.0]
     rotation: 0
     state: enabled
 - name: gr_digital_rf_digital_rf_channel_source_0
@@ -120,7 +84,7 @@ blocks:
     affinity: ''
     alias: ''
     comment: ''
-    dir: /data/ringbuffer/mep/sr20MHz
+    dir: f"/data/tmp-ringbuffer/sr{samp_rate/1e6:n}MHz"
     end: ''
     gapless: 'False'
     hide_msg_port: 'True'
@@ -134,28 +98,6 @@ blocks:
     bus_source: false
     bus_structure: null
     coordinate: [40, 136.0]
-    rotation: 0
-    state: disabled
-- name: gr_digital_rf_digital_rf_channel_source_0_0
-  id: gr_digital_rf_digital_rf_channel_source
-  parameters:
-    affinity: ''
-    alias: ''
-    comment: ''
-    dir: /data/recordings/maser/sr20MHz
-    end: '"2025-04-14T18:59:00"'
-    gapless: 'False'
-    hide_msg_port: 'True'
-    maxoutbuf: '0'
-    min_chunksize: '0'
-    minoutbuf: '0'
-    repeat: 'True'
-    start: '"2025-04-14T18:57:00"'
-  states:
-    bus_sink: false
-    bus_source: false
-    bus_structure: null
-    coordinate: [248, 256.0]
     rotation: 0
     state: enabled
 - name: qtgui_freq_sink_x_0
@@ -174,7 +116,7 @@ blocks:
     alpha8: '1.0'
     alpha9: '1.0'
     autoscale: 'False'
-    average: '0.05'
+    average: '0.1'
     axislabels: 'True'
     bw: samp_rate
     color1: '"blue"'
@@ -190,7 +132,7 @@ blocks:
     comment: ''
     ctrlpanel: 'True'
     fc: center_freq
-    fftsize: '16384'
+    fftsize: '8192'
     freqhalf: 'True'
     grid: 'True'
     gui_hint: tabs@0
@@ -210,7 +152,7 @@ blocks:
     minoutbuf: '0'
     name: '""'
     nconnections: '1'
-    norm_window: 'True'
+    norm_window: 'False'
     showports: 'False'
     tr_chan: '0'
     tr_level: '0.0'
@@ -218,7 +160,7 @@ blocks:
     tr_tag: '""'
     type: complex
     units: dB
-    update_time: '0.05'
+    update_time: '0.10'
     width1: '1'
     width10: '1'
     width2: '1'
@@ -230,13 +172,13 @@ blocks:
     width8: '1'
     width9: '1'
     wintype: window.WIN_BLACKMAN_hARRIS
-    ymax: '-80'
-    ymin: '-105'
+    ymax: '10'
+    ymin: '-140'
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [720, 220.0]
+    coordinate: [728, 228.0]
     rotation: 0
     state: enabled
 - name: qtgui_sink_x_0
@@ -246,8 +188,8 @@ blocks:
     alias: ''
     bw: samp_rate
     comment: ''
-    fc: '0'
-    fftsize: '1024'
+    fc: 1090e6
+    fftsize: '8192'
     gui_hint: ''
     maxoutbuf: '0'
     minoutbuf: '0'
@@ -258,7 +200,7 @@ blocks:
     plotwaterfall: 'True'
     rate: '30'
     showports: 'False'
-    showrf: 'False'
+    showrf: 'True'
     type: complex
     wintype: window.WIN_BLACKMAN_hARRIS
   states:
@@ -285,7 +227,7 @@ blocks:
     alpha9: '1.0'
     axislabels: 'True'
     bw: samp_rate
-    color1: '1'
+    color1: '0'
     color10: '0'
     color2: '0'
     color3: '0'
@@ -297,12 +239,12 @@ blocks:
     color9: '0'
     comment: ''
     fc: center_freq
-    fftsize: '16384'
+    fftsize: '1024'
     freqhalf: 'True'
     grid: 'False'
     gui_hint: tabs@1
-    int_max: '-80'
-    int_min: '-105'
+    int_max: '10'
+    int_min: '-140'
     label1: ''
     label10: ''
     label2: ''
@@ -320,13 +262,13 @@ blocks:
     nconnections: '1'
     showports: 'False'
     type: complex
-    update_time: '0.05'
+    update_time: '0.10'
     wintype: window.WIN_BLACKMAN_hARRIS
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [720, 324.0]
+    coordinate: [728, 328.0]
     rotation: 0
     state: enabled
 - name: tabs
@@ -360,7 +302,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [408, 12.0]
+    coordinate: [528, 24.0]
     rotation: 0
     state: enabled
 
@@ -369,7 +311,6 @@ connections:
 - [blocks_throttle2_0, '0', qtgui_sink_x_0, '0']
 - [blocks_throttle2_0, '0', qtgui_waterfall_sink_x_0, '0']
 - [gr_digital_rf_digital_rf_channel_source_0, '0', blocks_throttle2_0, '0']
-- [gr_digital_rf_digital_rf_channel_source_0_0, '0', blocks_throttle2_0, '0']
 
 metadata:
   file_format: 1

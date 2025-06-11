@@ -11,7 +11,7 @@ options:
     gen_linking: dynamic
     generate_options: qt_gui
     hier_block_src_path: '.:'
-    id: view_sr10MHz
+    id: view_sr8MHz
     max_nouts: '0'
     output_language: python
     placement: (0,0)
@@ -49,7 +49,7 @@ blocks:
   id: variable
   parameters:
     comment: ''
-    value: 10e6
+    value: 8e6
   states:
     bus_sink: false
     bus_source: false
