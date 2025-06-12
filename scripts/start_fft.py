@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/radiohound/python313/bin/python
 '''
 Start the fft service which listens to /data/ringbuffer and generates an fft from the most recent 1024 samples.  
 Author: Randy Herban
