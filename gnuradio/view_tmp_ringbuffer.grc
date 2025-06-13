@@ -46,13 +46,13 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [360, 16.0]
+    coordinate: [432, 16.0]
     rotation: 0
     state: enabled
 - name: samp_rate
   id: variable
   parameters:
-    comment: ''
+    comment: Enable IShort To Complex when 64 MHz
     value: 1e6
   states:
     bus_sink: false
@@ -61,6 +61,24 @@ blocks:
     coordinate: [200, 16.0]
     rotation: 0
     state: enabled
+- name: blocks_interleaved_short_to_complex_0
+  id: blocks_interleaved_short_to_complex
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    scale_factor: '32767'
+    swap: 'False'
+    vector_input: 'True'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [224, 256.0]
+    rotation: 0
+    state: disabled
 - name: blocks_throttle2_0
   id: blocks_throttle2
   parameters:
@@ -79,7 +97,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [296, 120.0]
+    coordinate: [360, 120.0]
     rotation: 0
     state: enabled
 - name: gr_digital_rf_digital_rf_channel_source_0
@@ -93,7 +111,7 @@ blocks:
     gapless: 'False'
     hide_msg_port: 'True'
     maxoutbuf: '0'
-    min_chunksize: '0'
+    min_chunksize: int(samp_rate * 0.01)
     minoutbuf: '0'
     repeat: 'True'
     start: ''
@@ -306,14 +324,17 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [520, 16.0]
+    coordinate: [592, 16.0]
     rotation: 0
     state: enabled
 
 connections:
+- [blocks_interleaved_short_to_complex_0, '0', blocks_throttle2_0, '0']
 - [blocks_throttle2_0, '0', qtgui_freq_sink_x_0, '0']
 - [blocks_throttle2_0, '0', qtgui_sink_x_0, '0']
 - [blocks_throttle2_0, '0', qtgui_waterfall_sink_x_0, '0']
+- [gr_digital_rf_digital_rf_channel_source_0, '0', blocks_interleaved_short_to_complex_0,
+  '0']
 - [gr_digital_rf_digital_rf_channel_source_0, '0', blocks_throttle2_0, '0']
 
 metadata:
