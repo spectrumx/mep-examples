@@ -19,10 +19,21 @@ def main():
     )
     parser.add_argument(
         "-r",
-        "--sample_rate",
+        "--sample-rate",
+        dest="sample_rate",
         type=int,
         help="Output recording sample rate to use, in MHz",
         default=1,
+    )
+    parser.add_argument(
+        "--tuner-freq",
+        dest="tuner_freq",
+        type=float,
+        default=0.0,
+        help=(
+            "External tuning frequency (in Hz), to be added to the RFSoC tuning"
+            " frequency to store the true center frequency in metadata. Default: 0"
+        ),
     )
     args = parser.parse_args()
 
@@ -33,7 +44,7 @@ def main():
     elif args.channel == "B":
         dst_port = 60133
 
-    valid_srs = (1, 2, 4, 8, 10, 16, 20, 64)
+    valid_srs = (1, 2, 4, 8, 10, 16, 20, 32, 64)
     if args.sample_rate not in valid_srs:
         raise ValueError(f"Sample rate must be one of: {valid_srs} MHz")
 
@@ -57,6 +68,25 @@ def main():
         "task_name": "config.load",
         "arguments": {
             "name": f"{config_name}",
+        },
+        "response_topic": "recorder/config/response",
+    }
+    subprocess.run(
+        [
+            "mosquitto_pub",
+            "-t",
+            "recorder/command",
+            "-m",
+            json.dumps(payload),
+        ]
+    )
+    time.sleep(0.1)
+
+    payload = {
+        "task_name": "config.set",
+        "arguments": {
+            "key": "packet.freq_idx_offset",
+            "value": f"{args.tuner_freq}",
         },
         "response_topic": "recorder/config/response",
     }
