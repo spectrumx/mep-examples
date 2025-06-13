@@ -39,14 +39,14 @@ blocks:
     comment: ''
     entry_signal: editingFinished
     gui_hint: ''
-    label: Center Frequency
+    label: Center Frequency (Hz)
     type: real
     value: '0'
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [384, 16.0]
+    coordinate: [360, 16.0]
     rotation: 0
     state: enabled
 - name: samp_rate
