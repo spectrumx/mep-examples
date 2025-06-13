@@ -11,7 +11,7 @@ options:
     gen_linking: dynamic
     generate_options: qt_gui
     hier_block_src_path: '.:'
-    id: view_sr10MHz
+    id: view_tmp_ringbuffer
     max_nouts: '0'
     output_language: python
     placement: (0,0)
@@ -28,33 +28,37 @@ options:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [8, 8]
+    coordinate: [16, 16.0]
     rotation: 0
     state: enabled
 
 blocks:
 - name: center_freq
-  id: variable
+  id: variable_qtgui_entry
   parameters:
     comment: ''
-    value: 93.3e6
+    entry_signal: editingFinished
+    gui_hint: ''
+    label: Center Frequency
+    type: real
+    value: '0'
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [296, 16.0]
+    coordinate: [384, 16.0]
     rotation: 0
     state: enabled
 - name: samp_rate
   id: variable
   parameters:
     comment: ''
-    value: 10e6
+    value: 1e6
   states:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [200, 12]
+    coordinate: [200, 16.0]
     rotation: 0
     state: enabled
 - name: blocks_throttle2_0
@@ -75,7 +79,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [264, 120.0]
+    coordinate: [296, 120.0]
     rotation: 0
     state: enabled
 - name: gr_digital_rf_digital_rf_channel_source_0
@@ -160,7 +164,7 @@ blocks:
     tr_tag: '""'
     type: complex
     units: dB
-    update_time: '0.10'
+    update_time: '0.03'
     width1: '1'
     width10: '1'
     width2: '1'
@@ -262,7 +266,7 @@ blocks:
     nconnections: '1'
     showports: 'False'
     type: complex
-    update_time: '0.10'
+    update_time: '0.05'
     wintype: window.WIN_BLACKMAN_hARRIS
   states:
     bus_sink: false
@@ -302,7 +306,7 @@ blocks:
     bus_sink: false
     bus_source: false
     bus_structure: null
-    coordinate: [528, 24.0]
+    coordinate: [520, 16.0]
     rotation: 0
     state: enabled
 
