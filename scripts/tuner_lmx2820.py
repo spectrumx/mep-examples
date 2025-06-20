@@ -38,7 +38,7 @@ import time
 SIMU = False
 
 # set environment variable to register the FT232H board
-os.environ["BLINKA_FT232H"] = 1
+os.environ["BLINKA_FT232H"] = "1"
 
 #
 # many dependencies to getting the device to work
