@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/radiohound/python313/bin/python
 #
 # mit haystack observatory
 # rps 10/25/2024
