@@ -100,16 +100,19 @@ def main():
         verbose=True,
     )
 
-    if (upload_results):
-        success_results = [success for success in upload_results if success]
-        failed_results = [success for success in upload_results if not success]
-        print(f"Uploaded {len(success_results)} assets.")
-        print(f"{len(failed_results)} assets failed.")
-    else:
-        print("Upload results are not available.")
+    if (not upload_results):
+        logger.error("Upload results are not available.")
+        return None
+        
+    success_results = [success for success in upload_results if success]
+    failed_results = [success for success in upload_results if not success]
+    logger.info(f"Uploaded {len(success_results)} assets.")
+    logger.info(f"{len(failed_results)} assets failed.")
+    # TODO: Handle failed uploads here. You may want to inspect the upload results and take action if any uploads failed.
+
 
     if sds.dry_run:
-        print("Turn off dry-run to actually upload files!")
+        logger.info("Turn off dry-run to actually upload files!")
     else:
         if args.create_capture:
             if not args.channel:
@@ -125,4 +128,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # Usability hint for users
+    logger.info("Tip: Run 'python upload_to_sds.py --help' to see all available options.\n")
     main()
