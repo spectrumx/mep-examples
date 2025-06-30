@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 start_mep_rx.py
 
@@ -17,9 +16,10 @@ import src.mep_tuner_test as mep_tuner_test
 import src.mep_tuner_lmx2820 as mep_tuner_lmx2820
 import src.mep_rfsoc as mep_rfsoc
 import os
+import math
 
 LOG_DIR = os.path.join(os.path.expanduser("~"),"log","spectrumx")
-ADC_IF = 1090                   # MHz
+ADC_IF = 1090      # ADC intermediate frequency (MHz)
 
 GREEN = "\033[92m"
 BLUE = "\033[94m"
@@ -31,10 +31,6 @@ def main(args):
     Main function for the frequency sweep control. 
     Args:
         args (argparse.Namespace): Command-line arguments. Expected to contain:
-            - command (list): A list of command strings to send.
-
-    Raises:
-        KeyboardInterrupt: If the user interrupts the program (Ctrl+C).
     """
 
     # Configure logging
@@ -58,7 +54,6 @@ def main(args):
 
     # Inputs 
     f_c_start_hz = int(args.freq_start * 1e6)
-    f_c_end_hz = int(args.freq_end * 1e6)
     f_step_hz = int(args.step * 1e6)
 
     # Constants
@@ -89,8 +84,16 @@ def main(args):
     if (rfsoc_wait_count >= rfsoc_timeout_s):
         logging.error("Failed to connect to RFSoC")
         return
+
+    # Generate frequency list
+    if math.isnan(args.freq_end):
+        freqs_hz = [f_c_start_hz]
+    else:
+        f_c_end_hz = int(args.freq_end * 1e6)
+        freqs_hz = range(f_c_start_hz, f_c_end_hz, f_step_hz)
     
-    for f_c_hz in range(f_c_start_hz, f_c_end_hz, f_step_hz):
+    # Loop over frequency range
+    for f_c_hz in freqs_hz:
         logging.info(f"Tuning to {GREEN}{f_c_hz}{RESET}")
         # Place RFSoC Capture in Reset
         rfsoc.reset()
@@ -111,13 +114,29 @@ def main(args):
             logging.info(f"RFSoC state {tlm['state']}")
 
         # Wait for dwell time
+        time_loop_start = time.time()
         logging.info(f"Waiting for {args.dwell} s")
-        time.sleep(args.dwell)
+        while((time_loop_start - time.time() + args.dwell) > 0):
+            tlm = rfsoc.get_tlm()
+            logging.debug(f"{tlm_to_str(tlm)} ")
+            time.sleep(1)
+
+def tlm_to_str(tlm):
+    if (tlm is None):
+        return ""
+    tlm_str =  f"RX State: {tlm['state']} "
+    tlm_str += f"f_c: {float(tlm['f_c_hz'])/1e6} MHz " 
+    tlm_str += f"f_if: {float(tlm['f_if_hz'])/1e6} MHz " 
+    tlm_str += f"f_s: {float(tlm['f_s'])/1e6} MHz " 
+    tlm_str += f"PPS Count: {tlm['pps_count']} "
+    tlm_str += f"Channel(s): {tlm['channels']}"
+    return tlm_str
+
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Send command to the RFSoC')
-    parser.add_argument('--freq_start', '-f1', type=float, default=7000, help='Start frequency in MHz (default: 7000 MHz)')
-    parser.add_argument('--freq_end', '-f2', type=float, default=7100, help='Start frequency in MHz (default: 7100 MHz)')
+    parser.add_argument('--freq_start', '-f1', type=float, default=7000, help='Center frequency in MHz, if FREQ_END is also set this is the starting frequency (default: 7000 MHz)')
+    parser.add_argument('--freq_end', '-f2', type=float, default=float('nan'), help='End frequency in MHz (default: NaN)')
     parser.add_argument('--step', '-s', type=float, default=10, help='Step size in MHz (default: 10 MHz)')
     parser.add_argument('--dwell', '-d', type=float, default=60, help='Dwell time in seconds (default: 60 s)')
     parser.add_argument( '--tuner', '-t', type=lambda x: x.upper(),
