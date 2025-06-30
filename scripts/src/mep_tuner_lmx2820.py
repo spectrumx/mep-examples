@@ -54,7 +54,9 @@ class MEPTunerLMX2820(MEPTuner):
         # Calculate local oscillator frequency
         self._f_lo_mhz = f_c_mhz - self._f_if_mhz
         f_lo_hz = self._f_lo_mhz * 1e6
-        logging.info(f"Setting local oscillator frequency to {self._f_lo_mhz} MHz")
+
+        logging.info(f"Setting center frequency to {f_c_mhz} MHz")
+        logging.debug(f"Setting local oscillator frequency to {self._f_lo_mhz} MHz")
         tuner_lmx2820.LMX2820ChangeFreq(self.spi, self.CSpin, self.tuner, int(f_lo_hz))
 
     def get_status(self) -> dict:
