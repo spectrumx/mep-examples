@@ -10,9 +10,10 @@ receive bitstream with:
 
 The -c option sets the active input channels, A and B. The -r option holds the UDP stream 
 in reset until the tuner script sets the external tuner frequency. This can be done using
-the start_mep_rx.py script:
+the start_mep_rx.py script from within the base conda environment on the Jetson:
 
 ```
+conda activate
 ./start_mep_rx.py -f1 7010 -f2 7050 -s 10 -d 5 -t LMX2820
 ```
 
@@ -60,9 +61,10 @@ Send command to the RFSoC
 options:
   -h, --help            show this help message and exit
   --freq_start FREQ_START, -f1 FREQ_START
-                        Start frequency in MHz (default: 7000 MHz)
+                        Center frequency in MHz, if FREQ_END is also set this is the starting frequency
+                        (default: 7000 MHz)
   --freq_end FREQ_END, -f2 FREQ_END
-                        Start frequency in MHz (default: 7100 MHz)
+                        End frequency in MHz (default: NaN)
   --step STEP, -s STEP  Step size in MHz (default: 10 MHz)
   --dwell DWELL, -d DWELL
                         Dwell time in seconds (default: 60 s)
