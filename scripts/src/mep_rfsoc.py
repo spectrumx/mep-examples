@@ -44,7 +44,7 @@ class MEPRFSoC:
         self._send_command(f"cmd set freq_metadata {f_c_hz}")
 
     def get_tlm(self, verbose=False):
-        timeout_s = .05
+        timeout_s = 1.5
         start_time = time.time()
 
         # Clear zmq queue

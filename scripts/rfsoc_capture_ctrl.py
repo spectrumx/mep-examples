@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-capture_ctrl.py
+rfsoc_capture_ctrl.py
 Remote command script for controlling an RFSoC via ZeroMQ.
 
 Author: nicholas.rainville@colorado.edu

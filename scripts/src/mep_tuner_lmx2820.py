@@ -1,6 +1,6 @@
 import logging
-from mep_tuner import MEPTuner
-import tuner_lmx2820
+from src.mep_tuner import MEPTuner
+import src.tuner_lmx2820 as tuner_lmx2820
 import board
 import busio
 from digitalio import DigitalInOut
@@ -8,9 +8,9 @@ from digitalio import DigitalInOut
 class MEPTunerLMX2820(MEPTuner):
     """Child class implementation for LMX2820 tuner device"""
     
-    def __init__(self):
+    def __init__(self, f_if_mhz):
         """Initialize LMX2820 specific hardware/resources"""
-        super().__init__()
+        super().__init__(f_if_mhz)
         # Add hardware-specific initialization here
         # Connect to tuner USB/SPI
         ref_freq = 10e6
@@ -32,7 +32,7 @@ class MEPTunerLMX2820(MEPTuner):
         tuner = tuner_lmx2820.LMX2820(ref_freq, ref_doubler, ref_multiplier, pre_r_div, post_r_div)
         tuner_lmx2820.LMX2820StartUp(tuner, spi, CSpin)
 
-        f_c_lo = f_c - f_if
+        f_c_lo = f_c - self._f_if_mhz
         f_c_lo_ghz = f_c_lo / 1e9
         tuner_lmx2820.LMX2820ChangeFreq(spi, CSpin, tuner, int(f_c_lo_ghz))
 

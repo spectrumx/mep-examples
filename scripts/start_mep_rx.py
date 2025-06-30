@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
 """
-capture_sweep.py
+start_mep_rx.py
 
-Automate a frequency sweep capture. Control the tuner through USB/SPI
-and RFSoC through ZeroMQ.
+Automate tuning and starting the RFSOC I/Q stream. 
+Supports frequency sweep capture. Control the tuner 
+through USB/SPI and RFSoC through ZeroMQ.
 
 Author: nicholas.rainville@colorado.edu
 """
@@ -12,11 +13,12 @@ Author: nicholas.rainville@colorado.edu
 import argparse
 import time
 import logging
-import mep_tuner_test
-import mep_rfsoc
+import src.mep_tuner_test as mep_tuner_test
+import src.mep_rfsoc as mep_rfsoc
 import os
 
 LOG_DIR = os.path.join(os.path.expanduser("~"),"log","spectrumx")
+ADC_IF = 1090                   # MHz
 
 GREEN = "\033[92m"
 BLUE = "\033[94m"
@@ -41,14 +43,14 @@ def main(args):
     log_filepath = os.path.join(LOG_DIR, log_filename)
 
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=args.log_level,
         format='%(asctime)s - %(levelname)s - %(message)s',
         filename=log_filepath
     )
 
     # Add console handler to also log to terminal
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(args.log_level)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(formatter)
     logging.getLogger().addHandler(console_handler)
@@ -57,14 +59,13 @@ def main(args):
     f_c_start_hz = int(args.freq_start * 1e6)
     f_c_end_hz = int(args.freq_end * 1e6)
     f_step_hz = int(args.step * 1e6)
-    dwell_s = args.dwell
 
     # Constants
     f_if_hz = 1090e6 # Hz
 
     # Connect to tuner
     if (args.tuner == "TEST"):
-        tuner = mep_tuner_test.MEPTunerTest()
+        tuner = mep_tuner_test.MEPTunerTest(ADC_IF)
     if (args.tuner == "LMX2820"):
         logging.error("LMX2820 tuner not yet implemented")
         return
@@ -74,6 +75,20 @@ def main(args):
 
     # Connect to RFSoC ZMQ
     rfsoc = mep_rfsoc.MEPRFSoC()
+
+    # Wait for RFSoC 
+    rfsoc_timeout_s = 10
+    rfsoc_wait_count = 0
+    tlm = rfsoc.get_tlm()
+    while(tlm is None and rfsoc_wait_count < rfsoc_timeout_s):
+        logging.debug("Waiting for RFSoC")
+        time.sleep(1)
+        tlm = rfsoc.get_tlm()
+        rfsoc_wait_count += 1
+    
+    if (rfsoc_wait_count >= rfsoc_timeout_s):
+        logging.error("Failed to connect to RFSoC")
+        return
     
     for f_c_hz in range(f_c_start_hz, f_c_end_hz, f_step_hz):
         logging.info(f"Tuning to {GREEN}{f_c_hz}{RESET}")
@@ -89,6 +104,15 @@ def main(args):
         # Start capture on pps edge
         rfsoc.set_freq_metadata(f_c_hz)
         rfsoc.capture_next_pps()
+        tlm = rfsoc.get_tlm()
+        if(tlm is not None):
+            if(tlm['state']) != 'active':
+                logging.error(f"Failed to start RFSoC capture")
+                continue
+            logging.info(f"RFSoC state {tlm['state']}")
+
+        # Wait for dwell time
+        logging.info(f"Waiting for {args.dwell} s")
         time.sleep(args.dwell)
     
 if __name__ == "__main__":
@@ -99,7 +123,9 @@ if __name__ == "__main__":
     parser.add_argument('--dwell', '-d', type=float, default=60, help='Dwell time in seconds (default: 60 s)')
     parser.add_argument( '--tuner', '-t', type=lambda x: x.upper(),
                         choices=["LMX2820", "VALON", "TEST"], default="TEST",
-                        help='Select tuner [LMX2820, VALON, TEST] (default: TEST)'
-)
+                        help='Select tuner [LMX2820, VALON, TEST] (default: TEST)')
+    parser.add_argument('--log-level', '-l', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        help='Set logging level (default: INFO)')
+
     args = parser.parse_args()
     main(args)
