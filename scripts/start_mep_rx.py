@@ -96,9 +96,8 @@ def main(args):
         rfsoc.reset()
 
         # Tune to starting frequency
-        f_lo_hz = f_c_hz - f_if_hz
-        f_lo_mhz = f_lo_hz / 1e6
-        tuner.set_freq(f_lo_mhz)
+        f_c_mhz = f_c_hz / 1e6
+        tuner.set_freq(f_c_mhz)
         time.sleep(.1) # Wait for tuner to lock?
 
         # Start capture on pps edge
