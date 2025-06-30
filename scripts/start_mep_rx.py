@@ -14,6 +14,7 @@ import argparse
 import time
 import logging
 import src.mep_tuner_test as mep_tuner_test
+import src.mep_tuner_lmx2820 as mep_tuner_lmx2820
 import src.mep_rfsoc as mep_rfsoc
 import os
 
@@ -67,8 +68,7 @@ def main(args):
     if (args.tuner == "TEST"):
         tuner = mep_tuner_test.MEPTunerTest(ADC_IF)
     if (args.tuner == "LMX2820"):
-        logging.error("LMX2820 tuner not yet implemented")
-        return
+        tuner = mep_tuner_lmx2820.MEPTunerLMX2820(ADC_IF)
     if (args.tuner == "VALON"):
         logging.error("Valon tuner not yet implemented")
         return

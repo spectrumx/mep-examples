@@ -830,7 +830,7 @@ def LMX2820WriteSingleRegister(spi, CS, LMX, address, NewValue):
     bcmd = bytes(icmd)  # array of tkype bytes
 
     try:
-        CSpin.switch_to_output(value=False)
+        CS.switch_to_output(value=False)
     except Exception:
         if SIMU:
             pass
@@ -853,7 +853,7 @@ def LMX2820WriteSingleRegister(spi, CS, LMX, address, NewValue):
         else:
             raise
     try:
-        CSpin.switch_to_output(value=True)
+        CS.switch_to_output(value=True)
     except Exception:
         if SIMU:
             pass
