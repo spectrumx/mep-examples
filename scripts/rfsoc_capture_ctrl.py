@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/radiohound/python313/bin/python
 
 """
 rfsoc_capture_ctrl.py
@@ -48,7 +48,7 @@ def main(args):
     sub_socket_str = "tcp://192.168.20.100:60201"
     sub_socket = context.socket(zmq.SUB)
     sub_socket.connect(sub_socket_str)
-    sub_socket.setsockopt_string(zmq.SUBSCRIBE, "") 
+    sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
     poller = zmq.Poller()
     poller.register(sub_socket, zmq.POLLIN)
 

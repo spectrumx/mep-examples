@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
+#!/opt/radiohound/python313/bin/python
 """
 start_mep_rx.py
 
-Automate tuning and starting the RFSOC I/Q stream. 
-Supports frequency sweep capture. Control the tuner 
+Automate tuning and starting the RFSOC I/Q stream.
+Supports frequency sweep capture. Control the tuner
 through USB/SPI and RFSoC through ZeroMQ.
 
 Author: nicholas.rainville@colorado.edu
@@ -28,7 +28,7 @@ RESET = "\033[0m"
 
 def main(args):
     """
-    Main function for the frequency sweep control. 
+    Main function for the frequency sweep control.
     Args:
         args (argparse.Namespace): Command-line arguments. Expected to contain:
     """
@@ -52,7 +52,7 @@ def main(args):
     console_handler.setFormatter(formatter)
     logging.getLogger().addHandler(console_handler)
 
-    # Inputs 
+    # Inputs
     f_c_start_hz = int(args.freq_start * 1e6)
     f_step_hz = int(args.step * 1e6)
 
@@ -71,7 +71,7 @@ def main(args):
     # Connect to RFSoC ZMQ
     rfsoc = mep_rfsoc.MEPRFSoC()
 
-    # Wait for RFSoC 
+    # Wait for RFSoC
     rfsoc_timeout_s = 10
     rfsoc_wait_count = 0
     tlm = rfsoc.get_tlm()
@@ -80,7 +80,7 @@ def main(args):
         time.sleep(1)
         tlm = rfsoc.get_tlm()
         rfsoc_wait_count += 1
-    
+
     if (rfsoc_wait_count >= rfsoc_timeout_s):
         logging.error("Failed to connect to RFSoC")
         return
@@ -91,7 +91,7 @@ def main(args):
     else:
         f_c_end_hz = int(args.freq_end * 1e6)
         freqs_hz = range(f_c_start_hz, f_c_end_hz, f_step_hz)
-    
+
     # Loop over frequency range
     for f_c_hz in freqs_hz:
         logging.info(f"Tuning to {GREEN}{f_c_hz}{RESET}")
@@ -125,14 +125,14 @@ def tlm_to_str(tlm):
     if (tlm is None):
         return ""
     tlm_str =  f"RX State: {tlm['state']} "
-    tlm_str += f"f_c: {float(tlm['f_c_hz'])/1e6} MHz " 
-    tlm_str += f"f_if: {float(tlm['f_if_hz'])/1e6} MHz " 
-    tlm_str += f"f_s: {float(tlm['f_s'])/1e6} MHz " 
+    tlm_str += f"f_c: {float(tlm['f_c_hz'])/1e6} MHz "
+    tlm_str += f"f_if: {float(tlm['f_if_hz'])/1e6} MHz "
+    tlm_str += f"f_s: {float(tlm['f_s'])/1e6} MHz "
     tlm_str += f"PPS Count: {tlm['pps_count']} "
     tlm_str += f"Channel(s): {tlm['channels']}"
     return tlm_str
 
-    
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Send command to the RFSoC')
     parser.add_argument('--freq_start', '-f1', type=float, default=7000, help='Center frequency in MHz, if FREQ_END is also set this is the starting frequency (default: 7000 MHz)')
