@@ -13,8 +13,8 @@ import argparse
 import time
 import logging
 import src.mep_tuner_test as mep_tuner_test
-import src.mep_tuner_lmx2820 as mep_tuner_lmx2820
 import src.mep_rfsoc as mep_rfsoc
+import src.mep_tuner_valon as mep_tuner_valon
 import os
 import math
 
@@ -63,10 +63,10 @@ def main(args):
     if (args.tuner == "TEST"):
         tuner = mep_tuner_test.MEPTunerTest(ADC_IF)
     if (args.tuner == "LMX2820"):
+        import src.mep_tuner_lmx2820 as mep_tuner_lmx2820
         tuner = mep_tuner_lmx2820.MEPTunerLMX2820(ADC_IF)
     if (args.tuner == "VALON"):
-        logging.error("Valon tuner not yet implemented")
-        return
+        tuner = mep_tuner_valon.MEPTunerValon(ADC_IF)
 
     # Connect to RFSoC ZMQ
     rfsoc = mep_rfsoc.MEPRFSoC()
