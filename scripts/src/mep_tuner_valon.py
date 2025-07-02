@@ -1,7 +1,6 @@
 """
 mep_tuner_valon.py
 
-
 Author: alisa.yurevich@tufts.edu
 """
 import subprocess
@@ -31,11 +30,11 @@ class MEPTunerValon(MEPTuner):
         self._f_lo_mhz = float('nan')
         self._device_type = "Valon"
 
-        logging.info(f"Initializing {self._device_type} tuner")
+        logging.info(f"initializing {self._device_type} tuner")
 
         self._start_valon_service()
-        # self._wait_for_service()
-        logging.info(f"Initialized {self._device_type} tuner")
+        self._wait_for_service()
+        logging.info(f"initialized {self._device_type} tuner")
 
     def _start_valon_service(self):
         """
@@ -66,10 +65,9 @@ class MEPTunerValon(MEPTuner):
         """
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(5.0)
                 sock.connect(CLI_SOCKET)
                 sock.sendall(cmd.encode('utf-8'))
-                response = sock.recv(1024).decode('utf-8').strip()
+                response = sock.recv(1024).decode('utf-8')
                 return response
         except Exception as e:
             logging.error(f"CLI command failed: {e}")
@@ -84,9 +82,10 @@ class MEPTunerValon(MEPTuner):
                 sock.settimeout(5.0)
                 sock.connect(TELEM_SOCKET)
                 response = sock.recv(1024).decode('utf-8').strip()
+                logging.info(f"sent")
                 return json.loads(response)
         except Exception as e:
-            logging.error(f"Telemetry request failed: {e}")
+            logging.error(f"telemetry request failed: {e}")
             raise
 
     def __del__(self):
@@ -97,16 +96,16 @@ class MEPTunerValon(MEPTuner):
         self._stop_valon_service()
         super().__del__()
 
-    def set_freq(self, f_c_mhz : float):
+    def set_freq(self, f_c_mhz):
         """
         
         """
         if f_c_mhz < 0:
-            raise ValueError("Frequency cannot be negative")
+            raise ValueError("frequency cannot be negative")
         
         self._f_lo_mhz = f_c_mhz - self._f_if_mhz
-        logging.info(f"Setting center frequency to {f_c_mhz} MHz")
-        logging.debug(f"Setting local oscillator frequency to {self._f_lo_mhz} MHz")
+        logging.info(f"setting center frequency to {f_c_mhz} MHz")
+        logging.info(f"setting local oscillator frequency to {self._f_lo_mhz} MHz")
         self._send_command(f"F{self._f_lo_mhz}MHz")
     
     def get_status(self):
@@ -135,6 +134,7 @@ class MEPTunerValon(MEPTuner):
 
     def _wait_for_service(self):
         """
+        Cautionary wait in case server.py has not had time to initalize
         """
         start = time.time()
         while time.time() - start < self.startup_timeout:
@@ -146,5 +146,5 @@ class MEPTunerValon(MEPTuner):
                 except socket.error:
                     pass
             time.sleep(0.25)
-        raise TimeoutError("Valon service failed to start in time")
+        raise TimeoutError("valon service failed to start in time")
 
