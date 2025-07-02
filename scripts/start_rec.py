@@ -26,13 +26,13 @@ def main():
         default=1,
     )
     parser.add_argument(
-        "--tuner-freq",
-        dest="tuner_freq",
+        "--added-freq",
+        dest="freq_idx_offset",
         type=float,
         default=0.0,
         help=(
-            "External tuning frequency (in Hz), to be added to the RFSoC tuning"
-            " frequency to store the true center frequency in metadata. Default: 0"
+            "Frequency (in Hz) to be added to the metadata from the RFSoC"
+            " to adjust for the true center frequency. Default: 0"
         ),
     )
     args = parser.parse_args()
@@ -43,6 +43,10 @@ def main():
         dst_port = 60134
     elif args.channel == "B":
         dst_port = 60133
+    elif args.channel == "C":
+        dst_port = 60132
+    elif args.channel == "D":
+        dst_port = 60131
 
     valid_srs = (1, 2, 4, 8, 10, 16, 20, 32, 64)
     if args.sample_rate not in valid_srs:
@@ -86,7 +90,26 @@ def main():
         "task_name": "config.set",
         "arguments": {
             "key": "packet.freq_idx_offset",
-            "value": f"{args.tuner_freq}",
+            "value": f"{args.freq_idx_offset}",
+        },
+        "response_topic": "recorder/config/response",
+    }
+    subprocess.run(
+        [
+            "mosquitto_pub",
+            "-t",
+            "recorder/command",
+            "-m",
+            json.dumps(payload),
+        ]
+    )
+    time.sleep(0.1)
+
+    payload = {
+        "task_name": "config.set",
+        "arguments": {
+            "key": "drf_sink.channel_dir",
+            "value": f"{config_name}/ch{args.channel}",
         },
         "response_topic": "recorder/config/response",
     }
