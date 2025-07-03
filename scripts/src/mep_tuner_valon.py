@@ -79,7 +79,7 @@ class MEPTunerValon(MEPTuner):
         """
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(5.0)
+                #sock.settimeout(5.0)
                 sock.connect(TELEM_SOCKET)
                 response = sock.recv(1024).decode('utf-8').strip()
                 logging.info(f"sent")
