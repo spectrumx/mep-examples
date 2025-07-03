@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 
-import spectrumx
 import argparse
 import logging
 import pathlib
 import sys
 import os
+import spectrumx
 from pathlib import PurePosixPath
 
 from spectrumx.client import Client
@@ -74,7 +74,7 @@ def main():
     sds.authenticate()
 
     try:
-        upload_results = sds.upload_multichannel_drf_capture(
+        capture_list = sds.upload_multichannel_drf_capture(
             local_path=data_dir,
             sds_path=args.reference_name,
             channels=args.channels,
@@ -84,15 +84,16 @@ def main():
         logger.error(f"Error uploading multi-channel capture: {e}")
         sys.exit(1)
 
-    if not upload_results:
-        logger.error("Upload results are not available.")
+    if not capture_list:
+        logger.error(f"Failed to upload capture.")
         return None
 
-    success_results = [success for success in upload_results if success]
-    failed_results = [success for success in upload_results if not success]
-    logger.info(f"Uploaded {len(success_results)} assets.")
-    logger.info(f"{len(failed_results)} assets failed.")
-    # TODO: Handle failed uploads here. You may want to inspect the upload results and take action if any uploads failed.
+    # To iterate over the upload results, you can do something like this:
+    for result in capture_list:
+        if result:
+            logger.info(f"Uploaded capture {result}.")
+        else:
+            logger.error(f"Failed to upload capture.")
 
     if sds.dry_run:
         logger.info("Turn off dry-run to actually upload files!")
