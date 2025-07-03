@@ -46,6 +46,7 @@ def main():
     parser = argparse.ArgumentParser(
         prog="upload_to_sds",
         description="Upload directory of files to the SDS",
+        epilog="Example:\n  python upload_to_sds.py <local_dir> <reference dir> --create-capture --channel <channel name>\nThis uploads data and creates a capture."
     )
     parser.add_argument(
         "data_dir",
