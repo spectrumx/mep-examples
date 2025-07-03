@@ -73,3 +73,55 @@ options:
   --log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}, -l {DEBUG,INFO,WARNING,ERROR,CRITICAL}
                         Set logging level (default: INFO)
 ```
+
+### upload_to_sds.py
+
+This script uploads directory of files to the SDS and create capture from these files.
+
+```
+usage: upload_to_sds [-h] [-n] [--dotenv DOTENV] [--channel CHANNEL]
+                     [--create-capture]
+                     data_dir reference_name
+
+positional arguments:
+  data_dir           Path to data directory to upload
+  reference_name     Reference name (virtual directory) to upload to. For example: digitalrf/your-data-folder-name
+
+options:
+  -h, --help         show this help message and exit
+  -n, --dry-run      
+  --dotenv DOTENV    Path to .env file containing SDS_SECRET_TOKEN
+  --channel CHANNEL  Channel to use for creating capture after upload
+  --create-capture   Create a capture after uploading files (--channel required if using --create-capture)
+
+Example: python upload_to_sds.py <local_dir> <reference dir> --create-capture
+--channel <channel name> This uploads data and creates a capture.
+```
+
+### upload_multichannel_to_sds.py
+
+```
+Use this script to upload captures if you have SDK v0.1.11 and if your data directory contains data from multiple channels.
+You can specify the list of channel names for which you would like to create capture using the
+--channels option (eg: --channels ch1 ch2 ch3).
+
+usage: upload_multichannel_to_sds [-h] [-n] [--dotenv DOTENV] --channels
+                                  CHANNELS [CHANNELS ...]
+                                  data_dir reference_name
+
+Upload a multi-channel DigitalRF capture to the SDS
+
+positional arguments:
+  data_dir              Path to data directory to upload
+  reference_name        Reference name (virtual directory) to upload to
+
+options:
+  -h, --help            show this help message and exit
+  -n, --dry-run
+  --dotenv DOTENV       Path to .env file containing SDS_SECRET_TOKEN
+  --channels CHANNELS [CHANNELS ...]
+                        List of channels to upload (space separated)
+
+Example: python upload_multichannel_to_sds.py <local_dir> <reference dir>
+--channels ch1 ch2 ch3 This uploads a multi-channel capture.
+```
