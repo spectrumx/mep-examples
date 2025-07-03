@@ -99,7 +99,9 @@ Example: python upload_to_sds.py <local_dir> <reference dir> --create-capture
 ### upload_multichannel_to_sds.py
 
 ```
-Use this script to upload captures if you have SDK v0.1.11 and if your data directory contains data from multiple channels. You can specify the list of channel names for which you would like to create capture using the --channels option (eg: --channels ch1 ch2 ch3).
+Use this script to upload captures if you have SDK v0.1.11 and if your data directory contains data from multiple channels.
+You can specify the list of channel names for which you would like to create capture using the
+--channels option (eg: --channels ch1 ch2 ch3).
 
 usage: upload_multichannel_to_sds [-h] [-n] [--dotenv DOTENV] --channels
                                   CHANNELS [CHANNELS ...]
