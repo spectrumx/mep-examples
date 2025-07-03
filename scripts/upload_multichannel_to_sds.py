@@ -88,10 +88,10 @@ def main():
         logger.error(f"Failed to upload capture.")
         return None
 
-    # To iterate over the upload results, you can do something like this:
-    for result in capture_list:
-        if result:
-            logger.info(f"Uploaded capture {result}.")
+    # To iterate over the upload capture list, you can do something like this:
+    for capture in capture_list:
+        if capture:
+            logger.info(f"Uploaded capture {capture}.")
         else:
             logger.error(f"Failed to upload capture.")
 
