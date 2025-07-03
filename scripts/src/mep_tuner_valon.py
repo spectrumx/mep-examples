@@ -103,7 +103,7 @@ class MEPTunerValon(MEPTuner):
         if f_c_mhz < 0:
             raise ValueError("frequency cannot be negative")
         
-        self._f_lo_mhz = f_c_mhz - self._f_if_mhz
+        self._f_lo_mhz = f_c_mhz + self._f_if_mhz
         logging.info(f"setting center frequency to {f_c_mhz} MHz")
         logging.info(f"setting local oscillator frequency to {self._f_lo_mhz} MHz")
         self._send_command(f"F{self._f_lo_mhz}MHz")
