@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import spectrumx
 import argparse
 import logging
 import pathlib
@@ -15,6 +16,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def main():
+
+    version_str = spectrumx.__version__
+    version = tuple(int(part) for part in version_str.split(".") if part.isdigit())
+    assert version >= (0, 1, 11), (
+    "SpectrumX version must be at least 0.1.11 to create multi-channel captures."
+    f" Current version: {version_str}"
+    )
+
     parser = argparse.ArgumentParser(
         prog="upload_multichannel_to_sds",
         description="Upload a multi-channel DigitalRF capture to the SDS",
