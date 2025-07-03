@@ -28,7 +28,7 @@ class MEPTunerTest(MEPTuner):
             raise ValueError("Frequency cannot be negative")
 
         # Calculate local oscillator frequency
-        self._f_lo_mhz = f_c_mhz - self._f_if_mhz
+        self._f_lo_mhz = f_c_mhz + self._f_if_mhz
 
         logging.info(f"Test: Setting center frequency to {f_c_mhz} MHz")
         logging.debug(f"Test: Setting local oscillator frequency to {self._f_lo_mhz} MHz")
