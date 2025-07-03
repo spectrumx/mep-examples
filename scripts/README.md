@@ -71,3 +71,27 @@ options:
   --log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}, -l {DEBUG,INFO,WARNING,ERROR,CRITICAL}
                         Set logging level (default: INFO)
 ```
+
+### upload_to_sds.py
+
+This script uploads directory of files to the SDS and create capture from these files.
+
+```
+usage: upload_to_sds [-h] [-n] [--dotenv DOTENV] [--channel CHANNEL]
+                     [--create-capture]
+                     data_dir reference_name
+
+positional arguments:
+  data_dir           Path to data directory to upload
+  reference_name     Reference name (virtual directory) to upload to. For example: digitalrf/your-data-folder-name
+
+options:
+  -h, --help         show this help message and exit
+  -n, --dry-run      
+  --dotenv DOTENV    Path to .env file containing SDS_SECRET_TOKEN
+  --channel CHANNEL  Channel to use for creating capture after upload
+  --create-capture   Create a capture after uploading files (--channel required if using --create-capture)
+
+Example: python upload_to_sds.py <local_dir> <reference dir> --create-capture
+--channel <channel name> This uploads data and creates a capture.
+```
