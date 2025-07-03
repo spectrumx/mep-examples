@@ -120,7 +120,11 @@ def main():
                 logger.error("--channel is required when --create-capture is used")
                 sys.exit(1)
             logger.info("Upload completed successfully. Creating capture...")
-            success = create_capture(sds, args.reference_name, args.channel)
+            success = create_capture(
+                sds_client=sds,
+                sds_dir=args.reference_name,
+                channel=args.channel
+            )
             if success:
                 logger.info("Capture created successfully!")
             else:
