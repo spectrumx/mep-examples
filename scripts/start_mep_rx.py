@@ -17,6 +17,7 @@ import src.mep_rfsoc as mep_rfsoc
 import src.mep_tuner_valon as mep_tuner_valon
 import os
 import math
+from datetime import datetime
 
 LOG_DIR = os.path.join(os.path.expanduser("~"),"log","spectrumx")
 ADC_IF = 1090      # ADC intermediate frequency (MHz)
@@ -35,20 +36,21 @@ def main(args):
 
     # Configure logging
     os.makedirs(LOG_DIR, exist_ok=True)
-    time_str = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    time_str = datetime.now().isoformat().replace(':', '-').replace('.', '-')
     log_filename = f"capture_sweep_{time_str}.log"
     log_filepath = os.path.join(LOG_DIR, log_filename)
 
     logging.basicConfig(
         level=args.log_level,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        filename=log_filepath
+        filename=log_filepath,
+        datefmt='%Y-%m-%dT%H:%M:%S'
     )
 
     # Add console handler to also log to terminal
     console_handler = logging.StreamHandler()
     console_handler.setLevel(args.log_level)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%dT%H:%M:%S')
     console_handler.setFormatter(formatter)
     logging.getLogger().addHandler(console_handler)
 
