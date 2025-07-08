@@ -33,8 +33,6 @@ CMD0="./system_time_sync.bash"
 screen -S $SESSION0 -X quit 2>/dev/null
 cat > /tmp/mep_screens/$SESSION0.sh <<EOF
 #!/usr/bin/env bash -l
-source /opt/radioconda/etc/profile.d/conda.sh
-conda activate base
 cd "$WORKDIR"
 echo "Running: $CMD0"
 $CMD1
@@ -52,8 +50,6 @@ CMD1="./start_rfsoc_rx.bash -c A B -r"
 screen -S $SESSION1 -X quit 2>/dev/null
 cat > /tmp/mep_screens/$SESSION1.sh <<EOF
 #!/usr/bin/env bash -l
-source /opt/radioconda/etc/profile.d/conda.sh
-conda activate base
 cd "$WORKDIR"
 echo "Running: $CMD1"
 $CMD1
@@ -66,13 +62,11 @@ echo "... screen -xS $SESSION1"
 
 # ===== SCREEN SESSION: mep_rx ===== #
 SESSION2="mep_rx"
-CMD2="python3 start_mep_rx.py -f1 7000 -f2 8500 -s 10 -d 10 -t $TUNER"
+CMD2="./start_mep_rx.py -f1 7000 -f2 8500 -s 10 -d 10 -t $TUNER"
 
 screen -S $SESSION2 -X quit 2>/dev/null
 cat > /tmp/mep_screens/$SESSION2.sh <<EOF
 #!/usr/bin/env bash -l
-source /opt/radioconda/etc/profile.d/conda.sh
-conda activate base
 cd "$WORKDIR"
 echo "Running: $CMD2"
 $CMD2
@@ -85,13 +79,11 @@ echo "... screen -xS $SESSION2"
 
 # ===== SCREEN SESSION: recorder_digitalrf ===== #
 SESSION3="recorder_digitalrf"
-CMD3="python3 start_rec.py -c A -r 10"
+CMD3="./start_rec.py -c A -r 10"
 
 screen -S $SESSION3 -X quit 2>/dev/null
 cat > /tmp/mep_screens/$SESSION3.sh <<EOF
 #!/usr/bin/env bash -l
-source /opt/radioconda/etc/profile.d/conda.sh
-conda activate base
 cd "$WORKDIR"
 echo "Running: $CMD3"
 $CMD3
