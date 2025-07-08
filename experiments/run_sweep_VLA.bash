@@ -78,7 +78,7 @@ echo "... screen -xS $SESSION2"
 
 # ===== SCREEN SESSION: recorder_digitalrf ===== #
 SESSION3="recorder_digitalrf"
-CMD3="python3 start_rec.py -c A -r 1"
+CMD3="python3 start_rec.py -c A -r 10"
 
 screen -S $SESSION3 -X quit 2>/dev/null
 cat > /tmp/mep_screens/$SESSION3.sh <<EOF
