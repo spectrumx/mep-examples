@@ -10,6 +10,13 @@
 #    (disabled) Starts gnuradio: "gnuradio-companion" [gnuradio]
 #    Starts the jetson power/temp monitor: "sudo python /usr/share/jetsonpowergui/__main__.py" [jetsonpowergui]
 #
+#    Re-running this script will kill previously started screen sessions
+#        Can force with killall screen
+#
+#    Important, the time sync requires a One-Time ssh key setup for each laptop/pc <--> MEP pair:
+#        1) Try  ssh-copy-id mep@<<the mep's IP address>>, if that works, done. If not, 
+#        2) Run this on the remote laptop/pc: ssh-keygen -t rsa, then
+#        3) re-run ssh-copy-id mep@<<the mep's IP address>>
 
 # ===== COMMON ===== #
 TUNER="VALON" #VALON, LMX2820, or TEST
