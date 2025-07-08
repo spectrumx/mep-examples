@@ -19,6 +19,7 @@ import os
 import math
 from datetime import datetime
 
+RECORDER_RESTART_COUNT = 20
 LOG_DIR = os.path.join(os.path.expanduser("~"),"log","spectrumx")
 ADC_IF = 1090      # ADC intermediate frequency (MHz)
 
@@ -100,10 +101,23 @@ def main(args):
         freqs_hz = range(f_c_start_hz, f_c_end_hz, f_step_hz)
 
     # Loop over frequency range
+    loop_count = args.rec_restart + 1
     for f_c_hz in freqs_hz:
         logging.info(f"Tuning to {GREEN}{f_c_hz}{RESET}")
         # Place RFSoC Capture in Reset
         rfsoc.reset()
+
+        # Restart recorder
+        # FIXME: This is a hack to restart the recorder every N loops
+        if loop_count >= args.rec_restart:
+            logging.info("Restarting recorder")
+            os.system('/opt/mep-examples/scripts/stop_rec.py')
+            time.sleep(2)
+            os.system('/opt/mep-examples/scripts/start_rec.py -c A -r 10')
+            time.sleep(1)
+            os.system('/opt/mep-examples/scripts/start_rec.py -c A -r 10')
+            time.sleep(1)
+            loop_count = 0
 
         # Tune to starting frequency
         f_c_mhz = f_c_hz / 1e6
@@ -127,6 +141,7 @@ def main(args):
             tlm = rfsoc.get_tlm()
             logging.debug(f"{tlm_to_str(tlm)} ")
             time.sleep(1)
+        loop_count += 1
 
 def tlm_to_str(tlm):
     if (tlm is None):
@@ -152,6 +167,7 @@ if __name__ == "__main__":
     parser.add_argument('--log-level', '-l', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='Set logging level (default: INFO)')
     parser.add_argument('--skip_ntp', action='store_true', help='Skip NTP update on RFSoC')
+    parser.add_argument('--rec_restart', type=int, default=RECORDER_RESTART_COUNT, help=f'Recorder restart count (default: {RECORDER_RESTART_COUNT})')
 
     args = parser.parse_args()
     main(args)
