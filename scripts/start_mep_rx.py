@@ -14,7 +14,7 @@ import time
 import logging
 import src.mep_tuner_test as mep_tuner_test
 import src.mep_rfsoc as mep_rfsoc
-import src.mep_tuner_valon as mep_tuner_valon
+import src.mep_tuner_valon2 as mep_tuner_valon
 import os
 import math
 from datetime import datetime
