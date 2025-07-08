@@ -19,7 +19,7 @@ cat << 'EOF'
 #        2) ON YOUR LAPTOP run ssh-keygen -t rsa, then
 #        3) ON YOUR LAPTOP re-run ssh-copy-id mep@<<the mep's IP address>>
 #
-#    2) ON YOUR LAPTOP run /opt/mep-examples/scripts/system_time_sync.bash (needs Linux, Mac, or WSL on Windows
+#    2) ON YOUR LAPTOP run /opt/mep-examples/scripts/system_time_sync.bash 192.168.33.1 (needs Linux, Mac, or WSL on Windows
 #    3) Run *this* script ON THE MEP /opt/mep-examples/experiments/run_sweep_VLA_<<TUNER>>.bash: Either Valon or LMX version
 EOF
 
