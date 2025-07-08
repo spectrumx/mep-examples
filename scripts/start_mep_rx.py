@@ -69,6 +69,10 @@ def main(args):
         tuner = mep_tuner_lmx2820.MEPTunerLMX2820(ADC_IF)
     if (args.tuner == "VALON"):
         tuner = mep_tuner_valon.MEPTunerValon(ADC_IF)
+    
+    # Update NTP
+    logging.info("Updating NTP on RFSoC")
+    os.system(os.path.join(os.getcwd(), "rfsoc_update_ntp.bash"))
 
     # Connect to RFSoC ZMQ
     rfsoc = mep_rfsoc.MEPRFSoC()
