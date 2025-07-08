@@ -71,8 +71,9 @@ def main(args):
         tuner = mep_tuner_valon.MEPTunerValon(ADC_IF)
     
     # Update NTP
-    logging.info("Updating NTP on RFSoC")
-    os.system(os.path.join(os.getcwd(), "rfsoc_update_ntp.bash"))
+    if not args.skip_ntp:
+        logging.info("Updating NTP on RFSoC")
+        os.system(os.path.join(os.getcwd(), "rfsoc_update_ntp.bash"))
 
     # Connect to RFSoC ZMQ
     rfsoc = mep_rfsoc.MEPRFSoC()
@@ -150,6 +151,7 @@ if __name__ == "__main__":
                         help='Select tuner [LMX2820, VALON, TEST] (default: TEST)')
     parser.add_argument('--log-level', '-l', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='Set logging level (default: INFO)')
+    parser.add_argument('--skip_ntp', action='store_true', help='Skip NTP update on RFSoC')
 
     args = parser.parse_args()
     main(args)
