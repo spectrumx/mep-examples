@@ -143,6 +143,9 @@ def main(args):
             time.sleep(1)
         loop_count += 1
 
+    logging.info("Stopping recorder")
+    os.system('/opt/mep-examples/scripts/stop_rec.py')
+
 def tlm_to_str(tlm):
     if (tlm is None):
         return ""
