@@ -51,7 +51,7 @@ echo "... screen -xS $SESSION1"
 
 # ===== SCREEN SESSION: mep_rx ===== #
 SESSION2="mep_rx"
-CMD2="./start_mep_rx.py -f1 7133 -s 20 -d 99000 -t $TUNER"
+CMD2="./start_mep_rx.py -f1 7130 -s 10 -d 99000 -t $TUNER"
 
 screen -S $SESSION2 -X quit 2>/dev/null
 cat > /tmp/mep_screens/$SESSION2.sh <<EOF
