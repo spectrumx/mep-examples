@@ -19,7 +19,6 @@ import os
 import math
 from datetime import datetime
 
-RECORDER_RESTART_COUNT = 20
 LOG_DIR = os.path.join(os.path.expanduser("~"),"log","spectrumx")
 ADC_IF = 1090      # ADC intermediate frequency (MHz)
 
@@ -27,6 +26,20 @@ GREEN = "\033[92m"
 BLUE = "\033[94m"
 RED = "\033[91m"
 RESET = "\033[0m"
+
+def stop_start_recorder(rate=10):
+    """
+    Stop and start the recorder.
+    Args:
+        rate (int): Rate parameter for start_rec.py (default: 10)
+    """
+    logging.info("Restarting recorder")
+    os.system('/opt/mep-examples/scripts/stop_rec.py')
+    time.sleep(2)
+    os.system(f'/opt/mep-examples/scripts/start_rec.py -c A -r {rate}')
+    time.sleep(1)
+    os.system(f'/opt/mep-examples/scripts/start_rec.py -c A -r {rate}')
+    time.sleep(1)
 
 def main(args):
     """
@@ -101,23 +114,12 @@ def main(args):
         freqs_hz = range(f_c_start_hz, f_c_end_hz, f_step_hz)
 
     # Loop over frequency range
-    loop_count = args.rec_restart + 1
+    last_restart_time = time.time()
+    restart_interval = args.restart_interval
     for f_c_hz in freqs_hz:
         logging.info(f"Tuning to {GREEN}{f_c_hz}{RESET}")
         # Place RFSoC Capture in Reset
         rfsoc.reset()
-
-        # Restart recorder
-        # FIXME: This is a hack to restart the recorder every N loops
-        if loop_count >= args.rec_restart:
-            logging.info("Restarting recorder")
-            os.system('/opt/mep-examples/scripts/stop_rec.py')
-            time.sleep(2)
-            os.system('/opt/mep-examples/scripts/start_rec.py -c A -r 10')
-            time.sleep(1)
-            os.system('/opt/mep-examples/scripts/start_rec.py -c A -r 10')
-            time.sleep(1)
-            loop_count = 0
 
         # Tune to starting frequency
         f_c_mhz = f_c_hz / 1e6
@@ -140,8 +142,15 @@ def main(args):
         while((time_loop_start - time.time() + args.dwell) > 0):
             tlm = rfsoc.get_tlm()
             logging.debug(f"{tlm_to_str(tlm)} ")
+            
+            # Check if it's time to restart the recorder
+            current_time = time.time()
+            if current_time - last_restart_time >= restart_interval:
+                logging.info("Timer reached - restarting recorder")
+                stop_start_recorder(args.step)
+                last_restart_time = current_time
+            
             time.sleep(1)
-        loop_count += 1
 
     logging.info("Stopping recorder")
     os.system('/opt/mep-examples/scripts/stop_rec.py')
@@ -170,7 +179,7 @@ if __name__ == "__main__":
     parser.add_argument('--log-level', '-l', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='Set logging level (default: INFO)')
     parser.add_argument('--skip_ntp', action='store_true', help='Skip NTP update on RFSoC')
-    parser.add_argument('--rec_restart', type=int, default=RECORDER_RESTART_COUNT, help=f'Recorder restart count (default: {RECORDER_RESTART_COUNT})')
+    parser.add_argument('--restart_interval', type=int, default=60, help='Recorder restart interval in seconds (default: 60)')
 
     args = parser.parse_args()
     main(args)
