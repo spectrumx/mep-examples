@@ -27,19 +27,28 @@ BLUE = "\033[94m"
 RED = "\033[91m"
 RESET = "\033[0m"
 
-def stop_start_recorder(rate=10):
+def stop_start_recorder(rfsoc, rate=10):
     """
     Stop and start the recorder.
     Args:
         rate (int): Rate parameter for start_rec.py (default: 10)
     """
     logging.info("Restarting recorder")
+    # Place RFSoC Capture in Reset
+    rfsoc.reset()
+
+    # Stop recorder
     os.system('/opt/mep-examples/scripts/stop_rec.py')
     time.sleep(2)
+
+    # Start recorder
     os.system(f'/opt/mep-examples/scripts/start_rec.py -c A -r {rate}')
     time.sleep(1)
     os.system(f'/opt/mep-examples/scripts/start_rec.py -c A -r {rate}')
     time.sleep(1)
+
+    # Start capture on pps edge
+    rfsoc.capture_next_pps()
 
 def main(args):
     """
@@ -147,7 +156,7 @@ def main(args):
             current_time = time.time()
             if current_time - last_restart_time >= restart_interval:
                 logging.info("Timer reached - restarting recorder")
-                stop_start_recorder(args.step)
+                stop_start_recorder(rfsoc, args.step)
                 last_restart_time = current_time
             
             time.sleep(1)
@@ -179,7 +188,7 @@ if __name__ == "__main__":
     parser.add_argument('--log-level', '-l', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='Set logging level (default: INFO)')
     parser.add_argument('--skip_ntp', action='store_true', help='Skip NTP update on RFSoC')
-    parser.add_argument('--restart_interval', type=int, default=60, help='Recorder restart interval in seconds (default: 60)')
+    parser.add_argument('--restart_interval', type=int, default=300, help='Recorder restart interval in seconds (default: 300)')
 
     args = parser.parse_args()
     main(args)
