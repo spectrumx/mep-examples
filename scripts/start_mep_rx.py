@@ -33,7 +33,7 @@ def stop_start_recorder(rate=10):
     Args:
         rate (int): Rate parameter for start_rec.py (default: 10)
     """
-
+    logging.info("Restarting recorder")
     # Stop recorder
     os.system('/opt/mep-examples/scripts/stop_rec.py')
     time.sleep(2)
@@ -119,6 +119,7 @@ def main(args):
     # Loop over frequency range
     last_restart_time = time.time()
     restart_interval = args.restart_interval
+    stop_start_recorder(int(args.step))
     for f_c_hz in freqs_hz:
         logging.info(f"Tuning to {GREEN}{f_c_hz}{RESET}")
         # Place RFSoC Capture in Reset
