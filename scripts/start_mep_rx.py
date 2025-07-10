@@ -92,7 +92,7 @@ def main(args):
         tuner = mep_tuner_lmx2820.MEPTunerLMX2820(ADC_IF)
     if (args.tuner == "VALON"):
         tuner = mep_tuner_valon.MEPTunerValon(ADC_IF)
-    
+
     # Update NTP
     if not args.skip_ntp:
         logging.info("Updating NTP on RFSoC")
@@ -151,14 +151,14 @@ def main(args):
         while((time_loop_start - time.time() + args.dwell) > 0):
             tlm = rfsoc.get_tlm()
             logging.debug(f"{tlm_to_str(tlm)} ")
-            
+
             # Check if it's time to restart the recorder
             current_time = time.time()
             if current_time - last_restart_time >= restart_interval:
                 logging.info("Timer reached - restarting recorder")
-                stop_start_recorder(rfsoc, args.step)
+                stop_start_recorder(int(args.step))
                 last_restart_time = current_time
-            
+
             time.sleep(1)
 
     logging.info("Stopping recorder")
