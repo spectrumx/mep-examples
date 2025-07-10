@@ -89,9 +89,6 @@ def main(args):
         logging.info("Updating NTP on RFSoC")
         os.system(os.path.join(os.getcwd(), "rfsoc_update_ntp.bash"))
 
-    # Start recording
-    stop_start_recorder(int(args.step))
-
     # Connect to RFSoC ZMQ
     rfsoc = mep_rfsoc.MEPRFSoC()
 
