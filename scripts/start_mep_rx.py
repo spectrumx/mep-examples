@@ -27,15 +27,12 @@ BLUE = "\033[94m"
 RED = "\033[91m"
 RESET = "\033[0m"
 
-def stop_start_recorder(rfsoc, rate=10):
+def stop_start_recorder(rate=10):
     """
     Stop and start the recorder.
     Args:
         rate (int): Rate parameter for start_rec.py (default: 10)
     """
-    logging.info("Restarting recorder")
-    # Place RFSoC Capture in Reset
-    rfsoc.reset()
 
     # Stop recorder
     os.system('/opt/mep-examples/scripts/stop_rec.py')
@@ -46,9 +43,6 @@ def stop_start_recorder(rfsoc, rate=10):
     time.sleep(1)
     os.system(f'/opt/mep-examples/scripts/start_rec.py -c A -r {rate}')
     time.sleep(1)
-
-    # Start capture on pps edge
-    rfsoc.capture_next_pps()
 
 def main(args):
     """
