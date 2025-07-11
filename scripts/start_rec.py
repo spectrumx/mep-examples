@@ -26,6 +26,11 @@ def main():
         default=1,
     )
     parser.add_argument(
+        "--flip",
+        action="store_true",
+        help="Invert spectrum by taking the complex conjugate of the IQ data",
+    )
+    parser.add_argument(
         "--added-freq",
         dest="freq_idx_offset",
         type=float,
@@ -72,6 +77,25 @@ def main():
         "task_name": "config.load",
         "arguments": {
             "name": f"{config_name}",
+        },
+        "response_topic": "recorder/config/response",
+    }
+    subprocess.run(
+        [
+            "mosquitto_pub",
+            "-t",
+            "recorder/command",
+            "-m",
+            json.dumps(payload),
+        ]
+    )
+    time.sleep(0.1)
+
+    payload = {
+        "task_name": "config.set",
+        "arguments": {
+            "key": "packet.apply_conjugate",
+            "value": args.flip,
         },
         "response_topic": "recorder/config/response",
     }
