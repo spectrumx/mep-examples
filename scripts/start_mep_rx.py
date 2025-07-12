@@ -39,9 +39,10 @@ def stop_start_recorder(rate=10):
     time.sleep(2)
 
     # Start recorder
-    os.system(f'/opt/mep-examples/scripts/start_rec.py -c A -r {rate}')
+    # (flip spectrum because we're doing high-side injection)
+    os.system(f'/opt/mep-examples/scripts/start_rec.py -c A -r {rate} --flip')
     time.sleep(1)
-    os.system(f'/opt/mep-examples/scripts/start_rec.py -c A -r {rate}')
+    os.system(f'/opt/mep-examples/scripts/start_rec.py -c A -r {rate} --flip')
     time.sleep(1)
 
 def main(args):
