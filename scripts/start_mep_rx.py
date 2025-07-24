@@ -3,188 +3,202 @@
 start_mep_rx.py
 
 Automate tuning and starting the RFSOC I/Q stream.
-Supports frequency sweep capture. Control the tuner
-through USB/SPI and RFSoC through ZeroMQ.
+Supports frequency sweep capture.
 
-Author: nicholas.rainville@colorado.edu
+- If a tuner is specified: performs tuner-controlled RF sweep.
+- If tuner is None: performs IF sweep only using RFSoC local NCO.
+
+Author: nicholas.rainville@colorado.edu, updated by john.marino@colorado.edu
 """
 
+# ===== IMPORTS ===== #
 import argparse
 import time
 import logging
-import src.mep_tuner_test as mep_tuner_test
-import src.mep_rfsoc as mep_rfsoc
-import src.mep_tuner_valon2 as mep_tuner_valon
 import os
 import math
 from datetime import datetime
+import src.mep_rfsoc as mep_rfsoc
 
-LOG_DIR = os.path.join(os.path.expanduser("~"),"log","spectrumx")
-ADC_IF = 1090      # ADC intermediate frequency (MHz)
-
+# ===== COMMON CONFIG ===== #
+LOG_DIR = os.path.join(os.path.expanduser("~"), "log", "spectrumx")
 GREEN = "\033[92m"
-BLUE = "\033[94m"
-RED = "\033[91m"
 RESET = "\033[0m"
 
-def stop_start_recorder(rate=10):
-    """
-    Stop and start the recorder.
-    Args:
-        rate (int): Rate parameter for start_rec.py (default: 10)
-    """
+# ===== HELPER FUNCTIONS ===== #
+def stop_start_recorder(channel="A", rate=10):
     logging.info("Restarting recorder")
-    # Stop recorder
     os.system('/opt/mep-examples/scripts/stop_rec.py')
     time.sleep(2)
-
-    # Start recorder
-    # (flip spectrum because we're doing high-side injection)
-    os.system(f'/opt/mep-examples/scripts/start_rec.py -c A -r {rate} --flip')
+    os.system(f'/opt/mep-examples/scripts/start_rec.py -c {channel} -r {rate}')
     time.sleep(1)
-    os.system(f'/opt/mep-examples/scripts/start_rec.py -c A -r {rate} --flip')
+    os.system(f'/opt/mep-examples/scripts/start_rec.py -c {channel} -r {rate}')
     time.sleep(1)
 
-def main(args):
-    """
-    Main function for the frequency sweep control.
-    Args:
-        args (argparse.Namespace): Command-line arguments. Expected to contain:
-    """
+def force_restart_recorder(last_restart, interval_s, channel, rate):
+    if time.time() - last_restart >= interval_s:
+        logging.info("Restart interval reached. Restarting recorder.")
+        stop_start_recorder(channel, rate)
+        return time.time()
+    return last_restart
 
-    # Configure logging
-    os.makedirs(LOG_DIR, exist_ok=True)
-    time_str = datetime.now().isoformat().replace(':', '-').replace('.', '-')
-    log_filename = f"capture_sweep_{time_str}.log"
-    log_filepath = os.path.join(LOG_DIR, log_filename)
+def get_frequency_list(start_mhz, end_mhz, step_mhz):
+    start_hz = int(start_mhz * 1e6)
+    step_hz = int(step_mhz * 1e6)
+    if math.isnan(end_mhz):
+        return [start_hz]
+    end_hz = int(end_mhz * 1e6)
+    return range(start_hz, end_hz, step_hz)
 
-    logging.basicConfig(
-        level=args.log_level,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        filename=log_filepath,
-        datefmt='%Y-%m-%dT%H:%M:%S'
+def wait_for_rfsoc(rfsoc, timeout_s=10):
+    for _ in range(timeout_s):
+        tlm = rfsoc.get_tlm()
+        if tlm is not None:
+            return True
+        time.sleep(1)
+    return False
+
+def tlm_to_str(tlm):
+    if tlm is None:
+        return ""
+    return (
+        f"RX State: {tlm['state']} "
+        f"f_c (tagged): {float(tlm['f_c_hz'])/1e6:.2f} MHz "
+        f"f_if (ADC): {float(tlm['f_if_hz'])/1e6:.2f} MHz "
+        f"f_s: {float(tlm['f_s'])/1e6:.2f} MHz "
+        f"PPS Count: {tlm['pps_count']} "
+        f"Channel(s): {tlm['channels']}"
     )
 
-    # Add console handler to also log to terminal
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(args.log_level)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%dT%H:%M:%S')
-    console_handler.setFormatter(formatter)
-    logging.getLogger().addHandler(console_handler)
+def wait_dwell_period(rfsoc, dwell_s):
+    start = time.time()
+    while (time.time() - start) < dwell_s:
+        tlm = rfsoc.get_tlm()
+        logging.debug(tlm_to_str(tlm))
+        time.sleep(1)
 
-    # Inputs
-    f_c_start_hz = int(args.freq_start * 1e6)
-    f_step_hz = int(args.step * 1e6)
+def get_tuner_object(tuner_type, adc_if):
+    tuner_object = None
 
-    # Constants
-    f_if_hz = 1090e6 # Hz
+    if tuner_type is not None:
+        if adc_if is None:
+            logging.error("You must specify --adc_if when using a tuner.")
+            exit(1)
 
-    # Connect to tuner
-    if (args.tuner == "TEST"):
-        tuner = mep_tuner_test.MEPTunerTest(ADC_IF)
-    if (args.tuner == "LMX2820"):
-        import src.mep_tuner_lmx2820 as mep_tuner_lmx2820
-        tuner = mep_tuner_lmx2820.MEPTunerLMX2820(ADC_IF)
-    if (args.tuner == "VALON"):
-        tuner = mep_tuner_valon.MEPTunerValon(ADC_IF)
+        logging.info(f"Tuner selected: {tuner_type} with ADC IF = {adc_if:.2f} MHz")
 
-    # Update NTP
+        if tuner_type == "TEST":
+            import src.mep_tuner_test as tuner_mod
+            tuner_object = tuner_mod.MEPTunerTest(adc_if)
+            
+        elif tuner_type == "VALON":
+            import src.mep_tuner_valon2 as tuner_mod
+            tuner_object = tuner_mod.MEPTunerValon(adc_if)
+            
+        elif tuner_type == "LMX2820":
+            import src.mep_tuner_lmx2820 as tuner_mod
+            tuner_object = tuner_mod.MEPTunerLMX2820(adc_if)
+            
+        else:
+            raise ValueError(f"Unknown tuner type: {tuner_type}")
+
+    return tuner_object
+
+        
+def run_sweep(freqs_hz, rfsoc, args, tuner=None):
+    # Determine Sweep Mode: Sweep IF without a tuner, or sweep RF with a tuner, must specify fixed IF
+    mode = "IF" if tuner is None else "RF"
+    logging.info(f"{mode} sweep starting...")
+
+    # Start Recorder
+    last_restart_time = time.time()
+    stop_start_recorder(channel=args.channel)
+
+    # Loop through Frequencies
+    for f_hz in freqs_hz:
+    	# Convert to Hz
+        f_mhz = f_hz / 1e6
+        
+        # Reset RFSoC
+        rfsoc.reset()
+
+	# Set RF or IF frequency and metadata
+        if mode == "IF":
+            logging.info(f"Setting RFSoC NCO to {GREEN}{f_mhz:.2f} MHz{RESET}")
+            rfsoc.set_freq_IF(f_mhz)
+            time.sleep(0.1) # Wait for lock
+            rfsoc.set_freq_metadata(f_hz / 1e3)  # Tag in kHz
+        elif mode == "RF":
+            logging.info(f"Tuning to {GREEN}{f_mhz:.2f} MHz{RESET}")
+            tuner.set_freq(f_mhz)
+            time.sleep(0.1) # Wait for lock
+            rfsoc.set_freq_metadata(f_hz / 1e3)
+
+        # Capture
+        rfsoc.capture_next_pps()
+        tlm = rfsoc.get_tlm()
+        tlm = rfsoc.get_tlm()
+        if not tlm or tlm.get('state') != 'active':
+            logging.error("RFSoC capture failed or telemetry missing.")
+            continue
+        logging.info(f"RFSoC state: {tlm['state']}")
+        wait_dwell_period(rfsoc, args.dwell)
+        
+        # Force recorder restart every args.restart_interval seconds
+        last_restart_time = force_restart_recorder(
+            last_restart_time,
+            args.restart_interval,
+            args.channel,
+            rate=10
+        )
+
+# ---------------------- Script Entry ----------------------
+
+if __name__ == "__main__":
+    # === Parse Arguments === #
+    parser = argparse.ArgumentParser(description='RFSoC capture with optional tuner or IF sweep')
+    parser.add_argument('--freq_start', '-f1', type=float, default=7000, help='Start frequency in MHz')
+    parser.add_argument('--freq_end', '-f2', type=float, default=float('nan'), help='End frequency in MHz')
+    parser.add_argument('--channel', '-c', type=str, default="A", help='Channel: A or A B')
+    parser.add_argument('--step', '-s', type=float, default=10, help='Step size in MHz')
+    parser.add_argument('--dwell', '-d', type=float, default=60, help='Dwell time in seconds')
+    parser.add_argument('--tuner', '-t', type=lambda x: x.upper() if x.lower() != "none" else None,
+                        choices=["LMX2820", "VALON", "TEST", "None"], default=None,
+                        help='Tuner type [LMX2820, VALON, TEST, None]')
+    parser.add_argument('--adc_if', type=float, help='ADC IF in MHz (required if tuner is used)')
+    parser.add_argument('--log-level', '-l', type=str, default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], help='Logging level')
+    parser.add_argument('--skip_ntp', action='store_true', help='Skip NTP sync')
+    parser.add_argument('--restart_interval', type=int, default=300, help='Recorder restart interval in seconds')
+    args = parser.parse_args()
+
+    # === Setup Logging === #
+    os.makedirs(LOG_DIR, exist_ok=True)
+    timestamp = datetime.now().isoformat().replace(':', '-').replace('.', '-')
+    log_path = os.path.join(LOG_DIR, f"capture_sweep_{timestamp}.log")
+    logging.basicConfig(level=args.log_level, format='%(asctime)s - %(levelname)s - %(message)s',
+                        filename=log_path, datefmt='%Y-%m-%dT%H:%M:%S')
+    logging.getLogger().addHandler(logging.StreamHandler())
+
+    # === Update NTP if Needed === #
     if not args.skip_ntp:
         logging.info("Updating NTP on RFSoC")
         os.system(os.path.join(os.getcwd(), "rfsoc_update_ntp.bash"))
 
-    # Connect to RFSoC ZMQ
+    # === Connect to RFSoC === #
     rfsoc = mep_rfsoc.MEPRFSoC()
+    if not wait_for_rfsoc(rfsoc):
+        logging.error("RFSoC not responding.")
+        exit(1)
 
-    # Wait for RFSoC
-    rfsoc_timeout_s = 10
-    rfsoc_wait_count = 0
-    tlm = rfsoc.get_tlm()
-    while(tlm is None and rfsoc_wait_count < rfsoc_timeout_s):
-        logging.debug("Waiting for RFSoC")
-        time.sleep(1)
-        tlm = rfsoc.get_tlm()
-        rfsoc_wait_count += 1
+    # === Tuner Setup === #
+    tuner = get_tuner_object(args.tuner, args.adc_if)
 
-    if (rfsoc_wait_count >= rfsoc_timeout_s):
-        logging.error("Failed to connect to RFSoC")
-        return
+    # === Frequency Sweep === #
+    freqs_hz = get_frequency_list(args.freq_start, args.freq_end, args.step)
+    run_sweep(freqs_hz, rfsoc, args, tuner=tuner)
 
-    # Generate frequency list
-    if math.isnan(args.freq_end):
-        freqs_hz = [f_c_start_hz]
-    else:
-        f_c_end_hz = int(args.freq_end * 1e6)
-        freqs_hz = range(f_c_start_hz, f_c_end_hz, f_step_hz)
-
-    # Loop over frequency range
-    last_restart_time = time.time()
-    restart_interval = args.restart_interval
-    stop_start_recorder(int(args.step))
-    for f_c_hz in freqs_hz:
-        logging.info(f"Tuning to {GREEN}{f_c_hz}{RESET}")
-        # Place RFSoC Capture in Reset
-        rfsoc.reset()
-
-        # Tune to starting frequency
-        f_c_mhz = f_c_hz / 1e6
-        tuner.set_freq(f_c_mhz)
-        time.sleep(.1) # Wait for tuner to lock?
-
-        # Start capture on pps edge
-        rfsoc.set_freq_metadata(f_c_hz)
-        rfsoc.capture_next_pps()
-        tlm = rfsoc.get_tlm()
-        if(tlm is not None):
-            if(tlm['state']) != 'active':
-                logging.error(f"Failed to start RFSoC capture")
-                continue
-            logging.info(f"RFSoC state {tlm['state']}")
-
-        # Wait for dwell time
-        time_loop_start = time.time()
-        logging.info(f"Waiting for {args.dwell} s")
-        while((time_loop_start - time.time() + args.dwell) > 0):
-            tlm = rfsoc.get_tlm()
-            logging.debug(f"{tlm_to_str(tlm)} ")
-
-            # Check if it's time to restart the recorder
-            current_time = time.time()
-            if current_time - last_restart_time >= restart_interval:
-                logging.info("Timer reached - restarting recorder")
-                stop_start_recorder(int(args.step))
-                last_restart_time = current_time
-
-            time.sleep(1)
-
+    # === Shutdown === #
     logging.info("Stopping recorder")
     os.system('/opt/mep-examples/scripts/stop_rec.py')
 
-def tlm_to_str(tlm):
-    if (tlm is None):
-        return ""
-    tlm_str =  f"RX State: {tlm['state']} "
-    tlm_str += f"f_c: {float(tlm['f_c_hz'])/1e6} MHz "
-    tlm_str += f"f_if: {float(tlm['f_if_hz'])/1e6} MHz "
-    tlm_str += f"f_s: {float(tlm['f_s'])/1e6} MHz "
-    tlm_str += f"PPS Count: {tlm['pps_count']} "
-    tlm_str += f"Channel(s): {tlm['channels']}"
-    return tlm_str
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Send command to the RFSoC')
-    parser.add_argument('--freq_start', '-f1', type=float, default=7000, help='Center frequency in MHz, if FREQ_END is also set this is the starting frequency (default: 7000 MHz)')
-    parser.add_argument('--freq_end', '-f2', type=float, default=float('nan'), help='End frequency in MHz (default: NaN)')
-    parser.add_argument('--step', '-s', type=float, default=10, help='Step size in MHz (default: 10 MHz)')
-    parser.add_argument('--dwell', '-d', type=float, default=60, help='Dwell time in seconds (default: 60 s)')
-    parser.add_argument( '--tuner', '-t', type=lambda x: x.upper(),
-                        choices=["LMX2820", "VALON", "TEST"], default="TEST",
-                        help='Select tuner [LMX2820, VALON, TEST] (default: TEST)')
-    parser.add_argument('--log-level', '-l', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
-                        help='Set logging level (default: INFO)')
-    parser.add_argument('--skip_ntp', action='store_true', help='Skip NTP update on RFSoC')
-    parser.add_argument('--restart_interval', type=int, default=300, help='Recorder restart interval in seconds (default: 300)')
-
-    args = parser.parse_args()
-    main(args)

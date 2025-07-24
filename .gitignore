@@ -2,3 +2,6 @@ gnuradio/*.py
 .DS_Store
 __pycache__/
 *.pyc
+/scripts/bak
+scripts/src/mep_rfsoc.py.bak
+scripts/start_mep_rx.py.bak2
