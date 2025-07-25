@@ -1,42 +1,48 @@
 #!/bin/bash
 
-# === NOTES === #
-# A script to start other scripts needed to collect data for the VLA experiment, each in separate screen sessions:
-#
-#    1) Starts the RFSoC with ADC capture held in reset: start_rfsoc_rx.bash
-#    2) Starts the Tuning, Sweeping, and Recording activities: start_mep_rx.py
-#    3) Starts the Jetson power/temp monitorGUI: "sudo python /usr/share/jetsonpowergui/__main__.py"
-#    4) (Removed) Starts GNURadio: "gnuradio-companion"
-#    5) Watches the Ringbuffer Directory for DigitalRF file changes: "drf watch /data/ringbuffer"
-#
-#    Re-running this script will kill previously started screen sessions
-#        Can force with killall screen
-
 cat << 'EOF'
-#
-#    # ==== TIME SYNCING ==== #
-#    # When powered on without internet, the MEP thinks it is 1970. You must sync the time!
-#    1) Important, the time sync requires a One-Time ssh key setup for each laptop/pc <--> MEP pair:
-#        1) ON YOUR LAPTOP run ssh-copy-id mep@<<the mep's IP address>>, if that works, done. If not,
-#        2) ON YOUR LAPTOP run ssh-keygen -t rsa, then
-#        3) ON YOUR LAPTOP re-run ssh-copy-id mep@<<the mep's IP address>>
-#    2) ON YOUR LAPTOP,  run /opt/mep-examples/scripts/system_time_sync.bash 192.168.33.1 (needs Linux, Mac, or WSL on Windows)
-#    
-#    # ==== INSTRUCTIONS ==== #
-#    ON THE MEP, open *THIS* script and modify configuation, then run: /opt/mep-examples/experiments/run_sweep.bash
-#
-#    # ==== TIPS ==== #
-#    If you are in the MEP's GUI DESKTOP environment and want to open all existing screen sessions in separate terminal windows, run:
-#      screen -ls | awk '/Detached/ {print $1}' | while read session; do gnome-terminal -- bash -c "screen -r $session; exec bash"; done
-#
-#    If you want to kill all screen seessions, run (this doesn't cleanly stop any scripts, it just kills the sessions):
-#      killall screen
-#
+╔═══════════════════════════════════════════════════════════════════════════╗
+║ ░░░░░░░░░░░░░░░░░░▒▒▓▓████ MEP DATA COLLECTION ████▓▓▒▒░░░░░░░░░░░░░░░░░░ ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+║                              ▶ DESCRIPTION ◀                              ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+║ A unified script to sweep the MEP across frequencies and record data:     ║
+║ Each opens in a separate screen session:                                  ║
+║   • RFSoC ADC Capture :     /opt/mep-examples/script/start_rfsoc_rx.bash  ║
+║   • Sweep/Tune/Record :     /opt/mep-examples/script/start_mep_rx.py      ║
+║   • Jetson Monitor GUI:     /usr/share/jetsonpowergui/__main__.py"        ║
+║   • DigitalRF Watcher :     drf watch /data/ringbuffer                    ║
+║   • (Removed) GNURadio:     gnuradio-companion                            ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+║                         ▶ TIME SYNCING REQUIRED ◀                         ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+║    MEP boots to 1970 without internet. Time must be synced manually!      ║
+║                                                                           ║
+║ 1) On YOUR LAPTOP, run:                                                   ║
+║    1A) $ ssh-copy-id mep@192.168.33.1 | If that works, skip to Step 2:    ║
+║    1B) $ ssh-keygen -t rsa            |                                   ║
+║    1C) $ ssh-copy-id mep@192.168.33.1 |                                   ║
+║                                                                           ║
+║ 2) ON YOUR LAPTOP, run: (Requires Linux, macOS, or WSL on Windows)        ║
+║     $ /opt/mep-examples/scripts/system_time_sync.bash 192.168.33.1        ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+║                             ▶ INSTRUCTIONS ◀                              ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+║ ON THE MEP, open *THIS* script and modify the user settings. The run it:  ║
+║     $ /opt/mep-examples/experiments/run_sweep.bash                        ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+║                                 ▶ TIPS ◀                                  ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+║ • From the MEP's GUI DESKTOP, to open all screen sessions in new windows: ║
+║     $ screen -ls | awk '/Detached/ {print $1}' | while read session; do gnome-terminal -- bash -c "screen -r $session; exec bash"; done
+║                                                                           ║
+║ • To kill all screen sessions (forceful — does NOT stop scripts):         ║
+║     $ killall screen                                                      ║
+╚═══════════════════════════════════════════════════════════════════════════╝
 
 EOF
 
 # --------------- USER SETTINGS --------------- #
-# ===== COMMON ===== #
 TUNER="LMX2820"           # Options: VALON, LMX2820, TEST, None
 ADC_IF=1090               # Fixed IF of the RFSoC in MHz, only required when a Tuner is being used, ignored otherwise
 FREQ_START=7000           # MHz for IF sweep, or RF sweep start if tuner present
@@ -45,6 +51,7 @@ STEP=10                   # Sweep frequency step size in MHz
 DWELL=10                  # Dwell time in seconds: Time to remain at each frequency step
 CHANNEL="A"               # Channel String, "A" or "A B"
 REC_RESTART_INTERVAL=300  # Force the DigitalRF recorder to restart every N seconds
+
 
 # --------------- HELPER FUNCTIONS --------------- #
 # Function to start a named screen session running an interactive login shell
@@ -77,7 +84,26 @@ send_command_to_session() {
     screen -S "$SESSION_NAME" -X stuff "$CMD"$'\n'
 }
 
+print_user_settings() {
+cat << EOF
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                            ▶ USER SETTINGS ◀                              ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+  TUNER:                ${TUNER:-<unset>}         # Options: VALON, LMX2820, TEST     
+  ADC_IF:               ${ADC_IF:-<unset>} MHz        # RFSoC fixed IF (if tuner used)    
+  FREQ_START:           ${FREQ_START:-<unset>} MHz        # Start of sweep                    
+  FREQ_END:             ${FREQ_END:-<unset>} MHz        # End of sweep                      
+  STEP:                 ${STEP:-<unset>} MHz          # Frequency step size               
+  DWELL:                ${DWELL:-<unset>} sec          # Time per frequency step           
+  CHANNEL:              ${CHANNEL:-<unset>}               # Channels to record (e.g., A B)    
+  REC_RESTART_INTERVAL: ${REC_RESTART_INTERVAL:-<unset>} sec         # Recorder restart interval  
+╚═══════════════════════════════════════════════════════════════════════════╝
+EOF
+}
+
+
 # --------------- SCREEN SESSIONS --------------- #
+print_user_settings
 echo "Starting Screen Sessions"
 
 # ===== SCREEN SESSION: rfsoc_rx ===== #
