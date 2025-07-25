@@ -53,31 +53,6 @@ start_screen_session() {
     local SESSION_NAME="$1"
     local COMMENT="${2:-}"
 
-    # Kill any previous screen session with the same name
-    screen -S "$SESSION_NAME" -X quit 2>/dev/null
-
-    # Start a new named screen session in detached mode (-dmS), using a login shell (-l)
-    screen -dmS "$SESSION_NAME" bash -l
-
-    # Print how to attach to it
-    echo "Starting screen session $SESSION_NAME: $COMMENT"
-    echo "... screen -xS $SESSION_NAME"
-}
-
-# Function to send (stuff) a command into a running screen session
-send_command_to_session() {
-    local SESSION_NAME="$1"
-    local CMD="$2"
-    screen -S "$SESSION_NAME" -X stuff "$CMD"$'\n'
-}
-
-# --------------- HELPER FUNCTIONS --------------- #
-# Function to start a named screen session running an interactive login shell
-start_screen_session() {
-    # Setup variables
-    local SESSION_NAME="$1"
-    local COMMENT="${2:-}"
-
     # Report
     echo "... $SESSION_NAME"
     echo "... ... $COMMENT"
