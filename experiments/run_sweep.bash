@@ -3,9 +3,11 @@
 # === NOTES === #
 # A script to start other scripts needed to collect data for the VLA experiment, each in separate screen sessions:
 #
-#    1) Starts the RF SOC configuration: start_rfsoc_rx.bash
-#    2) Starts the Sweep and Recorder: start_mep_rx.py
+#    1) Starts the RFSoC with ADC capture held in reset: start_rfsoc_rx.bash
+#    2) Starts the Tuning, Sweeping, and Recording activities: start_mep_rx.py
 #    3) Starts the Jetson power/temp monitorGUI: "sudo python /usr/share/jetsonpowergui/__main__.py"
+#    4) (Removed) Starts GNURadio: "gnuradio-companion"
+#    5) Watches the Ringbuffer Directory for DigitalRF file changes: "drf watch /data/ringbuffer"
 #
 #    Re-running this script will kill previously started screen sessions
 #        Can force with killall screen
@@ -21,6 +23,8 @@ cat << 'EOF'
 #    3) ON THE MEP, open *THIS* script and modify configuation, then run: /opt/mep-examples/experiments/run_sweep.bash
 #
 EOF
+#!/bin/bash
+
 # --------------- USER SETTINGS --------------- #
 # ===== COMMON ===== #
 TUNER="LMX2820"           # Options: VALON, LMX2820, TEST, None
@@ -31,60 +35,61 @@ STEP=10                   # Sweep frequency step size in MHz
 DWELL=10                  # Dwell time in seconds: Time to remain at each frequency step
 CHANNEL="A"               # Channel String, "A" or "A B"
 REC_RESTART_INTERVAL=300  # Force the DigitalRF recorder to restart every N seconds
-WORKDIR="/opt/mep-examples/scripts" # Place where the other scripts are located
+
+# --------------- HELPER FUNCTIONS --------------- #
+# Function to start a named screen session running an interactive login shell
+start_screen_session() {
+    # Setup variables
+    local SESSION_NAME="$1"
+    
+    # Kill any previous screen session with the same name
+    screen -S "$SESSION_NAME" -X quit 2>/dev/null
+
+    # Start a new named screen session in detached mode (-dmS), using a login shell (-l)
+    screen -dmS "$SESSION_NAME" bash -l
+    
+    # Print how to attach to it
+    echo "... screen -xS $SESSION_NAME"
+}
+
+# Function to send (stuff) a command into a running screen session
+send_command_to_session() {
+    local SESSION_NAME="$1"
+    local CMD="$2"
+    screen -S "$SESSION_NAME" -X stuff "$CMD"$'\n'
+}
 
 # --------------- SCREEN SESSIONS --------------- #
-# ===== REPORT ===== #
-mkdir -p /tmp/mep_screens
 echo "Starting Screen Sessions"
 
 # ===== SCREEN SESSION: rfsoc_rx ===== #
-SESSION1="rfsoc_rx"
-CMD1="./start_rfsoc_rx.bash -c $CHANNEL -r"
-
-screen -S $SESSION1 -X quit 2>/dev/null
-cat > /tmp/mep_screens/$SESSION1.sh <<EOF
-#!/usr/bin/env bash -l
-cd "$WORKDIR"
-echo "Running: $CMD1"
-$CMD1
-exec bash
-EOF
-
-chmod +x /tmp/mep_screens/$SESSION1.sh
-screen -dmS $SESSION1 bash /tmp/mep_screens/$SESSION1.sh
-echo "... screen -xS $SESSION1"
+# Start the RFSoC with ADC capture held in reset
+CMD1="/opt/mep-examples/scripts/start_rfsoc_rx.bash -c $CHANNEL -r"
+start_screen_session "rfsoc_rx"
+send_command_to_session "rfsoc_rx" "$CMD1"
 
 # ===== SCREEN SESSION: mep_rx ===== #
-SESSION2="mep_rx"
-CMD2="./start_mep_rx.py -f1 $FREQ_START -f2 $FREQ_END -s $STEP -d $DWELL -t $TUNER --adc_if $ADC_IF --restart_interval $REC_RESTART_INTERVAL"
-
-screen -S $SESSION2 -X quit 2>/dev/null
-cat > /tmp/mep_screens/$SESSION2.sh <<EOF
-#!/usr/bin/env bash -l
-cd "$WORKDIR"
-echo "Running: $CMD2"
-$CMD2
-exec bash
-EOF
-
-chmod +x /tmp/mep_screens/$SESSION2.sh
-screen -dmS $SESSION2 bash /tmp/mep_screens/$SESSION2.sh
-echo "... screen -xS $SESSION2"
+# Start the Tuning, Sweeping, and Recording activities
+CMD2="/opt/mep-examples/scripts/start_mep_rx.py -f1 $FREQ_START -f2 $FREQ_END -s $STEP -d $DWELL -t $TUNER --adc_if $ADC_IF --restart_interval $REC_RESTART_INTERVAL"
+start_screen_session "mep_rx"
+send_command_to_session "mep_rx" "$CMD2"
 
 # ===== SCREEN SESSION: Jetson Power GUI ===== #
-SESSION5="jetsonpowergui"
-CMD5="sudo python /usr/share/jetsonpowergui/__main__.py"
+# Start the Jetson Power GUI for monitoring voltages and temps, works with X11 forwarding over SSH
+CMD3="sudo python /usr/share/jetsonpowergui/__main__.py"
+start_screen_session "jetsonpowergui"
+send_command_to_session "jetsonpowergui" "$CMD3"
 
-screen -S $SESSION5 -X quit 2>/dev/null
-cat > /tmp/mep_screens/$SESSION5.sh <<EOF
-#!/usr/bin/env bash -l
-echo "Running: $CMD5"
-$CMD5
-exec bash
-EOF
+# ===== SCREEN SESSION: gnuradio ===== #
+# (Omitted) Start GNURadio
+#CMD4="source /opt/radioconda/etc/profile.d/conda.sh && conda activate base && /opt/mep-examples/scripts/gnuradio-companion"
+#start_screen_session "gnuradio"
+#send_command_to_session "gnuradio" "$CMD4"
 
-chmod +x /tmp/mep_screens/$SESSION5.sh
-screen -dmS $SESSION5 bash /tmp/mep_screens/$SESSION5.sh
-echo "... screen -xS $SESSION5"
+# ===== SCREEN SESSION: drf_watch ===== #
+# Watch the Ringbuffer Directory for DigitalRF file changes
+start_screen_session "drf_watch"
+send_command_to_session "drf_watch" "source /opt/radioconda/etc/profile.d/conda.sh"
+send_command_to_session "drf_watch" "conda activate base"
+send_command_to_session "drf_watch" "drf watch /data/ringbuffer"
 
