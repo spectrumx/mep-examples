@@ -81,33 +81,38 @@ send_command_to_session() {
 echo "Starting Screen Sessions"
 
 # ===== SCREEN SESSION: rfsoc_rx ===== #
+SESSION_NAME_1="rfsoc_rx"
 COMMENT1="Starting the RFSoC with ADC capture held in reset"
-CMD1="/opt/mep-examples/scripts/start_rfsoc_rx.bash -c $CHANNEL -r"
-start_screen_session "rfsoc_rx" "$COMMENT1"
-send_command_to_session "rfsoc_rx" "$CMD1"
+CMD1="cd /opt/mep-examples/scripts && ./start_rfsoc_rx.bash -c $CHANNEL -r"
+start_screen_session "$SESSION_NAME_1" "$COMMENT1"
+send_command_to_session "$SESSION_NAME_1" "$CMD1"
 
 # ===== SCREEN SESSION: mep_rx ===== #
+SESSION_NAME_2="mep_rx"
 COMMENT2="Starting the Tuning, Sweeping, and Recording activities"
-CMD2="/opt/mep-examples/scripts/start_mep_rx.py -f1 $FREQ_START -f2 $FREQ_END -s $STEP -d $DWELL -t $TUNER --adc_if $ADC_IF --restart_interval $REC_RESTART_INTERVAL"
-start_screen_session "mep_rx" "$COMMENT2"
-send_command_to_session "mep_rx" "$CMD2"
+CMD2="cd /opt/mep-examples/scripts && ./start_mep_rx.py -f1 $FREQ_START -f2 $FREQ_END -s $STEP -d $DWELL -t $TUNER --adc_if $ADC_IF --restart_interval $REC_RESTART_INTERVAL"
+start_screen_session "$SESSION_NAME_2" "$COMMENT2"
+send_command_to_session "$SESSION_NAME_2" "$CMD2"
 
 # ===== SCREEN SESSION: Jetson Power GUI ===== #
+SESSION_NAME_3="jetsonpowergui"
 COMMENT3="Starting the Jetson Power GUI for monitoring temperatures and voltages" #Works with X11 forwarding over SSH
 CMD3="sudo python /usr/share/jetsonpowergui/__main__.py"
-start_screen_session "jetsonpowergui" "$COMMENT3"
-send_command_to_session "jetsonpowergui" "$CMD3"
+start_screen_session "$SESSION_NAME_3" "$COMMENT3"
+send_command_to_session "$SESSION_NAME_3" "$CMD3"
 
 # ===== SCREEN SESSION: gnuradio ===== #
+# SESSION_NAME_4="gnuradio"
 # COMMENT4="Starting GNURadio"  # Uncomment if enabling
 # CMD4="source /opt/radioconda/etc/profile.d/conda.sh && conda activate base && /opt/mep-examples/scripts/gnuradio-companion"
-# start_screen_session "gnuradio" "$COMMENT4"
-# send_command_to_session "gnuradio" "$CMD4"
+# start_screen_session "$SESSION_NAME_4" "$COMMENT4"
+# send_command_to_session "$SESSION_NAME_4" "$CMD4"
 
 # ===== SCREEN SESSION: drf_watch ===== #
+SESSION_NAME_5="drf_watch"
 COMMENT5="Watching the Ringbuffer Directory for DigitalRF file changes"
-start_screen_session "drf_watch" "$COMMENT5"
-send_command_to_session "drf_watch" "source /opt/radioconda/etc/profile.d/conda.sh"
-send_command_to_session "drf_watch" "conda activate base"
-send_command_to_session "drf_watch" "drf watch /data/ringbuffer"
+start_screen_session "$SESSION_NAME_5" "$COMMENT5"
+send_command_to_session "$SESSION_NAME_5" "source /opt/radioconda/etc/profile.d/conda.sh"
+send_command_to_session "$SESSION_NAME_5" "conda activate base"
+send_command_to_session "$SESSION_NAME_5" "drf watch /data/ringbuffer"
 
