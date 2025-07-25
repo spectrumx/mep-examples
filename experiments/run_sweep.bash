@@ -89,7 +89,7 @@ cat << EOF
 ╔═══════════════════════════════════════════════════════════════════════════╗
 ║                            ▶ USER SETTINGS ◀                              ║
 ╠═══════════════════════════════════════════════════════════════════════════╣
-  TUNER:                ${TUNER:-<unset>}         # Options: VALON, LMX2820, TEST     
+  TUNER:                ${TUNER:-<unset>}         # Options: VALON, LMX2820, TEST, None     
   ADC_IF:               ${ADC_IF:-<unset>} MHz        # RFSoC fixed IF (if tuner used)    
   FREQ_START:           ${FREQ_START:-<unset>} MHz        # Start of sweep                    
   FREQ_END:             ${FREQ_END:-<unset>} MHz        # End of sweep                      
