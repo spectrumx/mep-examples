@@ -43,14 +43,14 @@ cat << 'EOF'
 EOF
 
 # --------------- USER SETTINGS --------------- #
-TUNER="LMX2820"           # Options: VALON, LMX2820, TEST, None
+TUNER="None"          # Options: VALON, LMX2820, TEST, None
 ADC_IF=1090               # Fixed IF of the RFSoC in MHz, only required when a Tuner is being used, ignored otherwise
 FREQ_START=7000           # MHz for IF sweep, or RF sweep start if tuner present
 FREQ_END=8500             # MHz for IF sweep, or RF sweep end if tuner present
 STEP=10                   # Sweep frequency step size in MHz
-DWELL=10                  # Dwell time in seconds: Time to remain at each frequency step
+DWELL=5                   # Dwell time in seconds: Time to remain at each frequency step
 CHANNEL="A"               # Channel String, "A" or "A B"
-REC_RESTART_INTERVAL=300  # Force the DigitalRF recorder to restart every N seconds
+REC_RESTART_INTERVAL=9999999  # Force the DigitalRF recorder to restart every N seconds
 
 
 # --------------- HELPER FUNCTIONS --------------- #

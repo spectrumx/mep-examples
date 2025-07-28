@@ -152,6 +152,17 @@ def run_sweep(freqs_hz, rfsoc, args, tuner=None):
             rate=10
         )
 
+def tuner_type(x: str):
+    # Allow None, none, "none", "None"
+    if x.strip().lower() == "none":
+        return None
+    x = x.upper()
+    if x not in ["LMX2820", "VALON", "TEST"]:
+        raise argparse.ArgumentTypeError(
+            f"Invalid tuner '{x}'. Valid options: LMX2820, VALON, TEST, None"
+        )
+    return x
+    
 # ---------------------- Script Entry ----------------------
 
 if __name__ == "__main__":
@@ -162,8 +173,7 @@ if __name__ == "__main__":
     parser.add_argument('--channel', '-c', type=str, default="A", help='Channel: A or A B')
     parser.add_argument('--step', '-s', type=float, default=10, help='Step size in MHz')
     parser.add_argument('--dwell', '-d', type=float, default=60, help='Dwell time in seconds')
-    parser.add_argument('--tuner', '-t', type=lambda x: x.upper() if x.lower() != "none" else None,
-                        choices=["LMX2820", "VALON", "TEST", "None"], default=None,
+    parser.add_argument('--tuner', '-t', type=tuner_type,
                         help='Tuner type [LMX2820, VALON, TEST, None]')
     parser.add_argument('--adc_if', type=float, help='ADC IF in MHz (required if tuner is used)')
     parser.add_argument('--log-level', '-l', type=str, default='INFO',
