@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-
 """
-
 Valon 5015/5019 RF Synthesizer CLI Tool
 
-Command-line interface for Valon RF synthesizer on Nvidia Jetson Linux systems.
 This tool configures the synthesizer via USB serial connection.
-
-Alisa Yurevich 06/2025 
-
+NOTE: Internal error from serial is thrown someyimes when the VALON is run for too long (hours).
+possible solutions include:
+    - a reset function (although this will introduce time delay in a sweep)
+    - higher/lower baud rate
+    - shorter sleep after send
+At a power input of 0, the relative output is equal to that of the LMX2820.
+Alisa Yurevich (Alisa.Yurevich@tufts.edu) 06/2025 
 """
 import argparse
 import serial  
@@ -71,21 +72,5 @@ class ValonSynth():
         """
         self.ser.reset_input_buffer()
         self.ser.close()
-
-# if __name__ == "__main__":
-
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("--freq", "-f", type=float, required=True, help= "freq in megahertz")
-#     parser.add_argument("--power", "-p", type=int, required=False, help="power in dB")
-#     args = parser.parse_args()
-
-#     valon = ValonSynth()
-#     result_freq = valon.set_freq(args.freq)
-#     print(result_freq)
-#     if args.power is not None:
-#         result_power = valon.set_power(args.power)
-#         print(result_power)
-#     valon.close()
-
 
  
