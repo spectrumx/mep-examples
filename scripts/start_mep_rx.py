@@ -92,7 +92,7 @@ def get_tuner_object(tuner_type, adc_if):
             tuner_object = tuner_mod.MEPTunerTest(adc_if)
             
         elif tuner_type == "VALON":
-            import src.mep_tuner_valon2 as tuner_mod
+            import src.mep_tuner_valon as tuner_mod
             tuner_object = tuner_mod.MEPTunerValon(adc_if)
             
         elif tuner_type == "LMX2820":
