@@ -158,7 +158,7 @@ if __name__ == '__main__':
              "ubxtool -e GPS    ",
              "ubxtool -e RAWX   ",
              "ubxtool -e SFRBX  ",
-             "ubxtool -z CFG-UART1-BAUDRATE,3686400 ", # the fastest the rp2040 can handle
+             "ubxtool -z CFG-UART1-BAUDRATE,1350000 ", # the fastest the rp2040 can handle
              "ubxtool -z CFG-UART1-DATABITS,0     ",
              "ubxtool -z CFG-UART1OUTPROT-NMEA,1  ",
              "ubxtool -z CFG-UART1OUTPROT-UBX,0   ",
