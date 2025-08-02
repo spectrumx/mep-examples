@@ -20,11 +20,13 @@ References:
 import os
 import glob
 from pathlib import Path
+from functools import lru_cache
 # Anaconda Distribution
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.signal import spectrogram
+from scipy.signal import welch
 # External (PyPI)
 import h5py
 import yaml
@@ -40,6 +42,7 @@ class NoiseDiode:
         self.serial = serial
         self.enr_table = dict(sorted(enr_table.items()))
 
+    @lru_cache(maxsize=1024)
     def enr_db(self, freq_ghz):
         freqs, vals = zip(*self.enr_table.items())
         return np.interp(freq_ghz, freqs, vals)
@@ -158,64 +161,41 @@ class FileChecker:
 # ===== METADATA INDEX ===== #
 class MetadataIndex:
     """Extracts and caches metadata from HDF5 files, with error reporting."""
+
     @staticmethod
     def extract_metadata_from_h5(metadata_dir, output_file=None, error_file=None):
-        records = []
-        error_records = []
+        records, error_records = [], []
 
-        print(f"☐ Extracting metadata from HDF5 files at {metadata_dir}")
         h5_files = sorted(glob.glob(os.path.join(metadata_dir, '**/metadata@*.h5'), recursive=True))
-
         for path in h5_files:
             try:
                 with h5py.File(path, 'r') as f:
                     sample_keys = list(f.keys())
                     if not sample_keys:
-                        msg = "No sample keys found in file"
-                        print(f"... Failed to process {path}: {msg}")
-                        error_records.append({"file": path, "error": msg})
+                        error_records.append({"file": path, "error": "No sample keys"})
                         continue
 
                     sample_key = sample_keys[0]
                     data = f[sample_key]
                     record = {'file': path, 'sample_index': int(sample_key)}
 
-                    # Flatten datasets
-                    for key in data.keys():
-                        value = data[key]
-                        if isinstance(value, h5py.Group):
-                            for subkey in value.keys():
-                                try:
-                                    subval = value[subkey][()]
-                                    if isinstance(subval, np.ndarray) and subval.shape == ():
-                                        subval = subval.item()
-                                    elif isinstance(subval, bytes):
-                                        subval = subval.decode('utf-8')
-                                    record[f"{key}/{subkey}"] = subval
-                                except Exception as e:
-                                    record[f"{key}/{subkey}"] = np.nan
-                                    error_records.append({"file": path, "error": f"{key}/{subkey}: {e}"})
-                        else:
-                            try:
-                                val = value[()]
-                                if isinstance(val, np.ndarray) and val.shape == ():
-                                    val = val.item()
-                                elif isinstance(val, bytes):
-                                    val = val.decode('utf-8')
-                                record[key] = val
-                            except Exception as e:
-                                record[key] = np.nan
-                                error_records.append({"file": path, "error": f"{key}: {e}"})
-
-                    # Flatten attributes
-                    for attr_key in data.attrs.keys():
+                    for key, value in data.items():
                         try:
-                            attr_val = data.attrs[attr_key]
-                            if isinstance(attr_val, bytes):
-                                attr_val = attr_val.decode('utf-8')
-                            elif isinstance(attr_val, np.ndarray) and attr_val.shape == ():
-                                attr_val = attr_val.item()
-                            record[f"attr/{attr_key}"] = attr_val
+                            if isinstance(value, h5py.Group):
+                                for subkey, subval in value.items():
+                                    arr = np.asarray(subval)
+                                    record[f"{key}/{subkey}"] = arr.item() if arr.shape == () else arr
+                            else:
+                                arr = np.asarray(value)
+                                record[key] = arr.item() if arr.shape == () else arr
+                        except Exception as e:
+                            record[f"{key}"] = np.nan
+                            error_records.append({"file": path, "error": f"{key}: {e}"})
+
+                    for attr_key, attr_val in data.attrs.items():
+                        try:
+                            arr = np.asarray(attr_val)
+                            record[f"attr/{attr_key}"] = arr.item() if arr.shape == () else arr
                         except Exception as e:
                             record[f"attr/{attr_key}"] = np.nan
                             error_records.append({"file": path, "error": f"attr/{attr_key}: {e}"})
@@ -223,115 +203,92 @@ class MetadataIndex:
                     records.append(record)
 
             except Exception as e:
-                print(f"... Failed to process {path}: {e}")
                 error_records.append({"file": path, "error": str(e)})
 
-        df_metadata = pd.DataFrame.from_records(records)
+        df_metadata = pd.DataFrame(records)
         if 'center_frequencies' in df_metadata.columns:
             df_metadata['center_frequency'] = df_metadata['center_frequencies'].apply(
-                lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) > 0 else np.nan
+                lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) else np.nan
             )
-            df_metadata = df_metadata.drop(columns=['center_frequencies'])
+            df_metadata.drop(columns=['center_frequencies'], inplace=True)
         else:
             df_metadata['center_frequency'] = np.nan
 
-        df_metadata = df_metadata.sort_values('sample_index').reset_index(drop=True)
-
-        if output_file:
-            df_metadata.to_csv(output_file, index=False)
-            print(f"☐ Cached metadata to {output_file}")
+        df_metadata.sort_values('sample_index', inplace=True)
+        df_metadata.reset_index(drop=True, inplace=True)
 
         df_errors = pd.DataFrame(error_records)
-        if error_file:
+        if output_file:
+            df_metadata.to_csv(output_file, index=False)
+        if error_file and error_records:
             df_errors.to_csv(error_file, index=False)
-            print(f"... Saved metadata errors to {error_file}")
 
         return df_metadata, df_errors
-
 
 # ===== IQ ANALYZER ===== #
 class IQAnalyzer:
     """Handles IQ power statistics and spectrogram plotting."""
 
     @staticmethod
-    def compute_power_stats(iq, fs=None, method='fft_bandpass', f_notch=None):
-        # If all values are NaN, bail out early
-        if np.all(np.isnan(iq)) or len(iq) == 0:
+    def compute_power_stats(iq, fs=None, method='fft_bandpass', f_notch=None, nfft_limit=2048):
+
+        if iq.size == 0 or np.all(np.isnan(iq)):
+            print("... Input IQ is empty or all NaN, returning NaNs")
             return (np.nan,) * 4
 
         if method == 'iq_rms':
-            inst_power = np.abs(iq) ** 2
+            print("... Using iq_rms method")
+            inst_power = np.abs(iq)**2
+
         elif method == 'fft_bandpass':
             if fs is None:
                 raise ValueError("Sample rate fs must be provided for FFT-based power estimation.")
-            N = len(iq)
-            window = np.hanning(N)
-            iq_win = np.where(np.isnan(iq), 0, iq) * window  # replace NaNs with 0 for FFT
 
-            fft_vals = np.fft.fftshift(np.fft.fft(iq_win, n=N))
-            freqs = np.fft.fftshift(np.fft.fftfreq(N, d=1/fs))
-            power_spectrum = np.abs(fft_vals) ** 2 / np.sum(window**2)
+            iq = iq[np.isfinite(iq)]
+            if iq.size == 0:
+                print("... After NaN filtering, IQ is empty")
+                return (np.nan,) * 4
 
-            mask = np.ones_like(power_spectrum, dtype=bool)
+            nfft = min(nfft_limit, len(iq))
+            print(f"... Using fft_bandpass (Welch PSD): fs={fs:.2e}, N={len(iq)}, nfft={nfft}")
+
+
+            # Welch PSD (single segment if nperseg=len(iq))
+            freqs, power_spectrum = welch(
+                iq,
+                fs=fs,
+                window='hann',
+                nperseg=nfft,
+                noverlap=0,
+                nfft=nfft,
+                return_onesided=False,
+                scaling='density'
+            )
+
             if f_notch is not None:
-                mask &= (np.abs(freqs) > f_notch)
-            inst_power = power_spectrum[mask]
+                mask = np.abs(freqs) > f_notch
+                inst_power = power_spectrum[mask]
+                #print(f"... [IQAnalyzer] Applied notch filter at {f_notch:.2e} Hz, kept {mask.sum()} bins")
+            else:
+                inst_power = power_spectrum
+                #print("... [IQAnalyzer] No notch filter applied")
+
+            if inst_power.size == 0 or np.all(np.isnan(inst_power)):
+                print("... inst_power is empty or all NaN after filtering")
+                return (np.nan,) * 4
+
         else:
             raise ValueError(f"Unknown method: {method}")
 
-        # Use nan-safe reducers
-        return (
-            np.nanmean(inst_power),
-            np.nanstd(inst_power),
-            np.nanmin(inst_power),
-            np.nanmax(inst_power)
-        )
+        mean_val = float(np.nanmean(inst_power))
+        std_val  = float(np.nanstd(inst_power))
+        min_val  = float(np.nanmin(inst_power))
+        max_val  = float(np.nanmax(inst_power))
 
-    @staticmethod
-    def plot_waterfall(iq_data, fs, fc=0.0, nperseg=4096, noverlap=1024,
-                       cmap='viridis', save_file=None):
-        """
-        Plot a 2-sided spectrogram and return fig, ax.
-        """
-        f, t, Sxx = spectrogram(
-            iq_data,
-            fs=fs,
-            window='hann',
-            nperseg=nperseg,
-            noverlap=noverlap,
-            nfft=nperseg,
-            return_onesided=False,
-            mode='psd',
-            scaling='density'
-        )
-    
-        sort_idx = np.argsort(f)
-        f = f[sort_idx]
-        Sxx = Sxx[sort_idx, :]
-    
-        Sxx_dB = 10 * np.log10(np.abs(Sxx) + 1e-12)
-        f_shifted = f + fc
-    
-        fig, ax = plt.subplots(figsize=(10, 6))
-        cax = ax.imshow(
-            Sxx_dB,
-            extent=[t[0], t[-1], f_shifted[0]/1e6, f_shifted[-1]/1e6],
-            aspect='auto',
-            origin='lower',
-            cmap=cmap,
-            interpolation=None
-        )
-        fig.colorbar(cax, ax=ax, label='Power (dB)')
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Frequency (MHz)')
-        ax.set_title(f'Spectrogram PSD (fc = {fc/1e6:.2f} MHz)')
-        fig.tight_layout()
-    
-        if save_file:
-            fig.savefig(save_file, dpi=300)
-            print(f"... Saved spectrogram to: {save_file}")
-    
-        return fig, ax
+        #print(f"... IQ Stats: mean={mean_val:.4e}, std={std_val:.4e}, "
+        #      f"min={min_val:.4e}, max={max_val:.4e}")
+
+        return (mean_val, std_val, min_val, max_val)
 
 
 # ===== YFACTOR PIPELINE ===== #
@@ -400,7 +357,9 @@ class YFactorPipeline:
 
 
 
-    def compute_stats(self, on_or_off, cache_file=None, save_spectrograms=True):
+    def compute_IQ_stats(self, on_or_off, cache_file=None, save_spectrograms=True):
+        print(f"... [Pipeline] Starting compute_IQ_stats for {on_or_off.upper()}")
+
         # Resolve the full channel path
         path_str = self.dir_template.format(
             dir_dataset=self.dir_dataset,
@@ -408,91 +367,98 @@ class YFactorPipeline:
             channel=self.channel
         )
         channel_path = Path(path_str).resolve()
-    
-        # DigitalRFReader needs the parent directory (not the channel itself)
         drf_reader = DigitalRFReader(str(channel_path.parent))
-    
-        # Get Metadata
+
         df_meta = self.df_metadata.get(on_or_off)
         if df_meta is None:
             raise RuntimeError("Must run build_metadata_index() first.")
-    
-        results = []
+
+        results = {k: [] for k in [
+            'row_index', 'f_center_GHz', 'IQ_power_mean', 'IQ_power_std',
+            'IQ_power_min', 'IQ_power_max', 'num_continuous_blocks',
+            'total_samples', 'num_nans', 'pct_nans', 'total_duration_s'
+        ]}
+
         n_rows = len(df_meta)
-    
         for idx, row in df_meta.iterrows():
             percent = ((idx + 1) / n_rows) * 100
             start = row['sample_index']
-            if idx < len(df_meta) - 1:
+            if idx < n_rows - 1:
                 end = df_meta.iloc[idx + 1]['sample_index']
             else:
                 _, end = drf_reader.get_bounds(self.channel)
-    
+
             try:
                 blocks = drf_reader.get_continuous_blocks(start, end - 1, self.channel)
             except Exception as e:
                 print(f"... Failed to read blocks at row {idx}: {e}")
                 blocks = {}
-    
-            print(f"{on_or_off} state, Row {idx+1} / {n_rows} ({percent:.1f}%): "
+
+            print(f"Diode '{on_or_off.upper()}' state, Row {idx+1} / {n_rows} ({percent:.1f}%): "
                   f"Index Range [{start}, {end}) fc={row['center_frequency']/1e9:.2f} GHz "
                   f"{len(blocks)} block(s)")
-    
-            iq_combined = np.array([])
-            if blocks:
-                row_data = []
-                for j, (b_start, b_len) in enumerate(blocks.items()):
-                    try:
-                        iq = drf_reader.read_vector(b_start, b_len, self.channel)
-                        row_data.append(iq)
-                        print(f"... ... Block {j}: start={b_start}, len={b_len}")
-                    except Exception as e:
-                        print(f"... ... Block {j} failed: {e}")
-                if row_data:
-                    iq_combined = np.concatenate(row_data, axis=0)
-    
-            if iq_combined.size == 0:
-                stats = (np.nan,) * 4
-                num_nans = np.nan
-                pct_nans = np.nan
-                total_samples = 0
-                total_duration_s = np.nan
-            else:
+
+            iq_segments = []
+            for j, (b_start, b_len) in enumerate(blocks.items()):
+                try:
+                    iq = drf_reader.read_vector(b_start, b_len, self.channel)
+                    iq_segments.append(iq)
+                    print(f"... ... Block {j}: start={b_start}, len={b_len}")
+                except Exception as e:
+                    print(f"... ... Block {j} failed: {e}")
+
+            iq_combined = np.hstack(iq_segments) if iq_segments else np.empty(0)
+            fs = (row['sample_rate_numerator'] / row['sample_rate_denominator']
+                  if 'sample_rate_numerator' in row and 'sample_rate_denominator' in row
+                  else np.nan)
+
+            if iq_combined.size:
+                stats = IQAnalyzer.compute_power_stats(  # ✅ correct helper
+                    iq_combined, fs=fs, method='fft_bandpass', f_notch=50e3
+                )
                 num_nans = np.isnan(iq_combined).sum()
-                pct_nans = (num_nans / len(iq_combined)) * 100
-                fs = row['sample_rate_numerator'] / row['sample_rate_denominator']
-                stats = IQAnalyzer.compute_power_stats(iq_combined, method='fft_bandpass', fs=fs, f_notch=50e3)
-                total_samples = len(iq_combined)
-                total_duration_s = len(iq_combined) / fs if fs else np.nan
-    
-            results.append({
-                'row_index': idx,
-                'f_center_GHz': row['center_frequency'] / 1e9,
-                'IQ_power_mean': stats[0],
-                'IQ_power_std': stats[1],
-                'IQ_power_min': stats[2],
-                'IQ_power_max': stats[3],
-                'num_continuous_blocks': len(blocks),
-                'total_samples': total_samples,
-                'num_nans': num_nans,
-                'pct_nans': pct_nans,
-                'total_duration_s': total_duration_s,
-            })
-    
+                pct_nans = 100 * num_nans / iq_combined.size
+                total_duration_s = iq_combined.size / fs
+                print(f"... IQ Stats (mean={stats[0]:.4e}, "
+                      f"std={stats[1]:.4e}, min={stats[2]:.4e}, max={stats[3]:.4e}), "
+                      f"samples={iq_combined.size}, NaNs={num_nans} ({pct_nans:.2f}%)")
+            else:
+                print(f"... Row {idx+1}: No IQ data, setting all stats to NaN")
+                stats = (np.nan,) * 4
+                num_nans, pct_nans, total_duration_s = np.nan, np.nan, np.nan
+
+            results['row_index'].append(idx)
+            results['f_center_GHz'].append(row['center_frequency'] / 1e9)
+            results['IQ_power_mean'].append(stats[0])
+            results['IQ_power_std'].append(stats[1])
+            results['IQ_power_min'].append(stats[2])
+            results['IQ_power_max'].append(stats[3])
+            results['num_continuous_blocks'].append(len(blocks))
+            results['total_samples'].append(iq_combined.size)
+            results['num_nans'].append(num_nans)
+            results['pct_nans'].append(pct_nans)
+            results['total_duration_s'].append(total_duration_s)
+
             if save_spectrograms and iq_combined.size > 0:
                 self.dir_spectrograms = self.dir_output / "spectrograms"
                 self.dir_spectrograms.mkdir(exist_ok=True)
-                save_name = self.dir_spectrograms / f"{row['center_frequency']/1e9:.2f}GHz_row{idx}_{on_or_off}_{self.base_name}.png"
-                fig, ax = IQAnalyzer.plot_waterfall(iq_combined, fs=fs, fc=row['center_frequency'],
-                                                    save_file=str(save_name))
+                save_name = self.dir_spectrograms / (
+                    f"{row['center_frequency']/1e9:.2f}GHz_row{idx}_{on_or_off}_{self.base_name}.png"
+                )
+                fig, ax = IQAnalyzer.plot_waterfall(
+                    iq_combined, fs=fs, fc=row['center_frequency'], save_file=str(save_name)
+                )
                 plt.close(fig)
-    
-        self.df_stats[on_or_off] = pd.DataFrame(results)
-        cache_file = cache_file or f"stats_{on_or_off}_{self.base_name}.csv"
-        cache_path = self.dir_output / cache_file
-        self.df_stats[on_or_off].to_csv(cache_path, index=False)
-        print(f"... [Stats] Saved stats to {cache_path}")
-        return self.df_stats[on_or_off]
+                print(f"... Saved spectrogram to {save_name}")
+
+        df_stats = pd.DataFrame(results)
+        cache_file = cache_file or f"df_stats_{on_or_off}_{self.base_name}.csv"
+        df_stats.to_csv(self.dir_output / cache_file, index=False)
+        self.df_stats[on_or_off] = df_stats
+        print(f"... [Stats] Saved stats to {self.dir_output / cache_file}")
+
+        return df_stats
+
 
     def compute_noisefigure(self, df_on=None, df_off=None, diode=None):
         """Compute Noise Figure using ON/OFF power stats and a noise diode."""
@@ -563,42 +529,68 @@ class YFactorPipeline:
             nan_groups.append((start, len(nan_indices) - 1))
         for start, end in nan_groups:
             ax.axvspan(x_data.iloc[start], x_data.iloc[end], color=color, alpha=alpha)
-            
-    def plot_noisefigure_summary(self, df_noisefigure=None, plots=None):
-        df_noisefigure = df_noisefigure if df_noisefigure is not None else self.df_noisefigure
+
+    def plot_noisefigure_summary(self, df_noisefigure=None, plots=None, highlight_missing_data=True, ax=None, save_path=None, base_name=None, auto_title=True):
+        """
+        Plot noise figure summary. If ax is provided, plot into it; otherwise create a new figure.
+        """
         if df_noisefigure is None:
-            raise RuntimeError("Must compute noisefigure results first.")
-    
+            if not hasattr(self, "df_noisefigure") or self.df_noisefigure is None:
+                raise RuntimeError("Must provide a DataFrame for noisefigure results.")
+            df_noisefigure = self.df_noisefigure
+
         if plots is None:
-            plots = [ #Column, title, color, label
+            plots = [
                 ("NF_dB", "Noise Figure (dB)", "b", "Noise Figure (dB)"),
                 ("Y", "Y Factor", "g", "Y Factor"),
                 ("P_on", "P_on", "r", "Mean(abs(IQ)) Noise Diode ON"),
                 ("P_off", "P_off", "m", "Mean(abs(IQ)) Noise Diode OFF"),
             ]
-    
-        fig, ax = plt.subplots(len(plots), 1, figsize=(10, 3 * len(plots)), sharex=True)
-        if len(plots) == 1:
-            ax = [ax]
-    
+
+        # Create axes if none provided
+        if ax is None:
+            fig, ax = plt.subplots(len(plots), 1, figsize=(10, 3 * len(plots)), sharex=True)
+            if len(plots) == 1:
+                ax = [ax]
+        else:
+            if not isinstance(ax, (list, tuple)):
+                ax = [ax]
+            fig = None
+
         for i, (col, ylabel, color, title) in enumerate(plots):
             if col not in df_noisefigure.columns:
                 print(f"... Skipping {col}, not found in DataFrame.")
                 continue
-    
+
             ax[i].plot(df_noisefigure['frequency_GHz'], df_noisefigure[col],
                        marker='o', linestyle='None', color=color)
-            self.highlight_missing_data(ax[i], df_noisefigure['frequency_GHz'], df_noisefigure[col])
+            if highlight_missing_data:
+                YFactorPipeline.highlight_missing_data(ax[i], df_noisefigure['frequency_GHz'], df_noisefigure[col])
             ax[i].set(ylabel=ylabel, title=title)
-    
+
         ax[-1].set_xlabel('Frequency (GHz)')
+        
+        # Choose base_name
+        if base_name is None:
+            base_name = self.base_name
+
+        if auto_title:
+            plt.suptitle(base_name)
+            
         plt.tight_layout()
-    
-        save_path = self.dir_output / f"noisefigure_summary_{self.base_name}.png"
-        fig.savefig(save_path, dpi=300)
-        print(f"... [NoiseFigure Summary] Saved to {save_path}")
-    
+
+        # Choose save_path
+        if save_path is None:
+            save_path = self.dir_output / f"df_noisefigure_{base_name}.png"
+        else:
+            save_path = Path(save_path)
+
+        if fig is not None:
+            fig.savefig(save_path, dpi=300)
+            print(f"... [NoiseFigure Plot] Saved to {save_path}")
+
         return fig, ax
+    
 
 
 
@@ -624,7 +616,7 @@ if __name__ == "__main__":
         channel = 'chA', # DigitalRF channel name
         dir_template=str(Path("{dir_dataset}") / "{on_or_off}" / "sr10MHz" / "{channel}"), # Subfolder structure
         diode=diode, # Instance of NoiseDiode
-        dir_output="/data/outputs/"
+        dir_output="/data/outputs"
     )
     
     # Plot Diode ENR Curve
@@ -640,11 +632,11 @@ if __name__ == "__main__":
 
     # Loop through each frequency bin, compute stats (min, max, mean, std), and spectrograms
     #   This can take a while. save_spectrograms=False makes it go slightly faster.
-    df_on  = pipeline.compute_stats("on" , save_spectrograms=True)
-    df_off = pipeline.compute_stats("off", save_spectrograms=True)
+    df_on  = pipeline.compute_IQ_stats("on" , save_spectrograms=False)
+    df_off = pipeline.compute_IQ_stats("off", save_spectrograms=False)
 
     # Compute Noise Figure
-    df_noisefigure = pipeline.compute_noisefigure(df_on=None, df_off=None) #Uses df_on, df_off from pipeline.compute_stats() unless you want to override with pd.read_csv(
+    df_noisefigure = pipeline.compute_noisefigure(df_on=None, df_off=None) #Uses df_on, df_off from pipeline.compute_IQ_stats() unless you want to override with pd.read_csv(
 
     # Summary Plot (default: NF_dB, Y, P_on, P_off)
-    fig_summary, ax_summary = pipeline.plot_noisefigure_summary(df_noisefigure=None) # Override data to plot with df_noisefigure = pd.read_csv("df_noisefigure.csv")
+    fig_summary, ax_summary = pipeline.plot_noisefigure_summary() # Override data to plot with df_noisefigure = pd.read_csv("df_noisefigure.csv")
