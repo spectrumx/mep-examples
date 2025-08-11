@@ -26,19 +26,25 @@ GREEN = "\033[92m"
 RESET = "\033[0m"
 
 # ===== HELPER FUNCTIONS ===== #
-def stop_start_recorder(channel="A", rate=10):
+def stop_start_recorder(channel="A", rate=10, mode="IF"):
+    start_rec_args = [
+        "-c",
+        f"{channel}",
+        "-r",
+        f"{rate}",
+    ]
+    if mode == "RF":
+        # flip spectrum because tuner does high-side injection
+        start_rec_args.append("--flip")
+    start_rec_args_string = " ".join(start_rec_args)
     logging.info("Restarting recorder")
-    os.system('/opt/mep-examples/scripts/stop_rec.py')
-    time.sleep(2)
-    os.system(f'/opt/mep-examples/scripts/start_rec.py -c {channel} -r {rate}')
-    time.sleep(1)
-    os.system(f'/opt/mep-examples/scripts/start_rec.py -c {channel} -r {rate}')
-    time.sleep(1)
+    # start script stops recording first if there is one active
+    os.system(f'/opt/mep-examples/scripts/start_rec.py {start_rec_args_string}')
 
-def force_restart_recorder(last_restart, interval_s, channel, rate):
-    if time.time() - last_restart >= interval_s:
+def force_restart_recorder(last_restart, interval_s, channel, rate, mode):
+    if interval_s is not None and time.time() - last_restart >= interval_s:
         logging.info("Restart interval reached. Restarting recorder.")
-        stop_start_recorder(channel, rate)
+        stop_start_recorder(channel, rate, mode)
         return time.time()
     return last_restart
 
@@ -90,21 +96,21 @@ def get_tuner_object(tuner_type, adc_if):
         if tuner_type == "TEST":
             import src.mep_tuner_test as tuner_mod
             tuner_object = tuner_mod.MEPTunerTest(adc_if)
-            
+
         elif tuner_type == "VALON":
             import src.mep_tuner_valon as tuner_mod
             tuner_object = tuner_mod.MEPTunerValon(adc_if)
-            
+
         elif tuner_type == "LMX2820":
             import src.mep_tuner_lmx2820 as tuner_mod
             tuner_object = tuner_mod.MEPTunerLMX2820(adc_if)
-            
+
         else:
             raise ValueError(f"Unknown tuner type: {tuner_type}")
 
     return tuner_object
 
-        
+
 def run_sweep(freqs_hz, rfsoc, args, tuner=None):
     # Determine Sweep Mode: Sweep IF without a tuner, or sweep RF with a tuner, must specify fixed IF
     mode = "IF" if tuner is None else "RF"
@@ -112,15 +118,24 @@ def run_sweep(freqs_hz, rfsoc, args, tuner=None):
 
     # Start Recorder
     last_restart_time = time.time()
-    stop_start_recorder(channel=args.channel)
+    stop_start_recorder(channel=args.channel, rate=args.sample_rate, mode=mode)
 
     # Loop through Frequencies
     for f_hz in freqs_hz:
     	# Convert to Hz
         f_mhz = f_hz / 1e6
-        
+
         # Reset RFSoC
         rfsoc.reset()
+
+        # Force recorder restart every args.restart_interval seconds
+        last_restart_time = force_restart_recorder(
+            last_restart_time,
+            args.restart_interval,
+            channel=args.channel,
+            rate=args.sample_rate,
+            mode=mode,
+        )
 
 	# Set RF or IF frequency and metadata
         if mode == "IF":
@@ -143,14 +158,6 @@ def run_sweep(freqs_hz, rfsoc, args, tuner=None):
             continue
         logging.info(f"RFSoC state: {tlm['state']}")
         wait_dwell_period(rfsoc, args.dwell)
-        
-        # Force recorder restart every args.restart_interval seconds
-        last_restart_time = force_restart_recorder(
-            last_restart_time,
-            args.restart_interval,
-            args.channel,
-            rate=10
-        )
 
 def tuner_type(x: str):
     # Allow None, none, "none", "None"
@@ -162,7 +169,7 @@ def tuner_type(x: str):
             f"Invalid tuner '{x}'. Valid options: LMX2820, VALON, TEST, None"
         )
     return x
-    
+
 # ---------------------- Script Entry ----------------------
 
 if __name__ == "__main__":
@@ -171,6 +178,7 @@ if __name__ == "__main__":
     parser.add_argument('--freq_start', '-f1', type=float, default=7000, help='Start frequency in MHz')
     parser.add_argument('--freq_end', '-f2', type=float, default=float('nan'), help='End frequency in MHz')
     parser.add_argument('--channel', '-c', type=str, default="A", help='Channel: A or A B')
+    parser.add_argument('--sample-rate', '-r', type=int, default=None, help='Output recording sample rate, in MHz (default: Use step size)')
     parser.add_argument('--step', '-s', type=float, default=10, help='Step size in MHz')
     parser.add_argument('--dwell', '-d', type=float, default=60, help='Dwell time in seconds')
     parser.add_argument('--tuner', '-t', type=tuner_type,
@@ -179,8 +187,11 @@ if __name__ == "__main__":
     parser.add_argument('--log-level', '-l', type=str, default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], help='Logging level')
     parser.add_argument('--skip_ntp', action='store_true', help='Skip NTP sync')
-    parser.add_argument('--restart_interval', type=int, default=300, help='Recorder restart interval in seconds')
+    parser.add_argument('--restart_interval', type=int, default=None, help='Recorder restart interval in seconds')
     args = parser.parse_args()
+
+    if args.sample_rate is None:
+        args.sample_rate = int(args.step)
 
     # === Setup Logging === #
     os.makedirs(LOG_DIR, exist_ok=True)
