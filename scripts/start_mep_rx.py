@@ -142,12 +142,12 @@ def run_sweep(freqs_hz, rfsoc, args, tuner=None):
             logging.info(f"Setting RFSoC NCO to {GREEN}{f_mhz:.2f} MHz{RESET}")
             rfsoc.set_freq_IF(f_mhz)
             time.sleep(0.1) # Wait for lock
-            rfsoc.set_freq_metadata(f_hz / 1e3)  # Tag in kHz
+            rfsoc.set_freq_metadata(f_hz)
         elif mode == "RF":
             logging.info(f"Tuning to {GREEN}{f_mhz:.2f} MHz{RESET}")
             tuner.set_freq(f_mhz)
             time.sleep(0.1) # Wait for lock
-            rfsoc.set_freq_metadata(f_hz / 1e3)
+            rfsoc.set_freq_metadata(f_hz)
 
         # Capture
         rfsoc.capture_next_pps()
