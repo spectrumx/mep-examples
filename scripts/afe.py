@@ -1,15 +1,19 @@
-#
 #!/usr/bin/env python3
 #
 # afe.py
 #
 # MIT Haystack Observatory
-# Ben Welchman 07-01-2025
+# Ben Welchman 08-01-2025
 #
-
 # --------------------------
 #
 # List of Functions:
+#
+#   send_command
+#   print_help
+#   parse_command_line
+#   update_reg_states
+#   main
 #
 # --------------------------
 
@@ -27,11 +31,10 @@ def send_command(block, channel, addr, bit):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
       s.connect(SOCKET_PATH)
       s.sendall(command)
-      reply = s.recv(1024).decode('utf-8', errors='ignore').strip()
+      reply = s.recv(4096).decode('utf-8', errors='ignore').strip()
       print(reply)
 
     return 
-
 
 def print_help():
 
@@ -65,7 +68,6 @@ def print_help():
   msg = msg + "     Register value to set: 0,1\n"
   
   print(msg)
-
 
 def parse_command_line():
     
@@ -104,7 +106,6 @@ def parse_command_line():
 
     return error_flag, args
 
-
 def update_reg_states(args):
 
   # block
@@ -129,7 +130,6 @@ def update_reg_states(args):
 
   if args.rate:
     block = 5
-    print(args.rate)
     channel = int(args.rate[0])
     addr = -1
     value = -1
@@ -198,7 +198,6 @@ def update_reg_states(args):
 
   return block, channel, addr, value
 
-
 def main():
    
   error_flag, args = parse_command_line() # parse command line options
@@ -214,7 +213,6 @@ def main():
     print_help()
 
   sys.exit()
-
 
 if __name__ == '__main__':
 
