@@ -49,6 +49,18 @@ blocks:
     coordinate: [432, 16.0]
     rotation: 0
     state: enabled
+- name: channel
+  id: variable
+  parameters:
+    comment: ''
+    value: '"chA"'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [296, 16.0]
+    rotation: 0
+    state: enabled
 - name: samp_rate
   id: variable
   parameters:
@@ -106,7 +118,7 @@ blocks:
     affinity: ''
     alias: ''
     comment: ''
-    dir: f"/data/tmp-ringbuffer/sr{samp_rate/1e6:n}MHz"
+    dir: f"/data/tmp-ringbuffer/sr{samp_rate/1e6:n}MHz/{channel}"
     end: ''
     gapless: 'False'
     hide_msg_port: 'True'
