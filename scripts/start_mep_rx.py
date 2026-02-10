@@ -209,14 +209,16 @@ if __name__ == "__main__":
     # === Connect to RFSoC === #
     rfsoc = mep_rfsoc.MEPRFSoC()
     
-    # === Initialize RFSoC Channel === #
-    logging.info(f"Setting RFSoC channel to {args.channel}")
-    rfsoc.set_channel(args.channel)
-    
     # === Wait for RFSoC firmware to be fully initialized === #
+    # This ensures overlay is loaded and sample rate is set BEFORE we send any commands
     if not rfsoc.wait_for_firmware_ready(max_wait_s=30):
         logging.error("RFSoC firmware not ready. Check RFSoC logs.")
         exit(1)
+    
+    # === Initialize RFSoC Channel === #
+    # Now it's safe to send commands - overlay is loaded
+    logging.info(f"Setting RFSoC channel to {args.channel}")
+    rfsoc.set_channel(args.channel)
 
     # === Tuner Setup === #
     tuner = get_tuner_object(args.tuner, args.adc_if)
