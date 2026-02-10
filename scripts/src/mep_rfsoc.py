@@ -1,7 +1,7 @@
 '''
 # Author: John Marino 2026
 # Based on /scripts/src/mep_rfsoc.py by Nicholas Rainville
-# Based on \opt\git\rfsoc_qsfp_10g\boards\RFSoC4x2\rfsoc_qsfp_offload\scripts\start_capture_rx.py ZMQ->MQTT conversion by Randy Herban 
+# Based on /opt/git/rfsoc_qsfp_10g/boards/RFSoC4x2/rfsoc_qsfp_offload/scripts/start_capture_rx.py ZMQ->MQTT conversion by Randy Herban 
 '''
 import paho.mqtt.client as mqtt
 import time
@@ -56,6 +56,42 @@ class MEPRFSoC:
             logging.error(f"Failed to connect to MQTT broker: {e}")
             raise
     
+    def wait_for_firmware_ready(self, max_wait_s=30):
+        """
+        Wait for RFSoC firmware to be fully initialized.
+        Checks that f_s is not NaN (overlay loaded and sample rate set).
+        
+        Args:
+            max_wait_s: Maximum time to wait in seconds
+            
+        Returns:
+            True if firmware ready, False if timeout
+        """
+        logging.info("Waiting for RFSoC firmware to initialize...")
+        start_time = time.time()
+        
+        while time.time() - start_time < max_wait_s:
+            self._tlm_data = None
+            self._tlm_event.clear()
+            command = {"task_name": "get", "arguments": ["tlm"]}
+            self.client.publish(self.command_topic, json.dumps(command))
+            
+            if self._tlm_event.wait(timeout=2.0):
+                f_s = self._tlm_data.get('f_s') if self._tlm_data else None
+                # Check if f_s is valid (not NaN, not None, > 0)
+                if f_s is not None and isinstance(f_s, (int, float)) and f_s == f_s and f_s > 0:
+                    logging.info(f"RFSoC firmware ready: f_s={f_s/1e6:.2f} MHz")
+                    return True
+                else:
+                    logging.debug(f"RFSoC not ready yet (f_s={f_s}), waiting...")
+            else:
+                logging.debug("No telemetry response, waiting...")
+            
+            time.sleep(1)
+        
+        logging.error(f"RFSoC firmware not ready after {max_wait_s}s! Check RFSoC firmware logs.")
+        return False
+    
     def _on_connect(self, client, userdata, flags, rc):
         """Callback for when the client connects to the broker."""
         if rc == 0:
@@ -75,7 +111,7 @@ class MEPRFSoC:
         """Callback for when a message is received from the broker."""
         try:
             payload_str = msg.payload.decode('utf-8')
-            logging.debug(f"Received on {msg.topic}: {BLUE}{payload_str}{RESET}")
+            logging.debug(f"MQTT RX on {msg.topic}: {payload_str[:100]}")
             
             with self._message_lock:
                 self._messages.append({
@@ -90,6 +126,7 @@ class MEPRFSoC:
                     status_data = json.loads(payload_str)
                     # Check if this is telemetry data
                     if 'state' in status_data or 'f_c_hz' in status_data:
+                        logging.debug(f"Got status: state={status_data.get('state')}")
                         self._tlm_data = status_data
                         self._tlm_event.set()
                 except json.JSONDecodeError:
@@ -120,13 +157,32 @@ class MEPRFSoC:
     
     def reset(self):
         """Reset the RFSoC."""
+        self._tlm_data = None
+        self._tlm_event.clear()
         self._send_command("reset")
-        time.sleep(0.5)  # Allow time for RFSoC to reset and reinitialize
+        # Wait for reset status to arrive before continuing
+        self._tlm_event.wait(timeout=1.0)
     
     def capture_next_pps(self):
-        """Trigger capture on the next PPS signal."""
+        """
+        Trigger capture on the next PPS signal.
+        Waits for 'active' status before returning.
+        """
+        self._tlm_data = None
+        self._tlm_event.clear()
         self._send_command("capture_next_pps")
-        time.sleep(0.1)  # Allow time for status update
+        
+        # Wait for 'active' status - PPS alignment can take up to 1 second
+        start_time = time.time()
+        while time.time() - start_time < 2.5:
+            if self._tlm_event.wait(timeout=0.2):
+                if self._tlm_data and self._tlm_data.get('state') == 'active':
+                    logging.debug(f"capture_next_pps: got active state")
+                    return  # Success
+                # Got a status but not active, keep waiting
+                self._tlm_event.clear()
+        
+        logging.warning("capture_next_pps: timeout waiting for active state")
     
     def set_freq_metadata(self, f_c_hz):
         """
@@ -135,7 +191,9 @@ class MEPRFSoC:
         Args:
             f_c_hz: Center frequency in Hz
         """
+        self._tlm_event.clear()
         self._send_command("set", f"freq_metadata {f_c_hz}")
+        self._tlm_event.wait(timeout=0.5)  # Wait for status
     
     def set_freq_IF(self, freq_mhz):
         """
@@ -144,11 +202,14 @@ class MEPRFSoC:
         Args:
             freq_mhz: IF frequency in MHz
         """
+        self._tlm_event.clear()
         self._send_command("set", f"freq_IF {freq_mhz}")
+        self._tlm_event.wait(timeout=0.5)  # Wait for status
     
-    def get_tlm(self, verbose=False, timeout_s=1.5):
+    def get_tlm(self, verbose=False, timeout_s=2.0):
         """
-        Request and wait for telemetry from the RFSoC.
+        Get telemetry from the RFSoC.
+        Returns cached data if available (from capture_next_pps), otherwise requests fresh.
         
         Args:
             verbose: Enable verbose logging
@@ -157,42 +218,22 @@ class MEPRFSoC:
         Returns:
             Dictionary with telemetry data or None if timeout/error
         """
-        # Clear old messages
-        with self._message_lock:
-            self._messages.clear()
+        # If we already have valid telemetry (e.g., from capture_next_pps), return it
+        if self._tlm_data is not None:
+            logging.debug(f"get_tlm() returning cached: state={self._tlm_data.get('state')}")
+            return self._tlm_data
         
-        # Clear old telemetry data and event
-        self._tlm_data = None
+        # Otherwise request fresh telemetry
         self._tlm_event.clear()
-        
-        # Request telemetry - RFSoC expects arguments as list for "get" command
-        # Line 131 of start_capture_rx.py checks: if args and args[0] == "tlm"
-        # This only works if args is a list like ["tlm"]
         command = {"task_name": "get", "arguments": ["tlm"]}
-        command_str = json.dumps(command)
-        self.client.publish(self.command_topic, command_str)
-        logging.debug(f"Sent: {BLUE}{command_str}{RESET}")
+        self.client.publish(self.command_topic, json.dumps(command))
+        logging.debug(f"get_tlm() requesting fresh telemetry...")
         
-        # Wait for telemetry response
         if self._tlm_event.wait(timeout=timeout_s):
-            if verbose:
-                logging.debug(f"Telemetry received: {self._tlm_data}")
-            
-            # Validate telemetry - ensure RFSoC is fully initialized
-            # f_s should not be NaN, otherwise capture_next_pps will fail
-            if self._tlm_data:
-                try:
-                    f_s = self._tlm_data.get('f_s')
-                    # Check if f_s is a valid number (not NaN, not None)
-                    if f_s is None or (isinstance(f_s, (int, float)) and (f_s != f_s or f_s == float('inf') or f_s == float('-inf'))):
-                        logging.warning("Telemetry received but RFSoC not fully initialized (f_s invalid)")
-                        return None
-                except:
-                    pass
-            
+            logging.debug(f"get_tlm() returning: state={self._tlm_data.get('state') if self._tlm_data else None}")
             return self._tlm_data
         else:
-            logging.warning("Timeout waiting for telemetry")
+            logging.warning("get_tlm() TIMEOUT")
             return None
     
     def get_msg(self, verbose=True, timeout_s=0.01):
@@ -223,7 +264,9 @@ class MEPRFSoC:
         Args:
             channel: Channel letter (A, B, C, or D)
         """
+        self._tlm_event.clear()
         self._send_command("set", f"channel {channel}")
+        self._tlm_event.wait(timeout=1.0)  # Wait for status - channel set triggers initialization
     
     def close(self):
         """Clean up and close the MQTT connection."""

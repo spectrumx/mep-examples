@@ -208,8 +208,14 @@ if __name__ == "__main__":
 
     # === Connect to RFSoC === #
     rfsoc = mep_rfsoc.MEPRFSoC()
-    if not wait_for_rfsoc(rfsoc):
-        logging.error("RFSoC not responding.")
+    
+    # === Initialize RFSoC Channel === #
+    logging.info(f"Setting RFSoC channel to {args.channel}")
+    rfsoc.set_channel(args.channel)
+    
+    # === Wait for RFSoC firmware to be fully initialized === #
+    if not rfsoc.wait_for_firmware_ready(max_wait_s=30):
+        logging.error("RFSoC firmware not ready. Check RFSoC logs.")
         exit(1)
 
     # === Tuner Setup === #
