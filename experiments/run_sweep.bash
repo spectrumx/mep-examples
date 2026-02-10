@@ -140,5 +140,5 @@ COMMENT5="Watching the Ringbuffer Directory for DigitalRF file changes"
 start_screen_session "$SESSION_NAME_5" "$COMMENT5"
 send_command_to_session "$SESSION_NAME_5" "source /opt/radioconda/etc/profile.d/conda.sh"
 send_command_to_session "$SESSION_NAME_5" "conda activate base"
-send_command_to_session "$SESSION_NAME_5" "drf watch /data/ringbuffer"
+send_command_to_session "$SESSION_NAME_5" "drf watch /data/captures"
 
