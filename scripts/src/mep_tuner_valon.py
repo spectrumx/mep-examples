@@ -43,6 +43,9 @@ class MEPTunerValon(MEPTuner):
         result = self.valon.set_freq(self._f_lo_mhz)
         logging.debug(result)
        
-       
-       
+    def get_status(self) -> dict:
+        """
+        Get current device status
+        """
+        logging.info(f"Dummy Status")
         

@@ -63,4 +63,4 @@ class MEPTunerLMX2820(MEPTuner):
         """
         Get current device status
         """
-        logging.info(f"LMX2820 Frequency: {self._frequency}")
+        logging.info(f"Dummy Status")
