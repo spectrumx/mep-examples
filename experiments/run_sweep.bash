@@ -116,7 +116,7 @@ send_command_to_session "$SESSION_NAME_1" "$CMD1"
 # ===== SCREEN SESSION: mep_rx ===== #
 SESSION_NAME_2="mep_rx"
 COMMENT2="Starting the Tuning, Sweeping, and Recording activities"
-CMD2="cd /opt/mep-examples/scripts && ./start_mep_rx.py -f1 $FREQ_START -f2 $FREQ_END -s $STEP -d $DWELL -t $TUNER --adc_if $ADC_IF --restart_interval $REC_RESTART_INTERVAL"
+CMD2="cd /opt/mep-examples/scripts && ./start_mep_rx_v2.py -f1 $FREQ_START -f2 $FREQ_END -s $STEP -d $DWELL -t $TUNER --adc_if $ADC_IF --restart_interval $REC_RESTART_INTERVAL"
 start_screen_session "$SESSION_NAME_2" "$COMMENT2"
 send_command_to_session "$SESSION_NAME_2" "$CMD2"
 

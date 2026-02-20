@@ -5,3 +5,4 @@ __pycache__/
 /scripts/bak
 scripts/src/mep_rfsoc.py.bak
 scripts/start_mep_rx.py.bak2
+scripts/mep_RH.py

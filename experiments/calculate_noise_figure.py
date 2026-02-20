@@ -608,15 +608,16 @@ if __name__ == "__main__":
         13: 15.36, 14: 15.25, 15: 14.91, 16: 14.79, 17: 14.98, 18: 14.61
     }
     diode = NoiseDiode("346B", "37502", ENR_TABLE)
+    # diode = NoiseDiode.load_yaml("/data/noise_factor_results/diode_346B_37502.yaml")
 
     # ===== NOISE FIGURE CALCULATION ===== #
     # Set up the noise figure class, no calculations (yet)
     pipeline = YFactorPipeline(
-        dir_dataset="/media/unknowndevice/d6146e64-be53-46f2-a627-5e690a0c8b4a/data/recordings/new/MEP10_CAL_20250727_TUNER_AFE_RFSOC/",
+        dir_dataset="/data/captures",
         channel = 'chA', # DigitalRF channel name
-        dir_template=str(Path("{dir_dataset}") / "{on_or_off}" / "sr10MHz" / "{channel}"), # Subfolder structure
+        dir_template=str(Path("{dir_dataset}") / "{on_or_off}" / "data" / "{channel}"), # Subfolder structure
         diode=diode, # Instance of NoiseDiode
-        dir_output="/data/outputs"
+        dir_output="/data/noise_factor_results"
     )
     
     # Plot Diode ENR Curve
