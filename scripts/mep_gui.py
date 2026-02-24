@@ -104,7 +104,7 @@ class _TextHandler(logging.Handler):
 class MEPGui:
     CHANNEL_OPTIONS     = ["A", "B", "C", "D"]
     TUNER_OPTIONS       = ["None"] + list(TUNER_INJECTION_SIDE.keys()) + ["auto"]
-    SAMPLE_RATE_OPTIONS = ["1", "10", "25"]
+    SAMPLE_RATE_OPTIONS = ["1", "2", "4", "8", "10", "16", "20", "32", "64"]
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -174,11 +174,18 @@ class MEPGui:
                     self._monitor_states[topic] = key
 
             elif topic == TUNER_STATUS_TOPIC:
-                prev_state = prev.get("state") if isinstance(prev, dict) else prev
-                if state != prev_state:
-                    logging.info(f"Tuner: {state}")
-                self._monitor_states[topic] = data
-                self.root.after(0, self._tun_refresh)
+                # Distinguish response messages (get_freq/get_power reply) from
+                # full state updates.  Response messages carry 'task_name'+'value'
+                # but no 'state' key; don't let them overwrite the state cache.
+                if "task_name" in data and "value" in data and "state" not in data:
+                    self.root.after(
+                        0, lambda d=data: self._tun_handle_response(d))
+                else:
+                    prev_state = prev.get("state") if isinstance(prev, dict) else prev
+                    if state != prev_state:
+                        logging.info(f"Tuner: {state}")
+                    self._monitor_states[topic] = data
+                    self.root.after(0, self._tun_refresh)
 
         mon = mqtt_client.Client(
             callback_api_version=mqtt_client.CallbackAPIVersion.VERSION1,
@@ -387,9 +394,9 @@ class MEPGui:
         self._build_mqtt_tab(mqtt_f)
 
     def _build_mqtt_tab(self, frame: ttk.Frame):
-        """MQTT tab: live log of all incoming MQTT messages."""
+        """MQTT tab: live log of all incoming MQTT messages + manual publish."""
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(1, weight=1)
+        frame.rowconfigure(1, weight=1)   # log row expands
 
         # ---- Options bar ---- #
         opt_f = ttk.Frame(frame)
@@ -402,15 +409,50 @@ class MEPGui:
                    command=lambda: self._mqtt_text.delete("1.0", "end")).pack(
             side="right", padx=4)
 
-        # ---- Message log ---- #
+        # ---- Message log (shorter to leave room for publish panel) ---- #
         self._mqtt_text = scrolledtext.ScrolledText(
-            frame, height=20, wrap="word", font=("TkFixedFont", 9),
+            frame, height=12, wrap="word", font=("TkFixedFont", 9),
             background="#f5f5f5")
-        self._mqtt_text.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        self._mqtt_text.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 2))
         self._mqtt_text.bind("<Key>",
             lambda e: None if (e.state & 0x4 and e.keysym in ("c", "C", "a", "A"))
                       else "break")
         self._bind_copy_menu(self._mqtt_text)
+
+        # ---- Manual publish ---- #
+        pub_f = ttk.LabelFrame(frame, text="Publish Message")
+        pub_f.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 6))
+        pub_f.columnconfigure(1, weight=1)
+
+        ttk.Label(pub_f, text="Topic").grid(
+            row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["mqtt_pub_topic"] = tk.StringVar(value="")
+        ttk.Entry(pub_f, textvariable=self._vars["mqtt_pub_topic"]).grid(
+            row=0, column=1, sticky="ew", padx=5, pady=3)
+
+        ttk.Label(pub_f, text="Payload").grid(
+            row=1, column=0, sticky="nw", padx=5, pady=3)
+        self._mqtt_pub_payload = tk.Text(pub_f, height=4, wrap="word",
+                                         font=("TkFixedFont", 9))
+        self._mqtt_pub_payload.grid(row=1, column=1, sticky="ew", padx=5, pady=3)
+
+        ttk.Button(pub_f, text="Publish",
+                   command=self._mqtt_publish_manual).grid(
+            row=2, column=0, columnspan=2, padx=5, pady=(0, 5), sticky="ew")
+
+    def _mqtt_publish_manual(self):
+        """Publish an arbitrary MQTT message from the manual publish panel."""
+        topic = self._vars["mqtt_pub_topic"].get().strip()
+        payload = self._mqtt_pub_payload.get("1.0", "end-1c").strip()
+        if not topic:
+            logging.error("MQTT publish: topic is empty")
+            return
+        try:
+            mqtt_publish.single(topic, payload,
+                                hostname=MQTT_BROKER, port=MQTT_PORT)
+            logging.info(f"MQTT published → {topic}")
+        except Exception as e:
+            logging.error(f"MQTT publish failed: {e}")
 
     def _mqtt_log_message(self, topic: str, payload: bytes):
         """Append one MQTT message to the MQTT tab log."""
@@ -535,7 +577,7 @@ class MEPGui:
         st_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
         st_f.columnconfigure(0, weight=1)
         self._tun_status_text = scrolledtext.ScrolledText(
-            st_f, height=10, wrap="word", font=("TkFixedFont", 9),
+            st_f, height=14, wrap="word", font=("TkFixedFont", 9),
             background="#f5f5f5")
         self._tun_status_text.insert("end", "no status received")
         self._tun_status_text.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
@@ -550,25 +592,59 @@ class MEPGui:
         ctrl_f.grid(row=2, column=0, padx=4, pady=(2, 4), sticky="ew")
         ctrl_f.columnconfigure(1, weight=1)
 
-        ttk.Label(ctrl_f, text="Set Freq (MHz)").grid(
+        # Freq row: Set + Get (all tuners)
+        ttk.Label(ctrl_f, text="Freq (MHz)").grid(
             row=0, column=0, sticky="w", padx=5, pady=3)
         self._vars["tun_set_freq"] = tk.StringVar(value="")
         ttk.Entry(ctrl_f, textvariable=self._vars["tun_set_freq"],
                   width=10).grid(row=0, column=1, sticky="ew", padx=5, pady=3)
         ttk.Button(ctrl_f, text="Set",
                    command=self._tun_set_freq).grid(
-            row=0, column=2, padx=4, pady=3)
+            row=0, column=2, padx=2, pady=3)
+        ttk.Button(ctrl_f, text="Get",
+                   command=self._tun_get_freq).grid(
+            row=0, column=3, padx=2, pady=3)
 
+        # Power row: Set + Get (Valon only)
+        ttk.Label(ctrl_f, text="Power (dBm)").grid(
+            row=1, column=0, sticky="w", padx=5, pady=3)
+        self._vars["tun_set_power"] = tk.StringVar(value="")
+        _pw_entry = ttk.Entry(ctrl_f, textvariable=self._vars["tun_set_power"],
+                              width=10)
+        _pw_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=3)
+        _pw_set_btn = ttk.Button(ctrl_f, text="Set",
+                                 command=self._tun_set_power)
+        _pw_set_btn.grid(row=1, column=2, padx=2, pady=3)
+        _pw_get_btn = ttk.Button(ctrl_f, text="Get",
+                                 command=self._tun_get_power)
+        _pw_get_btn.grid(row=1, column=3, padx=2, pady=3)
+        ttk.Label(ctrl_f, text="(Valon only)",
+                  foreground="grey", font=("TkDefaultFont", 8)).grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 4))
+
+        ttk.Separator(ctrl_f, orient="horizontal").grid(
+            row=3, column=0, columnspan=4, sticky="ew", padx=4, pady=2)
+
+        # Service-level commands
         ttk.Button(ctrl_f, text="Init Tuner",
                    command=self._tun_init).grid(
-            row=1, column=0, columnspan=3, padx=4, pady=3, sticky="ew")
-        ttk.Button(ctrl_f, text="Check Lock",
-                   command=self._tun_check_lock).grid(
-            row=2, column=0, columnspan=3, padx=4, pady=3, sticky="ew")
+            row=4, column=0, columnspan=4, padx=4, pady=3, sticky="ew")
+        ttk.Button(ctrl_f, text="Restart Tuner",
+                   command=self._tun_restart).grid(
+            row=5, column=0, columnspan=4, padx=4, pady=3, sticky="ew")
+        _lock_btn = ttk.Button(ctrl_f, text="Check Lock  (Valon only)",
+                               command=self._tun_check_lock)
+        _lock_btn.grid(row=6, column=0, columnspan=4, padx=4, pady=3, sticky="ew")
+        ttk.Button(ctrl_f, text="Publish: Get Status",
+                   command=self._tun_send_status).grid(
+            row=7, column=0, columnspan=4, padx=4, pady=3, sticky="ew")
 
-        ttk.Button(frame, text="Refresh",
-                   command=self._tun_refresh).grid(
-            row=3, column=0, padx=4, pady=(0, 6), sticky="ew")
+        # Gate Valon-only widgets on the active tuner name
+        self._valon_only_widgets = [_pw_entry, _pw_set_btn, _pw_get_btn, _lock_btn]
+        self._vars["tun_name"].trace_add(
+            "write", lambda *_: self._tun_update_capability_buttons())
+        self._tun_update_capability_buttons()   # apply correct state at build time
+
 
     def _build_tlm_tab(self, frame: ttk.Frame):
         """TLM tab: read-only telemetry fields populated by _afe_refresh."""
@@ -1001,6 +1077,13 @@ class MEPGui:
             tuner_sub = status.get("tuner", {})
             if isinstance(tuner_sub, dict):
                 name_val = tuner_sub.get("name") or status.get("name", "—")
+                # Populate freq / power fields from tuner state
+                freq_val = tuner_sub.get("freq_mhz")
+                if freq_val is not None:
+                    self._vars["tun_set_freq"].set(str(freq_val))
+                pwr_val = tuner_sub.get("pwr_dbm")
+                if pwr_val is not None:
+                    self._vars["tun_set_power"].set(str(pwr_val))
             else:
                 name_val = status.get("name", "—")
             self._vars["tun_name"].set(str(name_val) if name_val else "—")
@@ -1026,6 +1109,22 @@ class MEPGui:
         self._tun_status_text.delete("1.0", "end")
         self._tun_status_text.insert("end", text)
         logging.info("TUN: status text updated")
+
+    def _tun_handle_response(self, data: dict):
+        """Handle a tuner command response (get_freq / get_power reply).
+        These messages carry 'task_name' and 'value' but no 'state' key.
+        Update the corresponding entry field directly.
+        """
+        task = data.get("task_name", "")
+        value = data.get("value")
+        if value is None:
+            return
+        if task == "get_freq":
+            self._vars["tun_set_freq"].set(str(value))
+            logging.info(f"TUN: freq = {value} MHz")
+        elif task == "get_power":
+            self._vars["tun_set_power"].set(str(value))
+            logging.info(f"TUN: power = {value} dBm")
 
     def _tun_init(self):
         """Send init_tuner to tuner_control service."""
@@ -1061,7 +1160,7 @@ class MEPGui:
             logging.error(f"TUN set_freq failed: {e}")
 
     def _tun_check_lock(self):
-        """Send get_lock_status to tuner_control, then refresh the TUN status dump."""
+        """Send get_lock_status to tuner_control (Valon only), then refresh."""
         payload = {"task_name": "get_lock_status", "arguments": {}}
         def _query():
             try:
@@ -1073,6 +1172,84 @@ class MEPGui:
                 logging.error(f"TUN check_lock failed: {e}")
         threading.Thread(target=_query, daemon=True).start()
         logging.info("TUN: get_lock_status sent")
+
+    def _tun_get_freq(self):
+        """Send get_freq to tuner_control, then refresh status dump."""
+        payload = {"task_name": "get_freq", "arguments": {}}
+        def _query():
+            try:
+                mqtt_publish.single(TUNER_CMD_TOPIC, json.dumps(payload),
+                                    hostname=MQTT_BROKER, port=MQTT_PORT)
+                import time; time.sleep(1.5)
+                self.root.after(0, self._tun_refresh)
+            except Exception as e:
+                logging.error(f"TUN get_freq failed: {e}")
+        threading.Thread(target=_query, daemon=True).start()
+        logging.info("TUN: get_freq sent")
+
+    def _tun_set_power(self):
+        """Send set_power to tuner_control (Valon only)."""
+        try:
+            pwr = float(self._vars["tun_set_power"].get())
+        except ValueError:
+            logging.error("TUN: invalid power value")
+            return
+        payload = {"task_name": "set_power", "arguments": {"pwr_dbm": pwr}}
+        try:
+            mqtt_publish.single(TUNER_CMD_TOPIC, json.dumps(payload),
+                                hostname=MQTT_BROKER, port=MQTT_PORT)
+            logging.info(f"TUN: set_power {pwr:.1f} dBm sent")
+        except Exception as e:
+            logging.error(f"TUN set_power failed: {e}")
+
+    def _tun_get_power(self):
+        """Send get_power to tuner_control (Valon only), then refresh status dump."""
+        payload = {"task_name": "get_power", "arguments": {}}
+        def _query():
+            try:
+                mqtt_publish.single(TUNER_CMD_TOPIC, json.dumps(payload),
+                                    hostname=MQTT_BROKER, port=MQTT_PORT)
+                import time; time.sleep(1.5)
+                self.root.after(0, self._tun_refresh)
+            except Exception as e:
+                logging.error(f"TUN get_power failed: {e}")
+        threading.Thread(target=_query, daemon=True).start()
+        logging.info("TUN: get_power sent")
+
+    def _tun_restart(self):
+        """Send restart_tuner to tuner_control service."""
+        payload = {"task_name": "restart_tuner", "arguments": {}}
+        try:
+            mqtt_publish.single(TUNER_CMD_TOPIC, json.dumps(payload),
+                                hostname=MQTT_BROKER, port=MQTT_PORT)
+            logging.info("TUN: restart_tuner sent")
+            self.root.after(3000, self._tun_refresh)   # let service re-init
+        except Exception as e:
+            logging.error(f"TUN restart failed: {e}")
+
+    def _tun_send_status(self):
+        """Send 'status' command to tuner_control service, then refresh dump."""
+        payload = {"task_name": "status", "arguments": {}}
+        def _query():
+            try:
+                mqtt_publish.single(TUNER_CMD_TOPIC, json.dumps(payload),
+                                    hostname=MQTT_BROKER, port=MQTT_PORT)
+                import time; time.sleep(1.5)
+                self.root.after(0, self._tun_refresh)
+            except Exception as e:
+                logging.error(f"TUN status command failed: {e}")
+        threading.Thread(target=_query, daemon=True).start()
+        logging.info("TUN: status command sent")
+
+    def _tun_update_capability_buttons(self):
+        """Enable Valon-only widgets only when the active tuner name contains 'valon'."""
+        name = self._vars.get("tun_name", tk.StringVar()).get().lower()
+        state = "normal" if "valon" in name else "disabled"
+        for w in getattr(self, "_valon_only_widgets", []):
+            try:
+                w.configure(state=state)
+            except Exception:
+                pass
 
     # ---- REC config helpers ---- #
 
