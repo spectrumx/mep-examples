@@ -4,7 +4,7 @@ mep_gui.py
 
 Tkinter GUI for MEP RFSoC sweep/record control via X11 forwarding.
 
-Wraps MEPController from start_mep_rx_v2.py.
+Wraps MEPController from start_mep_rx.py.
 
 Usage:
     ssh -X mep@<jetson> python3 ~/mep-examples/scripts/mep_gui.py
@@ -20,9 +20,9 @@ import logging
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 
-# Allow importing start_mep_rx_v2 from the same directory
+# Allow importing start_mep_rx from the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from start_mep_rx_v2 import (
+from start_mep_rx import (
     MEPController,
     get_frequency_list,
     TUNER_INJECTION_SIDE,

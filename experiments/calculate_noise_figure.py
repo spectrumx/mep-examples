@@ -600,26 +600,37 @@ class YFactorPipeline:
 def bookmark_main(): pass
 
 if __name__ == "__main__":
+    '''
+    1) Collect a Sweep on the MEP with noise diode off, saved to /data/captures/off (or another directory as specified by dir_template below)
+    2) Collect a Sweep on the MEP with noise diode on, saved to /data/captures/on (or another directory as specified by dir_template below)
+    3) Input Diode parameters below
+    4) select 'channel' name below
+    3) Run this file
+    '''
 
     # ===== NOISE DIODE ===== #
+    # Set up a new Diode
     ENR_TABLE = {
         0.01: 15.5, 0.10:15.74, 1: 15.28, 2: 14.87, 3: 14.66, 4: 14.59, 5: 14.54,
         6: 14.65, 7: 14.81, 8: 14.85, 9: 14.99, 10: 15.36, 11: 15.23, 12: 15.22,
         13: 15.36, 14: 15.25, 15: 14.91, 16: 14.79, 17: 14.98, 18: 14.61
     }
-    diode = NoiseDiode("346B", "37502", ENR_TABLE)
-    # diode = NoiseDiode.load_yaml("/data/noise_factor_results/diode_346B_37502.yaml")
-
+    
+    diode = NoiseDiode("346B", "37502", ENR_TABLE) # Automatically saves this diode as *.YAML
+    
+    # Load previously saved diode from YAML file
+    #diode = NoiseDiode.load_yaml(STRING_PATH_TO_YAML)
+    
     # ===== NOISE FIGURE CALCULATION ===== #
     # Set up the noise figure class, no calculations (yet)
     pipeline = YFactorPipeline(
-        dir_dataset="/data/captures",
+        dir_dataset="/data/captures/",
         channel = 'chA', # DigitalRF channel name
         dir_template=str(Path("{dir_dataset}") / "{on_or_off}" / "data" / "{channel}"), # Subfolder structure
         diode=diode, # Instance of NoiseDiode
         dir_output="/data/noise_factor_results"
     )
-    
+
     # Plot Diode ENR Curve
     fig_diode, ax_diode = diode.plot_enr(dir_save=pipeline.dir_output)
     
@@ -636,8 +647,15 @@ if __name__ == "__main__":
     df_on  = pipeline.compute_IQ_stats("on" , save_spectrograms=False)
     df_off = pipeline.compute_IQ_stats("off", save_spectrograms=False)
 
+    # Load pre-saved IQ DataFrames
+    #df_on = pd.read_csv('/data/noise_factor_results/outputs_captures/df_stats_on_captures.csv')
+    #df_off = pd.read_csv('/data/noise_factor_results/outputs_captures/df_stats_off_captures.csv')
+    
     # Compute Noise Figure
-    df_noisefigure = pipeline.compute_noisefigure(df_on=None, df_off=None) #Uses df_on, df_off from pipeline.compute_IQ_stats() unless you want to override with pd.read_csv(
-
+    df_noisefigure = pipeline.compute_noisefigure(df_on=df_on, df_off=df_off)
+    
+    # Load pre-saved noise figure DataFrame
+    # df_noisefigure = pd.read_csv("df_noisefigure.csv")
+    
     # Summary Plot (default: NF_dB, Y, P_on, P_off)
-    fig_summary, ax_summary = pipeline.plot_noisefigure_summary() # Override data to plot with df_noisefigure = pd.read_csv("df_noisefigure.csv")
+    fig_summary, ax_summary = pipeline.plot_noisefigure_summary() 
