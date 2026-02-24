@@ -169,14 +169,14 @@ def update_reg_states(args):
     addr = int(addr_str)
     value = int(value_str)
     
-  if args.rx2:
+  if args.rx3:
     block = 2
     channel = 3
     addr_str, value_str = args.rx3
     addr = int(addr_str)
     value = int(value_str)
 
-  if args.rx2:
+  if args.rx4:
     block = 2
     channel = 4
     addr_str, value_str = args.rx4

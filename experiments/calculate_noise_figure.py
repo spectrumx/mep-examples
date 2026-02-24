@@ -647,12 +647,15 @@ if __name__ == "__main__":
     df_on  = pipeline.compute_IQ_stats("on" , save_spectrograms=False)
     df_off = pipeline.compute_IQ_stats("off", save_spectrograms=False)
 
-    # Override IQ tables by loading pre-saved ones
+    # Load pre-saved IQ DataFrames
     #df_on = pd.read_csv('/data/noise_factor_results/outputs_captures/df_stats_on_captures.csv')
     #df_off = pd.read_csv('/data/noise_factor_results/outputs_captures/df_stats_off_captures.csv')
     
     # Compute Noise Figure
     df_noisefigure = pipeline.compute_noisefigure(df_on=df_on, df_off=df_off)
-
+    
+    # Load pre-saved noise figure DataFrame
+    # df_noisefigure = pd.read_csv("df_noisefigure.csv")
+    
     # Summary Plot (default: NF_dB, Y, P_on, P_off)
-    fig_summary, ax_summary = pipeline.plot_noisefigure_summary() # Override data to plot with df_noisefigure = pd.read_csv("df_noisefigure.csv")
+    fig_summary, ax_summary = pipeline.plot_noisefigure_summary() 

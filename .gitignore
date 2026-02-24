@@ -7,3 +7,6 @@ scripts/src/mep_rfsoc.py.bak
 scripts/start_mep_rx.py.bak2
 scripts/mep_RH.py
 user_guide.md
+scripts/gnss.py
+scripts/test_eval.py
+scripts/test_ubx.py
