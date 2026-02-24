@@ -87,6 +87,8 @@ class MEPController:
             self.injection = None
         elif injection is not None:
             self.injection = injection                          # explicit CLI override
+        elif tuner.lower() == "auto":
+            self.injection = "high"                            # auto-detect: both known tuners are high-side
         elif tuner.upper() in TUNER_INJECTION_SIDE:
             self.injection = TUNER_INJECTION_SIDE[tuner.upper()]
         else:
