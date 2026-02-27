@@ -118,10 +118,61 @@ class MEPGui:
         self._build_ui()
         self._setup_logging()
         self._start_status_monitor()
+        self._start_gps_monitor()          # GPS: direct gpsd feed, independent of afe_service
         self._schedule_poll()
         self.root.after(2000, self._tun_refresh)   # TUN: read monitor cache once connected
         self.root.after(2000, self._rec_status_seed)  # REC: seed status from cache
         self.root.after(3000, self._afe_refresh)   # AFE/TLM: load true hardware state
+
+    # ------------------------------------------------------------------ #
+    #  Direct gpsd GPS monitor                                             #
+    # ------------------------------------------------------------------ #
+
+    def _start_gps_monitor(self):
+        """Connect directly to gpsd on port 2947 and parse $GNRMC sentences.
+        Populates GPS TLM fields independently of afe_service, which does not
+        reliably return GPS sentences in its block-3 reply.
+        """
+        import time as _time
+
+        def _worker():
+            while True:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(5.0)
+                        s.connect(("127.0.0.1", 2947))
+                        s.settimeout(None)
+                        s.sendall(b'?WATCH={"enable":true,"raw":1};\n')
+                        f = s.makefile('r', encoding='ascii', errors='ignore')
+                        for line in f:
+                            line = line.strip()
+                            if not line.startswith('$GNRMC'):
+                                continue
+                            clean = line.split('*')[0]
+                            parts = clean.lstrip('$').split(',')
+                            if len(parts) >= 10:
+                                self.root.after(
+                                    0, lambda p=parts: self._gps_apply(p))
+                except Exception as e:
+                    logging.warning(f"GPS monitor: {e} — retrying in 5s")
+                    _time.sleep(5)
+
+        threading.Thread(target=_worker, daemon=True, name="gps_monitor").start()
+
+    def _gps_apply(self, parts: list):
+        """Update GPS TLM StringVars from a split $GNRMC sentence.
+        parts[0] == 'GNRMC', parts[1]=time, [2]=A/V, [3]=lat, [4]=NS,
+        [5]=lon, [6]=EW, [7]=speed.
+        """
+        def _set(key, val):
+            if key in self._vars:
+                self._vars[key].set(val)
+
+        _set("tlm_gps_time",  parts[1] if parts[1] else "—")
+        _set("tlm_gps_fix",   "Valid" if parts[2] == "A" else "No fix")
+        _set("tlm_gps_lat",   f"{parts[3]} {parts[4]}" if parts[3] else "—")
+        _set("tlm_gps_lon",   f"{parts[5]} {parts[6]}" if parts[5] else "—")
+        _set("tlm_gps_speed", parts[7] if parts[7] else "—")
 
     # ------------------------------------------------------------------ #
     #  Background MQTT status monitor                                      #
