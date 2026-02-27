@@ -20,6 +20,7 @@ import os
 import math
 from datetime import datetime
 import threading
+from typing import Optional
 import paho.mqtt.client as mqtt_lib
 
 # ===== CONFIG ===== #
@@ -76,7 +77,7 @@ class MEPController:
         broker:       str   = MQTT_BROKER,
         port:         int   = MQTT_PORT,
     ):
-        self.channel      = channel
+        self.channel      = channel.upper()
         self.sample_rate  = sample_rate
         self.tuner        = tuner
         self.adc_if       = adc_if
@@ -191,6 +192,35 @@ class MEPController:
             with self._status_lock:
                 return self._status[topic]
         logging.warning(f"No status response from {topic} within {timeout_s}s — service may not be running")
+        return None
+
+    @staticmethod
+    def _extract_tuner_name(status_payload: dict) -> Optional[str]:
+        """Best-effort extraction of resolved tuner type from tuner status payload."""
+        if not isinstance(status_payload, dict):
+            return None
+
+        candidate_keys = ("tuner", "tuner_type", "active_tuner", "name", "model", "device")
+
+        def _normalize(value):
+            if isinstance(value, str):
+                token = value.strip().upper()
+                if token in TUNER_INJECTION_SIDE:
+                    return token
+            return None
+
+        for key in candidate_keys:
+            resolved = _normalize(status_payload.get(key))
+            if resolved:
+                return resolved
+
+        for nested_key in ("arguments", "status", "data", "result"):
+            nested = status_payload.get(nested_key)
+            if isinstance(nested, dict):
+                for key in candidate_keys:
+                    resolved = _normalize(nested.get(key))
+                    if resolved:
+                        return resolved
         return None
 
     def disconnect(self):
@@ -315,6 +345,8 @@ class MEPController:
             if self.adc_if is None:
                 raise ValueError("adc_if is required when a tuner is specified")
 
+            resolved_tuner = self.tuner.upper()
+
             # Set fixed IF
             self._publish(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {self.adc_if}"})
             time.sleep(0.1)
@@ -323,6 +355,9 @@ class MEPController:
             if self.tuner.lower() == "auto":
                 logging.debug("Tuner: auto-select (not forcing tuner type)")
                 self._publish(TUNER_CMD_TOPIC, {"task_name": "init_tuner", "arguments": {}})
+                init_status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
+                resolved_tuner = self._extract_tuner_name(init_status) or "AUTO"
+                logging.info(f"Auto tuner resolved to: {resolved_tuner}")
             else:
                 self._publish(TUNER_CMD_TOPIC, {
                     "task_name": "init_tuner",
@@ -341,15 +376,26 @@ class MEPController:
                 f"LO={lo_mhz:.2f} MHz  IF={self.adc_if:.2f} MHz"
             )
 
-            # Set tuner LO and check PLL lock
+            # Spectrum flip: conjugate required when LO is above RF (high-side injection)
+            # to correct the mirrored spectrum that results from downconversion.
+            apply_conjugate = (self.injection == "high")
+            self._publish(RECORDER_CMD_TOPIC, {
+                "task_name": "config.set",
+                "arguments": {"key": "packet.apply_conjugate", "value": str(apply_conjugate).lower()},
+            })
+
+            # Set tuner LO frequency
             self._publish(TUNER_CMD_TOPIC, {"task_name": "set_freq", "arguments": {"freq_mhz": lo_mhz}})
             time.sleep(0.1)
-            self._publish(TUNER_CMD_TOPIC, {"task_name": "get_lock_status", "arguments": {}})
-            lock_status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
-            if lock_status is not None:
-                logging.info(f"Tuner lock status: {lock_status}")
-            else:
-                logging.warning("No tuner lock status response received")
+
+            # PLL lock check: Valon supports get_lock_status; other tuners do not
+            if resolved_tuner == "VALON":
+                self._publish(TUNER_CMD_TOPIC, {"task_name": "get_lock_status", "arguments": {}})
+                lock_status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
+                if lock_status is not None:
+                    logging.info(f"Tuner lock status: {lock_status}")
+                else:
+                    logging.warning("No tuner lock status response received")
 
         # Common tail: metadata → channel → capture → TLM
         self._publish(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_metadata {f_hz}"})
@@ -458,7 +504,8 @@ def get_frequency_list(start_mhz: float, end_mhz: float, step_mhz: float):
     step_hz  = int(step_mhz  * 1e6)
     if math.isnan(end_mhz):
         return [start_hz]
-    return range(start_hz, int(end_mhz * 1e6), step_hz)
+    end_hz = int(end_mhz * 1e6)
+    return range(start_hz, end_hz + step_hz, step_hz)
 
 
 def tuner_type_arg(x: str):
@@ -510,6 +557,10 @@ if __name__ == "__main__":
     parser.add_argument("--capture_name",       type=str,   default=None,
                         help="Save data under captures/{name}/... (default: ringbuffer)")
     args = parser.parse_args()
+    args.channel = args.channel.upper()
+
+    if args.tuner is not None and args.adc_if is None:
+        parser.error("--adc_if is required when --tuner is set")
 
     if args.sample_rate is None:
         args.sample_rate = int(args.step)
