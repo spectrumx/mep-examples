@@ -1191,7 +1191,9 @@ class MEPGui:
             mqtt_publish.single(TUNER_CMD_TOPIC, json.dumps(payload),
                                 hostname=MQTT_BROKER, port=MQTT_PORT)
             logging.info(f"TUN: init_tuner sent ({tuner})")
-            self.root.after(3000, self._tun_check_lock)  # check lock after init settles
+            # Only Valon supports get_lock_status
+            if tuner.lower() == "valon":
+                self.root.after(3000, self._tun_check_lock)
         except Exception as e:
             logging.error(f"TUN init failed: {e}")
 
