@@ -149,7 +149,8 @@ if __name__ == '__main__':
   #
   # note: gary miller is the difficult human who holds responsibility over gpsd open source
   #
-  cmdList = ["ubxtool -e BINARY ",    # 1st
+  cmdList = ["ubxtool -p MODEL,0",  # Dynamic platform model preset, 0=mobile, 1=stationary
+             "ubxtool -e BINARY ",    # 1st
              "ubxtool -d NMEA   ",    # 2nd
              "ubxtool -d BEIDOU ",
              "ubxtool -d GALILEO",
