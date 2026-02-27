@@ -1703,6 +1703,10 @@ class MEPGui:
             try:
                 mep = self._get_or_create_mep(params)
                 mep._stop_flag.clear()
+                if not mep.wait_for_firmware_ready(max_wait_s=10):
+                    logging.error("RFSoC firmware not ready — aborting sweep")
+                    self._status_var.set("Idle")
+                    return
                 freqs_hz = get_frequency_list(
                     params["freq_start"], params["freq_end"], params["step"]
                 )
