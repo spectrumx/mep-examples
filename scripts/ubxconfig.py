@@ -149,8 +149,7 @@ if __name__ == '__main__':
   #
   # note: gary miller is the difficult human who holds responsibility over gpsd open source
   #
-  cmdList = ["ubxtool -p MODEL,0",  # Dynamic platform model preset, 0=mobile, 1=stationary
-             "ubxtool -e BINARY ",    # 1st
+  cmdList = ["ubxtool -e BINARY ",    # 1st
              "ubxtool -d NMEA   ",    # 2nd
              "ubxtool -d BEIDOU ",
              "ubxtool -d GALILEO",
@@ -171,6 +170,7 @@ if __name__ == '__main__':
              "ubxtool -z CFG-TP-LEN_TP2,100       ",
              "ubxtool -z CFG-TP-LEN_LOCK_TP2,1000 ",
              "ubxtool -z CFG-TP-ANT_CABLEDELAY,%d "%(cable_delay),  # antenna
+             "ubxtool -p MODEL,0",  # Dynamic platform model preset, 0=mobile, 1=stationary
              #"ubxtool -z CFG-TP-DRSTR_TP1,%d"%(drstr),              # coded driver strength
              #"ubxtool -z CFG-TP-DRSTR_TP2,%d"%(drstr),
          ]
