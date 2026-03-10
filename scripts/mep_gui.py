@@ -18,6 +18,7 @@ import re
 import math
 import json
 import socket
+import queue
 import threading
 import logging
 import tkinter as tk
@@ -104,75 +105,611 @@ class _TextHandler(logging.Handler):
 class MEPGui:
     CHANNEL_OPTIONS     = ["A", "B", "C", "D"]
     TUNER_OPTIONS       = ["None"] + list(TUNER_INJECTION_SIDE.keys()) + ["auto"]
-    SAMPLE_RATE_OPTIONS = ["1", "2", "4", "8", "10", "16", "20", "32", "64"]
+    RECORDER_CONFIG_DIR = "/opt/radiohound/docker/recorder/configs"
+    DEFAULT_SAMPLE_RATE_OPTIONS = ["1", "2", "4", "8", "10", "16", "20", "32", "64"]
+    SAMPLE_RATE_OPTIONS = DEFAULT_SAMPLE_RATE_OPTIONS.copy()
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("MEP RFSoC Controller")
+        self.root.title("MEP Control App")
         self.root.resizable(True, True)
+
+        # Read available recorder configs (sr{N}MHz.yaml) and present N values.
+        self.SAMPLE_RATE_OPTIONS = self._discover_sample_rate_options()
 
         self.mep: MEPController = None
         self._sweep_thread: threading.Thread = None
         self._afe_updating = False  # suppresses trace callbacks during state load
+        self._gpsd_cmd_queue = queue.Queue()
+        self._gpsd_run = True
+        self._gps_state = self._gps_state_defaults()
+        self._gps_fix_hints = {
+            "tpv_mode": None,
+            "gga_quality": None,
+            "gsa_mode": None,
+            "rmc_valid": None,
+        }
+        self._gps_gsv_partial = {}
+        self._gps_gsv_last_complete = {}
 
         self._build_ui()
         self._setup_logging()
         self._start_status_monitor()
-        self._start_gps_monitor()          # GPS: direct gpsd feed, independent of afe_service
+        self._start_gps_monitor()          # GPSD: single shared stream for GPS tab + fields
         self._schedule_poll()
         self.root.after(2000, self._tun_refresh)   # TUN: read monitor cache once connected
         self.root.after(2000, self._rec_status_seed)  # REC: seed status from cache
         self.root.after(3000, self._afe_refresh)   # AFE/TLM: load true hardware state
 
+    def _discover_sample_rate_options(self) -> list[str]:
+        """Return sorted sample-rate strings discovered from recorder config filenames."""
+        pattern = re.compile(r"^sr(\d+)MHz\.yaml$")
+        rates = set()
+
+        try:
+            for name in os.listdir(self.RECORDER_CONFIG_DIR):
+                match = pattern.match(name)
+                if match:
+                    rates.add(int(match.group(1)))
+        except OSError as e:
+            logging.warning(
+                "Could not read recorder config directory '%s': %s. Using default sample rates.",
+                self.RECORDER_CONFIG_DIR,
+                e,
+            )
+            return self.DEFAULT_SAMPLE_RATE_OPTIONS.copy()
+
+        if not rates:
+            logging.warning(
+                "No sample-rate configs matching 'sr{N}MHz.yaml' in '%s'. Using default sample rates.",
+                self.RECORDER_CONFIG_DIR,
+            )
+            return self.DEFAULT_SAMPLE_RATE_OPTIONS.copy()
+
+        return [str(rate) for rate in sorted(rates)]
+
+    def _default_sample_rate(self) -> str:
+        """Prefer 10 MHz when available, otherwise use the first discovered option."""
+        if "10" in self.SAMPLE_RATE_OPTIONS:
+            return "10"
+        return self.SAMPLE_RATE_OPTIONS[0]
+
     # ------------------------------------------------------------------ #
-    #  Direct gpsd GPS monitor                                             #
+    #  Direct gpsd monitor                                                #
     # ------------------------------------------------------------------ #
 
+    def _gps_state_defaults(self) -> dict:
+        return {
+            "gpsd_conn_status": "Connecting...",
+            "gpsd_device": "Not reported",
+            "gpsd_driver": "Not reported",
+            "gpsd_baud": "Not reported",
+            "gpsd_update_rate_s": "Not reported",
+            "gpsd_watch_state": "Not reported",
+            "gps_summary": "Waiting for gpsd data",
+            "gps_fix_status": "Unknown",
+            "gps_fix_quality": "Not reported",
+            "gps_utc_time": "Unknown",
+            "gps_lat": "Unknown",
+            "gps_lon": "Unknown",
+            "gps_alt_m": "Not reported",
+            "gps_speed_kn": "0.000",
+            "gps_sats_visible": "0",
+            "gps_sats_used": "0",
+            "gps_sats_gps": "0",
+            "gps_sats_glonass": "0",
+            "gps_sats_galileo": "0",
+            "gps_sats_beidou": "0",
+            "gps_pdop": "Not reported",
+            "gps_hdop": "Not reported",
+            "gps_vdop": "Not reported",
+        }
+
+    def _gps_set(self, key: str, value, *, allow_empty: bool = False, force: bool = False):
+        """Set one semantic GPS state key safely and update matching UI field."""
+        if value is None and not force:
+            return
+        val = "" if value is None else str(value)
+        if (not allow_empty) and (not val.strip()) and (not force):
+            return
+        self._gps_state[key] = val
+        if key in self._vars:
+            self._vars[key].set(val)
+
+    def _gps_set_float(self, key: str, value, fmt: str):
+        try:
+            self._gps_set(key, format(float(value), fmt))
+        except Exception:
+            return
+
+    def _gps_nmea_to_decimal(self, raw: str, hemi: str):
+        """Convert ddmm.mmmm / dddmm.mmmm NMEA coordinates to decimal degrees."""
+        if not raw:
+            return None
+        try:
+            v = float(raw)
+        except Exception:
+            return None
+
+        deg = int(v // 100)
+        minutes = v - (deg * 100)
+        decimal = deg + minutes / 60.0
+        hemi = (hemi or "").upper()
+        if hemi in ("S", "W"):
+            decimal *= -1.0
+        return decimal
+
+    def _gps_fmt_hms(self, hhmmss: str):
+        if not hhmmss or len(hhmmss) < 6:
+            return None
+        core = hhmmss.split(".")[0]
+        if len(core) < 6:
+            return None
+        return f"{core[0:2]}:{core[2:4]}:{core[4:6]}Z"
+
+    def _gps_fmt_iso_from_rmc(self, hhmmss: str, ddmmyy: str):
+        if not hhmmss or not ddmmyy or len(ddmmyy) != 6:
+            return self._gps_fmt_hms(hhmmss)
+        t = self._gps_fmt_hms(hhmmss)
+        if t is None:
+            return None
+        day = ddmmyy[0:2]
+        month = ddmmyy[2:4]
+        year = int(ddmmyy[4:6])
+        year += 2000 if year < 80 else 1900
+        return f"{year:04d}-{month}-{day}T{t}"
+
+    def _gps_fix_quality_text(self, quality: int):
+        table = {
+            0: "Invalid",
+            1: "GPS",
+            2: "DGPS",
+            3: "PPS",
+            4: "RTK",
+            5: "Float RTK",
+            6: "Estimated",
+            7: "Manual",
+            8: "Simulation",
+        }
+        return table.get(quality, f"Quality {quality}")
+
+    def _gps_recompute_fix_and_summary(self):
+        """Resolve cross-source fix precedence and publish a stable summary."""
+        h = self._gps_fix_hints
+
+        fix = "Unknown"
+        if h.get("rmc_valid") is False:
+            fix = "No fix"
+        elif isinstance(h.get("gga_quality"), int):
+            q = h["gga_quality"]
+            fix = "No fix" if q <= 0 else self._gps_fix_quality_text(q)
+        elif isinstance(h.get("tpv_mode"), int):
+            mode = h["tpv_mode"]
+            if mode <= 1:
+                fix = "No fix"
+            elif mode == 2:
+                fix = "2D"
+            else:
+                fix = "3D"
+        elif isinstance(h.get("gsa_mode"), int):
+            mode = h["gsa_mode"]
+            if mode <= 1:
+                fix = "No fix"
+            elif mode == 2:
+                fix = "2D"
+            else:
+                fix = "3D"
+
+        self._gps_set("gps_fix_status", fix, force=True)
+        if fix == "No fix":
+            self._gps_set("gps_fix_quality", "Invalid", force=True)
+
+        summary = (
+            f"{self._gps_state.get('gpsd_conn_status', 'Unknown')} | "
+            f"Fix: {self._gps_state.get('gps_fix_status', 'Unknown')} | "
+            f"Sats used/visible: {self._gps_state.get('gps_sats_used', '0')}/"
+            f"{self._gps_state.get('gps_sats_visible', '0')} | "
+            f"Device: {self._gps_state.get('gpsd_device', 'Not reported')}"
+        )
+        self._gps_set("gps_summary", summary, force=True)
+
     def _start_gps_monitor(self):
-        """Connect directly to gpsd on port 2947 and parse $GNRMC sentences.
-        Populates GPS TLM fields independently of afe_service, which does not
-        reliably return GPS sentences in its block-3 reply.
-        """
+        """Run one persistent gpsd stream and fan out data to the GPSD tab/UI."""
         import time as _time
 
         def _worker():
-            while True:
+            while self._gpsd_run:
                 try:
                     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                         s.settimeout(5.0)
                         s.connect(("127.0.0.1", 2947))
-                        s.settimeout(None)
+                        s.settimeout(0.5)
+                        self.root.after(0, lambda: self._gps_set("gpsd_conn_status", "Connected", force=True))
+
+                        # Default stream includes raw NMEA and JSON classes.
                         s.sendall(b'?WATCH={"enable":true,"raw":1};\n')
-                        f = s.makefile('r', encoding='ascii', errors='ignore')
-                        for line in f:
-                            line = line.strip()
-                            if not line.startswith('$GNRMC'):
+                        self.root.after(
+                            0, lambda: self._gpsd_log("TX", '?WATCH={"enable":true,"raw":1};'))
+                        self.root.after(0, lambda: self._gps_set("gpsd_watch_state", "enabled raw=1", force=True))
+
+                        buf = ""
+                        while self._gpsd_run:
+                            try:
+                                while True:
+                                    cmd = self._gpsd_cmd_queue.get_nowait().strip()
+                                    if not cmd:
+                                        continue
+                                    if not cmd.endswith(";"):
+                                        cmd += ";"
+                                    wire = (cmd + "\n").encode("ascii", errors="ignore")
+                                    s.sendall(wire)
+                                    self.root.after(0, lambda c=cmd: self._gpsd_log("TX", c))
+                            except queue.Empty:
+                                pass
+
+                            try:
+                                data = s.recv(4096)
+                            except socket.timeout:
                                 continue
-                            clean = line.split('*')[0]
-                            parts = clean.lstrip('$').split(',')
-                            if len(parts) >= 10:
-                                self.root.after(
-                                    0, lambda p=parts: self._gps_apply(p))
+
+                            if not data:
+                                raise ConnectionError("gpsd closed socket")
+
+                            buf += data.decode("ascii", errors="ignore")
+                            while "\n" in buf:
+                                line, buf = buf.split("\n", 1)
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                self.root.after(0, lambda l=line: self._gpsd_handle_line(l))
                 except Exception as e:
-                    logging.warning(f"GPS monitor: {e} — retrying in 5s")
+                    self.root.after(0, lambda err=str(e): self._gps_set("gpsd_conn_status", f"Disconnected ({err})", force=True))
+                    self.root.after(0, lambda: self._gps_set("gps_fix_status", "Unknown", force=True))
+                    self.root.after(0, self._gps_recompute_fix_and_summary)
                     _time.sleep(5)
 
         threading.Thread(target=_worker, daemon=True, name="gps_monitor").start()
 
-    def _gps_apply(self, parts: list):
-        """Update GPS TLM StringVars from a split $GNRMC sentence.
-        parts[0] == 'GNRMC', parts[1]=time, [2]=A/V, [3]=lat, [4]=NS,
-        [5]=lon, [6]=EW, [7]=speed.
-        """
-        def _set(key, val):
-            if key in self._vars:
-                self._vars[key].set(val)
+    def _gpsd_log(self, direction: str, line: str):
+        if not hasattr(self, "_gpsd_text"):
+            return
+        import datetime
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self._gpsd_text.insert("end", f"{ts}  {direction}  {line}\n")
+        self._gpsd_text.see("end")
+        lines = int(self._gpsd_text.index("end-1c").split(".")[0])
+        if lines > 800:
+            self._gpsd_text.delete("1.0", f"{lines - 800}.0")
 
-        _set("tlm_gps_time",  parts[1] if parts[1] else "—")
-        _set("tlm_gps_fix",   "Valid" if parts[2] == "A" else "No fix")
-        _set("tlm_gps_lat",   f"{parts[3]} {parts[4]}" if parts[3] else "—")
-        _set("tlm_gps_lon",   f"{parts[5]} {parts[6]}" if parts[5] else "—")
-        _set("tlm_gps_speed", parts[7] if parts[7] else "—")
+    def _gpsd_handle_line(self, line: str):
+        self._gpsd_log("RX", line)
+
+        if line.startswith("$"):
+            self._gps_parse_nmea(line)
+            return
+
+        if line.startswith("{"):
+            try:
+                msg = json.loads(line)
+            except Exception:
+                return
+            self._gps_apply_json(msg)
+
+    def _gps_apply_json(self, msg: dict):
+        """Apply optional gpsd JSON updates into semantic GPS state keys."""
+        if not isinstance(msg, dict):
+            return
+
+        cls = str(msg.get("class", "")).upper()
+        if not cls:
+            return
+
+        if cls == "DEVICE":
+            self._gps_set("gpsd_device", msg.get("path"))
+            self._gps_set("gpsd_driver", msg.get("driver"))
+            if msg.get("bps") is not None:
+                self._gps_set("gpsd_baud", str(int(msg.get("bps"))))
+            if msg.get("cycle") is not None:
+                self._gps_set_float("gpsd_update_rate_s", msg.get("cycle"), ".2f")
+
+        elif cls == "DEVICES":
+            devs = msg.get("devices")
+            if isinstance(devs, list) and devs:
+                first = devs[0] if isinstance(devs[0], dict) else {}
+                self._gps_apply_json(dict(first, **{"class": "DEVICE"}))
+
+        elif cls == "WATCH":
+            enabled = msg.get("enable")
+            raw = msg.get("raw")
+            nmea = msg.get("nmea")
+            state = "Not reported"
+            if enabled is not None:
+                state = "enabled" if bool(enabled) else "disabled"
+                if raw is not None:
+                    state += f" raw={raw}"
+                if nmea is not None:
+                    state += f" nmea={bool(nmea)}"
+            self._gps_set("gpsd_watch_state", state, force=True)
+
+        elif cls == "VERSION":
+            rel = msg.get("release")
+            rev = msg.get("rev")
+            if rel:
+                txt = f"gpsd {rel}"
+                if rev:
+                    txt += f" ({rev})"
+                self._gps_set("gpsd_driver", txt, force=True)
+
+        elif cls == "TPV":
+            if msg.get("mode") is not None:
+                try:
+                    self._gps_fix_hints["tpv_mode"] = int(msg.get("mode"))
+                except Exception:
+                    pass
+
+            if msg.get("time"):
+                self._gps_set("gps_utc_time", msg.get("time"))
+            if msg.get("lat") is not None:
+                self._gps_set_float("gps_lat", msg.get("lat"), ".6f")
+            if msg.get("lon") is not None:
+                self._gps_set_float("gps_lon", msg.get("lon"), ".6f")
+            if msg.get("alt") is not None:
+                self._gps_set_float("gps_alt_m", msg.get("alt"), ".2f")
+            if msg.get("speed") is not None:
+                self._gps_set_float("gps_speed_kn", float(msg.get("speed")) * 1.943844, ".3f")
+
+        elif cls == "SKY":
+            sats = msg.get("satellites")
+            if isinstance(sats, list):
+                visible = len(sats)
+                used = 0
+                counts = {
+                    "GPS": 0,
+                    "GLONASS": 0,
+                    "GALILEO": 0,
+                    "BEIDOU": 0,
+                }
+                for sat in sats:
+                    if not isinstance(sat, dict):
+                        continue
+                    if sat.get("used") is True:
+                        used += 1
+                    gnssid = sat.get("gnssid")
+                    if gnssid == 0:
+                        counts["GPS"] += 1
+                    elif gnssid == 2:
+                        counts["GALILEO"] += 1
+                    elif gnssid == 3:
+                        counts["BEIDOU"] += 1
+                    elif gnssid == 6:
+                        counts["GLONASS"] += 1
+
+                self._gps_set("gps_sats_visible", str(visible), force=True)
+                self._gps_set("gps_sats_used", str(used), force=True)
+                self._gps_set("gps_sats_gps", str(counts["GPS"]), force=True)
+                self._gps_set("gps_sats_glonass", str(counts["GLONASS"]), force=True)
+                self._gps_set("gps_sats_galileo", str(counts["GALILEO"]), force=True)
+                self._gps_set("gps_sats_beidou", str(counts["BEIDOU"]), force=True)
+
+            if msg.get("pdop") is not None:
+                self._gps_set_float("gps_pdop", msg.get("pdop"), ".2f")
+            if msg.get("hdop") is not None:
+                self._gps_set_float("gps_hdop", msg.get("hdop"), ".2f")
+            if msg.get("vdop") is not None:
+                self._gps_set_float("gps_vdop", msg.get("vdop"), ".2f")
+
+        self._gps_recompute_fix_and_summary()
+
+    def _gpsd_send_command(self, cmd: str):
+        """Queue one raw gpsd command for the single monitor connection."""
+        self._gpsd_cmd_queue.put(cmd)
+
+    def _gpsd_send_manual(self):
+        cmd = self._vars["gpsd_cmd"].get().strip()
+        if not cmd:
+            logging.error("GPSD: command is empty")
+            return
+        self._gpsd_send_command(cmd)
+
+    def _gpsd_watch_raw_on(self):
+        self._gpsd_send_command('?WATCH={"enable":true,"raw":1}')
+        self._gps_set("gpsd_watch_state", "enabled raw=1", force=True)
+
+    def _gpsd_watch_off(self):
+        self._gpsd_send_command('?WATCH={"enable":false}')
+        self._gps_set("gpsd_watch_state", "disabled", force=True)
+
+    def _gps_parse_nmea(self, line: str):
+        clean = line.split("*")[0]
+        body = clean.lstrip("$")
+        parts = body.split(",")
+        if not parts:
+            return
+        talker_sentence = parts[0]
+        if len(talker_sentence) < 3:
+            return
+        talker = talker_sentence[:2]
+        sentence = talker_sentence[2:]
+
+        if sentence == "RMC":
+            self._gps_parse_rmc(parts)
+        elif sentence == "GGA":
+            self._gps_parse_gga(parts)
+        elif sentence == "GSA":
+            self._gps_parse_gsa(parts)
+        elif sentence == "GSV":
+            self._gps_parse_gsv(talker, parts)
+        elif sentence == "ZDA":
+            self._gps_parse_zda(parts)
+
+        self._gps_recompute_fix_and_summary()
+
+    def _gps_parse_rmc(self, parts: list):
+        if len(parts) < 10:
+            return
+        t_utc = self._gps_fmt_iso_from_rmc(parts[1], parts[9])
+        if t_utc:
+            self._gps_set("gps_utc_time", t_utc)
+
+        status = (parts[2] or "").upper()
+        if status:
+            self._gps_fix_hints["rmc_valid"] = (status == "A")
+
+        lat = self._gps_nmea_to_decimal(parts[3], parts[4])
+        lon = self._gps_nmea_to_decimal(parts[5], parts[6])
+        if lat is not None:
+            self._gps_set("gps_lat", f"{lat:.6f}")
+        if lon is not None:
+            self._gps_set("gps_lon", f"{lon:.6f}")
+
+        if parts[7]:
+            self._gps_set_float("gps_speed_kn", parts[7], ".3f")
+
+    def _gps_parse_gga(self, parts: list):
+        if len(parts) < 10:
+            return
+        t_utc = self._gps_fmt_hms(parts[1])
+        if t_utc:
+            self._gps_set("gps_utc_time", t_utc)
+
+        lat = self._gps_nmea_to_decimal(parts[2], parts[3])
+        lon = self._gps_nmea_to_decimal(parts[4], parts[5])
+        if lat is not None:
+            self._gps_set("gps_lat", f"{lat:.6f}")
+        if lon is not None:
+            self._gps_set("gps_lon", f"{lon:.6f}")
+
+        if parts[6]:
+            try:
+                q = int(parts[6])
+                self._gps_fix_hints["gga_quality"] = q
+                self._gps_set("gps_fix_quality", self._gps_fix_quality_text(q), force=True)
+            except Exception:
+                pass
+
+        if parts[7]:
+            try:
+                self._gps_set("gps_sats_used", str(int(parts[7])), force=True)
+            except Exception:
+                pass
+
+        if parts[8]:
+            self._gps_set_float("gps_hdop", parts[8], ".2f")
+
+        if parts[9]:
+            self._gps_set_float("gps_alt_m", parts[9], ".2f")
+
+    def _gps_parse_gsa(self, parts: list):
+        if len(parts) < 18:
+            return
+        if parts[2]:
+            try:
+                self._gps_fix_hints["gsa_mode"] = int(parts[2])
+            except Exception:
+                pass
+
+        used = 0
+        for sv in parts[3:15]:
+            if sv.strip():
+                used += 1
+        self._gps_set("gps_sats_used", str(used), force=True)
+
+        if parts[15]:
+            self._gps_set_float("gps_pdop", parts[15], ".2f")
+        if parts[16]:
+            self._gps_set_float("gps_hdop", parts[16], ".2f")
+        if parts[17]:
+            self._gps_set_float("gps_vdop", parts[17], ".2f")
+
+    def _gps_constellation_from_prn(self, talker: str, prn: int):
+        talker = (talker or "").upper()
+        if talker == "GP":
+            return "GPS"
+        if talker == "GL":
+            return "GLONASS"
+        if talker == "GA":
+            return "GALILEO"
+        if talker in ("GB", "BD"):
+            return "BEIDOU"
+        if 65 <= prn <= 96:
+            return "GLONASS"
+        if 201 <= prn <= 237:
+            return "BEIDOU"
+        if 301 <= prn <= 336:
+            return "GALILEO"
+        return "GPS"
+
+    def _gps_parse_gsv(self, talker: str, parts: list):
+        if len(parts) < 4:
+            return
+        try:
+            total_msgs = int(parts[1] or 0)
+            msg_num = int(parts[2] or 0)
+            total_visible = int(parts[3] or 0)
+        except Exception:
+            return
+
+        if total_msgs <= 0 or msg_num <= 0:
+            return
+
+        key = talker.upper()
+        cycle = self._gps_gsv_partial.get(key)
+        if cycle is None or msg_num == 1 or cycle.get("expected") != total_msgs:
+            cycle = {
+                "expected": total_msgs,
+                "seen": set(),
+                "visible": total_visible,
+                "counts": {"GPS": 0, "GLONASS": 0, "GALILEO": 0, "BEIDOU": 0},
+            }
+            self._gps_gsv_partial[key] = cycle
+
+        cycle["seen"].add(msg_num)
+        cycle["visible"] = max(cycle["visible"], total_visible)
+
+        idx = 4
+        while idx + 3 < len(parts):
+            prn_txt = parts[idx].strip()
+            if prn_txt:
+                try:
+                    prn = int(prn_txt)
+                    const = self._gps_constellation_from_prn(key, prn)
+                    if const in cycle["counts"]:
+                        cycle["counts"][const] += 1
+                except Exception:
+                    pass
+            idx += 4
+
+        # Update global counters only when cycle is complete to avoid flicker.
+        if len(cycle["seen"]) >= cycle["expected"]:
+            self._gps_gsv_last_complete[key] = {
+                "visible": cycle["visible"],
+                "counts": dict(cycle["counts"]),
+            }
+            self._gps_gsv_partial.pop(key, None)
+
+            totals = {"GPS": 0, "GLONASS": 0, "GALILEO": 0, "BEIDOU": 0}
+            total_visible_all = 0
+            for data in self._gps_gsv_last_complete.values():
+                total_visible_all += int(data.get("visible", 0))
+                for c in totals:
+                    totals[c] += int(data.get("counts", {}).get(c, 0))
+
+            if total_visible_all > 0:
+                self._gps_set("gps_sats_visible", str(total_visible_all), force=True)
+            self._gps_set("gps_sats_gps", str(totals["GPS"]), force=True)
+            self._gps_set("gps_sats_glonass", str(totals["GLONASS"]), force=True)
+            self._gps_set("gps_sats_galileo", str(totals["GALILEO"]), force=True)
+            self._gps_set("gps_sats_beidou", str(totals["BEIDOU"]), force=True)
+
+    def _gps_parse_zda(self, parts: list):
+        if len(parts) < 5:
+            return
+        t = self._gps_fmt_hms(parts[1])
+        d = parts[2]
+        m = parts[3]
+        y = parts[4]
+        if t and d and m and y:
+            self._gps_set("gps_utc_time", f"{y}-{m.zfill(2)}-{d.zfill(2)}T{t}")
 
     # ------------------------------------------------------------------ #
     #  Background MQTT status monitor                                      #
@@ -185,11 +722,20 @@ class MEPGui:
         """
         self._monitor_states = {}   # last seen state per topic
 
-        def _on_connect(client, userdata, flags, rc):
-            if rc == 0:
+        def _on_connect(client, userdata, flags, reason_code, properties):
+            rc_value = getattr(reason_code, "value", reason_code)
+            try:
+                rc_num = int(rc_value)
+            except (TypeError, ValueError):
+                rc_num = None
+            is_failure = getattr(reason_code, "is_failure", None)
+            connected = (not is_failure) if isinstance(is_failure, bool) else (rc_num == 0)
+
+            if connected:
                 client.subscribe("#")   # wildcard – all topics
             else:
-                logging.warning(f"Status monitor MQTT connect failed: rc={rc}")
+                logging.warning(
+                    f"Status monitor MQTT connect failed: rc={rc_num} ({reason_code})")
 
         def _on_message(client, userdata, msg):
             # ---- MQTT tab live log ---- #
@@ -239,7 +785,7 @@ class MEPGui:
                     self.root.after(0, self._tun_refresh)
 
         mon = mqtt_client.Client(
-            callback_api_version=mqtt_client.CallbackAPIVersion.VERSION1,
+            callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2,
             client_id="mep_gui_monitor",
         )
         mon.on_connect = _on_connect
@@ -360,7 +906,7 @@ class MEPGui:
 
         ttk.Label(frame, text="Sample Rate (MHz)").grid(
             row=1, column=2, sticky="w", padx=5, pady=4)
-        self._vars["sample_rate"] = tk.StringVar(value="10")
+        self._vars["sample_rate"] = tk.StringVar(value=self._default_sample_rate())
         ttk.Combobox(
             frame, textvariable=self._vars["sample_rate"],
             values=self.SAMPLE_RATE_OPTIONS, width=16, state="readonly",
@@ -430,8 +976,10 @@ class MEPGui:
         soc_f = ttk.Frame(nb, padding=8)
         tun_f = ttk.Frame(nb, padding=8)
         mqtt_f = ttk.Frame(nb, padding=8)
+        gpsd_f = ttk.Frame(nb, padding=8)
         nb.add(afe_f, text="AFE")
         nb.add(rec_f, text="REC")
+        nb.add(gpsd_f, text="GPSD")
         nb.add(tlm_f, text="TLM")
         nb.add(soc_f, text="SOC")
         nb.add(tun_f, text="TUN")
@@ -439,10 +987,118 @@ class MEPGui:
 
         self._build_afe_tab(afe_f)
         self._build_rec_tab(rec_f)
+        self._build_gpsd_tab(gpsd_f)
         self._build_tlm_tab(tlm_f)
         self._build_soc_tab(soc_f)
         self._build_tun_tab(tun_f)
         self._build_mqtt_tab(mqtt_f)
+
+    def _build_gpsd_tab(self, frame: ttk.Frame):
+        """GPSD tab: connection controls, semantic diagnostics, stream, and commands."""
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
+
+        def _ro_row(parent, row, col, label, key, unit=""):
+            sv = tk.StringVar(value=self._gps_state.get(key, "Not reported"))
+            self._vars[key] = sv
+            c0 = col * 4
+            ttk.Label(parent, text=label).grid(
+                row=row, column=c0, sticky="w", padx=5, pady=2)
+            e = ttk.Entry(parent, textvariable=sv, state="readonly", width=18)
+            e.grid(row=row, column=c0 + 1, sticky="ew", padx=5, pady=2)
+            self._bind_copy_menu(e, sv)
+            if unit:
+                ttk.Label(parent, text=unit, foreground="grey").grid(
+                    row=row, column=c0 + 2, sticky="w")
+
+        ctl_f = ttk.LabelFrame(frame, text="Connection")
+        ctl_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
+        ctl_f.columnconfigure(0, weight=1)
+        ctl_f.columnconfigure(1, weight=1)
+
+        ttk.Button(ctl_f, text="WATCH Raw On",
+                   command=self._gpsd_watch_raw_on).grid(
+            row=1, column=0, padx=5, pady=(0, 4), sticky="ew")
+        ttk.Button(ctl_f, text="WATCH Off",
+                   command=self._gpsd_watch_off).grid(
+            row=1, column=1, padx=5, pady=(0, 4), sticky="ew")
+
+        st_f = ttk.LabelFrame(frame, text="Status")
+        st_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        for c in (1, 5):
+            st_f.columnconfigure(c, weight=1)
+
+        _ro_row(st_f, 0, 0, "Status", "gpsd_conn_status")
+        _ro_row(st_f, 0, 1, "Device", "gpsd_device")
+        _ro_row(st_f, 1, 0, "Driver", "gpsd_driver")
+        _ro_row(st_f, 1, 1, "Baud", "gpsd_baud", "bps")
+        _ro_row(st_f, 2, 0, "Update Rate", "gpsd_update_rate_s", "s")
+        _ro_row(st_f, 2, 1, "WATCH", "gpsd_watch_state")
+        _ro_row(st_f, 3, 0, "Summary", "gps_summary")
+
+        _ro_row(st_f, 4, 0, "Fix Status", "gps_fix_status")
+        _ro_row(st_f, 4, 1, "Fix Quality", "gps_fix_quality")
+        _ro_row(st_f, 5, 0, "UTC Time", "gps_utc_time")
+        _ro_row(st_f, 5, 1, "Altitude", "gps_alt_m", "m")
+        _ro_row(st_f, 6, 0, "Latitude", "gps_lat", "deg")
+        _ro_row(st_f, 6, 1, "Longitude", "gps_lon", "deg")
+        _ro_row(st_f, 7, 0, "Speed", "gps_speed_kn", "knots")
+
+        _ro_row(st_f, 8, 0, "Visible Total", "gps_sats_visible")
+        _ro_row(st_f, 8, 1, "Used In Fix", "gps_sats_used")
+        _ro_row(st_f, 9, 0, "GPS Visible", "gps_sats_gps")
+        _ro_row(st_f, 9, 1, "GLONASS Visible", "gps_sats_glonass")
+        _ro_row(st_f, 10, 0, "Galileo Visible", "gps_sats_galileo")
+        _ro_row(st_f, 10, 1, "BeiDou Visible", "gps_sats_beidou")
+        _ro_row(st_f, 11, 0, "PDOP", "gps_pdop")
+        _ro_row(st_f, 11, 1, "HDOP", "gps_hdop")
+        _ro_row(st_f, 12, 0, "VDOP", "gps_vdop")
+
+        log_f = ttk.LabelFrame(frame, text="GPSD Stream")
+        log_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="nsew")
+        log_f.columnconfigure(0, weight=1)
+        log_f.rowconfigure(0, weight=1)
+
+        self._gpsd_text = tk.Text(
+            log_f,
+            height=12,
+            wrap="none",
+            font=("TkFixedFont", 9),
+            background="#f5f5f5",
+        )
+        ysb = ttk.Scrollbar(log_f, orient="vertical", command=self._gpsd_text.yview)
+        xsb = ttk.Scrollbar(log_f, orient="horizontal", command=self._gpsd_text.xview)
+        self._gpsd_text.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self._gpsd_text.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=(4, 0))
+        ysb.grid(row=0, column=1, sticky="ns", pady=(4, 0), padx=(0, 4))
+        xsb.grid(row=1, column=0, sticky="ew", padx=(4, 0), pady=(0, 4))
+        self._gpsd_text.bind("<Key>",
+            lambda e: None if (e.state & 0x4 and e.keysym in ("c", "C", "a", "A"))
+                      else "break")
+        self._bind_copy_menu(self._gpsd_text)
+
+        cmd_f = ttk.LabelFrame(frame, text="Manual Command")
+        cmd_f.grid(row=3, column=0, padx=4, pady=(2, 6), sticky="ew")
+        cmd_f.columnconfigure(1, weight=1)
+
+        ttk.Label(cmd_f, text="Command").grid(
+            row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["gpsd_cmd"] = tk.StringVar(value='?VERSION;')
+        ttk.Entry(cmd_f, textvariable=self._vars["gpsd_cmd"]).grid(
+            row=0, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Button(cmd_f, text="Send",
+                   command=self._gpsd_send_manual).grid(
+            row=0, column=2, padx=5, pady=3)
+        ttk.Button(cmd_f, text="Clear Log",
+                   command=lambda: self._gpsd_text.delete("1.0", "end")).grid(
+            row=1, column=0, columnspan=3, padx=5, pady=(0, 4), sticky="ew")
+
+        self._add_copyable_note(
+            frame,
+            "Source: gpsd service (config: /etc/default/gpsd)",
+            row=4,
+            wraplength=420,
+        )
 
     def _build_mqtt_tab(self, frame: ttk.Frame):
         """MQTT tab: live log of all incoming MQTT messages + manual publish."""
@@ -515,10 +1171,20 @@ class MEPGui:
         import datetime
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         try:
-            body = payload.decode()
+            decoded = payload.decode("utf-8")
+            stripped = decoded.strip()
+            if stripped:
+                try:
+                    parsed = json.loads(stripped)
+                    pretty = json.dumps(parsed, indent=2, sort_keys=True)
+                    body = "\n".join(f"  {ln}" for ln in pretty.splitlines())
+                except Exception:
+                    body = "\n".join(f"  {ln}" for ln in decoded.rstrip().splitlines())
+            else:
+                body = "  <empty>"
         except Exception:
-            body = repr(payload)
-        line = f"{ts}  {topic}\n  {body}\n"
+            body = f"  {repr(payload)}"
+        line = f"{ts}  {topic}\n{body}\n"
         self._mqtt_text.insert("end", line)
         self._mqtt_text.see("end")  # auto-scroll
         # cap log at 500 lines
@@ -548,6 +1214,33 @@ class MEPGui:
         menu.add_command(label="Copy", command=_copy)
         widget.bind("<Button-3>", lambda e: menu.post(e.x_root, e.y_root))
         widget.bind("<Control-c>", lambda e: (_copy(), "break")[1])
+
+    def _add_copyable_note(self, parent, text: str, row: int, wraplength: int = 420):
+        """Render subtle gray footer text that still allows selection/copy."""
+        est_lines = max(1, min(3, (len(text) // max(40, wraplength // 7)) + 1))
+        note = tk.Text(
+            parent,
+            height=est_lines,
+            wrap="word",
+            font=("TkDefaultFont", 8),
+            foreground="grey",
+            borderwidth=0,
+            highlightthickness=0,
+            relief="flat",
+            padx=0,
+            pady=0,
+            background=self.root.cget("bg"),
+        )
+        note.grid(row=row, column=0, padx=4, pady=(0, 2), sticky="ew")
+        note.insert("1.0", text)
+        note.configure(state="disabled")
+        note.bind(
+            "<Key>",
+            lambda e: None if (e.state & 0x4 and e.keysym in ("c", "C", "a", "A"))
+                      else "break",
+        )
+        self._bind_copy_menu(note)
+        return note
 
     def _build_soc_tab(self, frame: ttk.Frame):
         """SOC tab: RFSoC live telemetry and control."""
@@ -714,19 +1407,9 @@ class MEPGui:
                 ttk.Label(parent, text=unit, foreground="grey").grid(
                     row=row, column=2, sticky="w")
 
-        # ---- GPS ---- #
-        gps_f = ttk.LabelFrame(frame, text="GPS")
-        gps_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
-        gps_f.columnconfigure(1, weight=1)
-        _ro_row(gps_f, 0, "UTC Time",   "tlm_gps_time")
-        _ro_row(gps_f, 1, "Fix Status", "tlm_gps_fix")
-        _ro_row(gps_f, 2, "Latitude",   "tlm_gps_lat", "deg")
-        _ro_row(gps_f, 3, "Longitude",  "tlm_gps_lon", "deg")
-        _ro_row(gps_f, 4, "Speed",      "tlm_gps_speed", "knots")
-
         # ---- Accelerometer ---- #
         acc_f = ttk.LabelFrame(frame, text="Accelerometer")
-        acc_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        acc_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
         acc_f.columnconfigure(1, weight=1)
         _ro_row(acc_f, 0, "X", "tlm_acc_x", "g")
         _ro_row(acc_f, 1, "Y", "tlm_acc_y", "g")
@@ -734,7 +1417,7 @@ class MEPGui:
 
         # ---- Gyroscope ---- #
         gyr_f = ttk.LabelFrame(frame, text="Gyroscope")
-        gyr_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="ew")
+        gyr_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
         gyr_f.columnconfigure(1, weight=1)
         _ro_row(gyr_f, 0, "X", "tlm_gyr_x", "deg/s")
         _ro_row(gyr_f, 1, "Y", "tlm_gyr_y", "deg/s")
@@ -742,7 +1425,7 @@ class MEPGui:
 
         # ---- Magnetometer ---- #
         mag_f = ttk.LabelFrame(frame, text="Magnetometer")
-        mag_f.grid(row=3, column=0, padx=4, pady=(2, 2), sticky="ew")
+        mag_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="ew")
         mag_f.columnconfigure(1, weight=1)
         _ro_row(mag_f, 0, "X", "tlm_mag_x", "uT")
         _ro_row(mag_f, 1, "Y", "tlm_mag_y", "uT")
@@ -750,34 +1433,33 @@ class MEPGui:
 
         # ---- Housekeeping ---- #
         hk_f = ttk.LabelFrame(frame, text="Housekeeping")
-        hk_f.grid(row=4, column=0, padx=4, pady=(2, 4), sticky="ew")
+        hk_f.grid(row=3, column=0, padx=4, pady=(2, 4), sticky="ew")
         hk_f.columnconfigure(1, weight=1)
         _ro_row(hk_f, 0, "Timestamp",  "tlm_hk_ts")
         _ro_row(hk_f, 1, "Temp 1",     "tlm_hk_t1", "°C")
         _ro_row(hk_f, 2, "Temp 2",     "tlm_hk_t2", "°C")
         _ro_row(hk_f, 3, "Temp 3",     "tlm_hk_t3", "°C")
 
-        ttk.Label(frame, text="Updated on AFE Refresh",
+        ttk.Label(frame, text="Updated on AFE Refresh (IMU/HK)",
                   foreground="grey", font=("TkDefaultFont", 8)).grid(
-            row=5, column=0, pady=(0, 2))
+            row=4, column=0, pady=(0, 2))
 
         ttk.Button(frame, text="Refresh Telemetry",
                    command=self._afe_refresh).grid(
-            row=6, column=0, padx=4, pady=(0, 6), sticky="ew")
+            row=5, column=0, padx=4, pady=(0, 6), sticky="ew")
+
+        self._add_copyable_note(
+            frame,
+            "Source: AFE service (/opt/afe/afe_service.py), helper client: /opt/mep-examples/scripts/afe.py",
+            row=6,
+            wraplength=420,
+        )
 
     def _tlm_apply_state(self, telem: dict):
         """Populate TLM tab read-only fields from parsed telemetry dict."""
         def _set(key, val):
             if key in self._vars:
                 self._vars[key].set(val)
-
-        gps = telem.get("GNRMC", [])
-        if len(gps) >= 10:
-            _set("tlm_gps_time",  gps[1] if gps[1] else "—")
-            _set("tlm_gps_fix",   "Valid" if gps[2] == "A" else "No fix")
-            _set("tlm_gps_lat",   f"{gps[3]} {gps[4]}" if gps[3] else "—")
-            _set("tlm_gps_lon",   f"{gps[5]} {gps[6]}" if gps[5] else "—")
-            _set("tlm_gps_speed", gps[7] if gps[7] else "—")
 
         acc = telem.get("PMITACC", [])
         if len(acc) >= 4:
@@ -1822,6 +2504,7 @@ def main():
 
     def _on_close():
         # Clean up controller on window close
+        app._gpsd_run = False
         if app.mep is not None:
             logging.info("Window closed — cleaning up")
             try:

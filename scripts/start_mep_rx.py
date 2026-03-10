@@ -114,7 +114,7 @@ class MEPController:
         self._status_events = {t: threading.Event() for t in STATUS_TOPICS}
 
         self._client = mqtt_lib.Client(
-            callback_api_version=mqtt_lib.CallbackAPIVersion.VERSION1,
+            callback_api_version=mqtt_lib.CallbackAPIVersion.VERSION2,
             client_id=f"mep_rx_v2_{int(time.time())}",
         )
         self._client.on_connect    = self._on_connect
@@ -130,14 +130,22 @@ class MEPController:
     #  MQTT internals                                                      #
     # ------------------------------------------------------------------ #
 
-    def _on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        rc_value = getattr(reason_code, "value", reason_code)
+        try:
+            rc_num = int(rc_value)
+        except (TypeError, ValueError):
+            rc_num = None
+        is_failure = getattr(reason_code, "is_failure", None)
+        connected = (not is_failure) if isinstance(is_failure, bool) else (rc_num == 0)
+
+        if connected:
             logging.info("MQTT connected")
             for topic in STATUS_TOPICS:
                 client.subscribe(topic)
                 logging.debug(f"Subscribed to {topic}")
         else:
-            logging.error(f"MQTT connect failed: rc={rc}")
+            logging.error(f"MQTT connect failed: rc={rc_num} ({reason_code})")
 
     def _on_message(self, client, userdata, msg):
         try:
@@ -157,9 +165,17 @@ class MEPController:
             self._status_events[msg.topic].set()
             logging.debug(f"[{msg.topic}] {data}")
 
-    def _on_disconnect(self, client, userdata, rc):
-        if rc != 0:
-            logging.warning(f"MQTT unexpectedly disconnected: rc={rc}")
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
+        rc_value = getattr(reason_code, "value", reason_code)
+        try:
+            rc_num = int(rc_value)
+        except (TypeError, ValueError):
+            rc_num = None
+        is_failure = getattr(reason_code, "is_failure", None)
+        unexpected = bool(is_failure) if isinstance(is_failure, bool) else (rc_num != 0)
+
+        if unexpected:
+            logging.warning(f"MQTT unexpectedly disconnected: rc={rc_num} ({reason_code})")
 
     def _publish(self, topic: str, payload: dict, sleep_s: float = 0.1):
         self._client.publish(topic, json.dumps(payload))
