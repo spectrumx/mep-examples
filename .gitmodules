@@ -1,3 +1,0 @@
-[submodule "extern/valon-jetson-service"]
-	path = extern/valon-jetson-service
-	url = https://github.com/alisayurev/valon-jetson-service

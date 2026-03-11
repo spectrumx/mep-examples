@@ -14,15 +14,18 @@ Author: john.marino@colorado.edu
 
 import sys
 import os
+import shutil
 import re
 import math
 import json
 import socket
+import subprocess
 import queue
 import threading
 import logging
+from collections import deque
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox
 import paho.mqtt.publish as mqtt_publish
 import paho.mqtt.client as mqtt_client
 
@@ -86,18 +89,28 @@ class _TextHandler(logging.Handler):
     def __init__(self, widget: scrolledtext.ScrolledText):
         super().__init__()
         self.widget = widget
+        self._pending = queue.Queue()
 
     def emit(self, record: logging.LogRecord):
         msg = self.format(record) + "\n"
+        self._pending.put(msg)
 
-        def _append():
-            self.widget.configure(state="normal")
-            self.widget.insert(tk.END, msg)
-            self.widget.see(tk.END)
-            self.widget.configure(state="disabled")
+    def flush_pending(self, max_messages: int = 200):
+        """Flush queued log lines into the widget from the Tk main thread."""
+        batch = []
+        for _ in range(max_messages):
+            try:
+                batch.append(self._pending.get_nowait())
+            except queue.Empty:
+                break
 
-        # Schedule on main thread
-        self.widget.after(0, _append)
+        if not batch:
+            return
+
+        self.widget.configure(state="normal")
+        self.widget.insert(tk.END, "".join(batch))
+        self.widget.see(tk.END)
+        self.widget.configure(state="disabled")
 
 
 # ===== MAIN GUI CLASS ===== #
@@ -108,6 +121,7 @@ class MEPGui:
     RECORDER_CONFIG_DIR = "/opt/radiohound/docker/recorder/configs"
     DEFAULT_SAMPLE_RATE_OPTIONS = ["1", "2", "4", "8", "10", "16", "20", "32", "64"]
     SAMPLE_RATE_OPTIONS = DEFAULT_SAMPLE_RATE_OPTIONS.copy()
+    LEFT_START_WIDTH = 760
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -131,14 +145,24 @@ class MEPGui:
         }
         self._gps_gsv_partial = {}
         self._gps_gsv_last_complete = {}
+        self._tlm_state = self._tlm_state_defaults()
+        self._jetson_nvpmodel_modes, self._jetson_nvpmodel_default_id = self._read_nvpmodel_config()
+        self._jetson_health_state = self._jetson_health_defaults()
+        self._jetson_health_busy = False
+        self._jetson_nvpmodel_busy = False
+        self._jetson_cpu_prev = None
+        self._afe_reg_cache = {}
+        self._rec_status_cache = {"state": "—", "file": "—"}
+        self._mqtt_messages = deque(maxlen=2000)
+        self._mqtt_lock = threading.Lock()
+        self._mqtt_rendered_count = 0
 
         self._build_ui()
         self._setup_logging()
-        self._start_status_monitor()
-        self._start_gps_monitor()          # GPSD: single shared stream for GPS tab + fields
-        self._schedule_poll()
-        self.root.after(2000, self._tun_refresh)   # TUN: read monitor cache once connected
-        self.root.after(2000, self._rec_status_seed)  # REC: seed status from cache
+        # Defer monitor startup slightly so the first window paint is not delayed.
+        self.root.after(10, self._start_status_monitor)
+        self.root.after(20, self._start_gps_monitor)          # GPSD: single shared stream for GPS tab + fields
+        self.root.after(50, self._schedule_poll)
         self.root.after(3000, self._afe_refresh)   # AFE/TLM: load true hardware state
 
     def _discover_sample_rate_options(self) -> list[str]:
@@ -326,11 +350,11 @@ class MEPGui:
                         s.settimeout(0.5)
                         self.root.after(0, lambda: self._gps_set("gpsd_conn_status", "Connected", force=True))
 
-                        # Default stream includes raw NMEA and JSON classes.
-                        s.sendall(b'?WATCH={"enable":true,"raw":1};\n')
+                        # Default to JSON-only to keep startup/UI load low.
+                        s.sendall(b'?WATCH={"enable":true,"raw":0};\n')
                         self.root.after(
-                            0, lambda: self._gpsd_log("TX", '?WATCH={"enable":true,"raw":1};'))
-                        self.root.after(0, lambda: self._gps_set("gpsd_watch_state", "enabled raw=1", force=True))
+                            0, lambda: self._gpsd_log("TX", '?WATCH={"enable":true,"raw":0};'))
+                        self.root.after(0, lambda: self._gps_set("gpsd_watch_state", "enabled raw=0", force=True))
 
                         buf = ""
                         while self._gpsd_run:
@@ -372,6 +396,8 @@ class MEPGui:
 
     def _gpsd_log(self, direction: str, line: str):
         if not hasattr(self, "_gpsd_text"):
+            return
+        if not self._is_adv_tab_selected("GPSD"):
             return
         import datetime
         ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -738,9 +764,9 @@ class MEPGui:
                     f"Status monitor MQTT connect failed: rc={rc_num} ({reason_code})")
 
         def _on_message(client, userdata, msg):
-            # ---- MQTT tab live log ---- #
-            self.root.after(0, lambda t=msg.topic, p=msg.payload:
-                self._mqtt_log_message(t, p))
+            self._mqtt_capture_message(msg.topic, msg.payload)
+            if self._is_adv_tab_selected("MQTT"):
+                self.root.after(0, self._mqtt_flush_buffer_to_widget)
 
             try:
                 data = json.loads(msg.payload.decode())
@@ -759,7 +785,18 @@ class MEPGui:
                 if state != prev_state:
                     logging.info(f"Recorder: {state}")
                 self._monitor_states[topic] = data
-                self.root.after(0, lambda d=data: self._rec_status_update(d))
+                self._rec_status_cache = {
+                    "state": data.get("state", "—"),
+                    "file": str(
+                        data.get("file")
+                        or data.get("filename")
+                        or data.get("path")
+                        or data.get("output_file")
+                        or "—"
+                    ),
+                }
+                if self._adv_tabs_built and "rec_status" in self._vars:
+                    self.root.after(0, self._rec_status_apply_to_ui)
 
             elif topic == RFSOC_STATUS_TOPIC:
                 f_c = float(data.get("f_c_hz", 0)) / 1e6
@@ -781,8 +818,10 @@ class MEPGui:
                     prev_state = prev.get("state") if isinstance(prev, dict) else prev
                     if state != prev_state:
                         logging.info(f"Tuner: {state}")
-                    self._monitor_states[topic] = data
-                    self.root.after(0, self._tun_refresh)
+                    if data != prev:
+                        self._monitor_states[topic] = data
+                        if self._adv_tabs_built and "tun_state" in self._vars:
+                            self.root.after(0, self._tun_refresh)
 
         mon = mqtt_client.Client(
             callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2,
@@ -791,11 +830,28 @@ class MEPGui:
         mon.on_connect = _on_connect
         mon.on_message = _on_message
         try:
-            mon.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+            # Avoid blocking Tk startup on broker connect.
+            mon.connect_async(MQTT_BROKER, MQTT_PORT, keepalive=60)
             mon.loop_start()
             self._monitor_client = mon
         except Exception as e:
             logging.warning(f"Status monitor could not connect: {e}")
+
+    def _is_adv_tab_selected(self, tab_text: str) -> bool:
+        """Return True only when Advanced is visible and the named tab is active."""
+        if not hasattr(self, "_adv_frame") or not hasattr(self, "_adv_nb"):
+            return False
+        if not getattr(self, "_adv_tabs_built", False):
+            return False
+        if self._adv_nb is None:
+            return False
+        if not self._adv_frame.winfo_viewable():
+            return False
+        try:
+            current = self._adv_nb.index("current")
+            return self._adv_nb.tab(current, "text") == tab_text
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------ #
     #  UI Construction                                                     #
@@ -803,16 +859,26 @@ class MEPGui:
 
     def _build_ui(self):
         self.root.columnconfigure(0, weight=1)
-        self.root.columnconfigure(1, weight=0)
         self.root.rowconfigure(0, weight=1)
 
         self._vars = {}
 
+        # Horizontal split container with a draggable sash (resize handle).
+        self._main_pane = tk.PanedWindow(
+            self.root,
+            orient=tk.HORIZONTAL,
+            sashwidth=8,
+            sashrelief="raised",
+            showhandle=True,
+        )
+        self._main_pane.grid(row=0, column=0, sticky="nsew")
+        self._main_pane.bind("<ButtonRelease-1>", self._on_main_pane_release)
+
         # ---- Left pane ---- #
-        left = ttk.Frame(self.root)
-        left.grid(row=0, column=0, sticky="nsew")
+        left = ttk.Frame(self._main_pane)
         left.columnconfigure(0, weight=1)
         left.rowconfigure(5, weight=1)  # Log row expands
+        self._left_panel = left
 
         self._build_tune_section(left, row=0)
         self._build_record_section(left, row=1)
@@ -834,14 +900,26 @@ class MEPGui:
         log_frame.rowconfigure(0, weight=1)
 
         self._log_text = scrolledtext.ScrolledText(
-            log_frame, height=16, width=80, state="disabled",
+            log_frame, height=16, width=64, state="disabled",
             font=("Courier", 9),
         )
         self._log_text.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
         self._bind_copy_menu(self._log_text)
 
         # ---- Right pane: Advanced Options ---- #
-        self._build_advanced_section(self.root)
+        self._build_advanced_section(self._main_pane)
+
+        # Left pane is always present.
+        self._main_pane.add(self._left_panel)
+
+        # Capture a natural baseline width for the left pane after widgets are built.
+        self.root.update_idletasks()
+        self._left_panel_base_width = max(self._left_panel.winfo_width(), self._left_panel.winfo_reqwidth())
+        self._left_user_width = min(self._left_panel_base_width, self.LEFT_START_WIDTH)
+
+        # Start with a narrower left pane by default.
+        current_height = max(self.root.winfo_height(), self.root.winfo_reqheight())
+        self.root.geometry(f"{int(self._left_user_width + 24)}x{int(current_height)}")
 
     # ---- Section builders ---- #
 
@@ -959,20 +1037,29 @@ class MEPGui:
         self._update_synth_lo()  # initial display
 
     def _build_advanced_section(self, parent: ttk.Frame):
-        """Advanced Options section: AFE and REC tabs (right column, hidden by default)."""
+        """Advanced Options section container (content built lazily on first open)."""
         frame = ttk.LabelFrame(parent, text="Advanced Options")
-        frame.grid(row=0, column=1, padx=(0, 10), pady=6, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
         self._adv_frame = frame
-        frame.grid_remove()  # hidden until the user toggles it
 
-        nb = ttk.Notebook(frame)
+        self._adv_nb = None
+        self._adv_tabs_built = False
+        self._adv_visible = False
+
+    def _build_advanced_tabs(self):
+        """Build Advanced tabs once, on-demand, when the panel is first shown."""
+        if self._adv_tabs_built:
+            return
+
+        nb = ttk.Notebook(self._adv_frame)
         nb.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+        self._adv_nb = nb
 
         afe_f = ttk.Frame(nb, padding=8)
         rec_f = ttk.Frame(nb, padding=8)
         tlm_f = ttk.Frame(nb, padding=8)
+        jh_f = ttk.Frame(nb, padding=8)
         soc_f = ttk.Frame(nb, padding=8)
         tun_f = ttk.Frame(nb, padding=8)
         mqtt_f = ttk.Frame(nb, padding=8)
@@ -981,17 +1068,29 @@ class MEPGui:
         nb.add(rec_f, text="REC")
         nb.add(gpsd_f, text="GPSD")
         nb.add(tlm_f, text="TLM")
+        nb.add(jh_f, text="JET")
         nb.add(soc_f, text="SOC")
         nb.add(tun_f, text="TUN")
         nb.add(mqtt_f, text="MQTT")
+        nb.bind("<<NotebookTabChanged>>", self._on_advanced_tab_changed)
 
         self._build_afe_tab(afe_f)
         self._build_rec_tab(rec_f)
         self._build_gpsd_tab(gpsd_f)
         self._build_tlm_tab(tlm_f)
+        self._build_jetson_health_tab(jh_f)
         self._build_soc_tab(soc_f)
         self._build_tun_tab(tun_f)
         self._build_mqtt_tab(mqtt_f)
+        self._rec_status_apply_to_ui()
+        self._tun_refresh()
+        self._afe_sync_ui_from_cache()
+        self._mqtt_render_from_buffer()
+        self._adv_tabs_built = True
+
+    def _on_advanced_tab_changed(self, _event=None):
+        if self._is_adv_tab_selected("MQTT"):
+            self._mqtt_flush_buffer_to_widget()
 
     def _build_gpsd_tab(self, frame: ttk.Frame):
         """GPSD tab: connection controls, semantic diagnostics, stream, and commands."""
@@ -1112,8 +1211,10 @@ class MEPGui:
         ttk.Checkbutton(opt_f, text="Suppress announce topics",
                         variable=self._vars["mqtt_suppress_announce"]).pack(
             side="left", padx=4)
+        self._vars["mqtt_suppress_announce"].trace_add(
+            "write", lambda *_: self._mqtt_render_from_buffer())
         ttk.Button(opt_f, text="Clear",
-                   command=lambda: self._mqtt_text.delete("1.0", "end")).pack(
+                   command=self._mqtt_clear_buffer_and_widget).pack(
             side="right", padx=4)
 
         # ---- Message log (shorter to leave room for publish panel) ---- #
@@ -1147,6 +1248,14 @@ class MEPGui:
                    command=self._mqtt_publish_manual).grid(
             row=2, column=0, columnspan=2, padx=5, pady=(0, 5), sticky="ew")
 
+        self._add_copyable_note(
+            frame,
+            "Source: MQTT broker stream via wildcard subscription (#) on localhost:1883",
+            row=3,
+            wraplength=420,
+        )
+        self._mqtt_render_from_buffer()
+
     def _mqtt_publish_manual(self):
         """Publish an arbitrary MQTT message from the manual publish panel."""
         topic = self._vars["mqtt_pub_topic"].get().strip()
@@ -1161,15 +1270,7 @@ class MEPGui:
         except Exception as e:
             logging.error(f"MQTT publish failed: {e}")
 
-    def _mqtt_log_message(self, topic: str, payload: bytes):
-        """Append one MQTT message to the MQTT tab log."""
-        if not hasattr(self, "_mqtt_text"):
-            return
-        if self._vars.get("mqtt_suppress_announce", tk.BooleanVar()).get():
-            if "announce" in topic.lower():
-                return
-        import datetime
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
+    def _mqtt_format_entry(self, ts: str, topic: str, payload: bytes) -> str:
         try:
             decoded = payload.decode("utf-8")
             stripped = decoded.strip()
@@ -1184,13 +1285,73 @@ class MEPGui:
                 body = "  <empty>"
         except Exception:
             body = f"  {repr(payload)}"
-        line = f"{ts}  {topic}\n{body}\n"
-        self._mqtt_text.insert("end", line)
-        self._mqtt_text.see("end")  # auto-scroll
-        # cap log at 500 lines
+        return f"{ts}  {topic}\n{body}\n"
+
+    def _mqtt_capture_message(self, topic: str, payload: bytes):
+        import datetime
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        with self._mqtt_lock:
+            self._mqtt_messages.append((ts, topic, payload))
+
+    def _mqtt_flush_buffer_to_widget(self):
+        if not hasattr(self, "_mqtt_text"):
+            return
+        if not self._is_adv_tab_selected("MQTT"):
+            return
+
+        suppress = bool(self._vars.get("mqtt_suppress_announce", tk.BooleanVar()).get())
+        with self._mqtt_lock:
+            entries = list(self._mqtt_messages)
+            start = min(self._mqtt_rendered_count, len(entries))
+            tail = entries[start:]
+
+        if not tail:
+            return
+
+        lines = []
+        for ts, topic, payload in tail:
+            if suppress and "announce" in topic.lower():
+                continue
+            lines.append(self._mqtt_format_entry(ts, topic, payload))
+
+        if lines:
+            self._mqtt_text.insert("end", "".join(lines))
+            self._mqtt_text.see("end")
+
+        self._mqtt_rendered_count = len(entries)
+        self._mqtt_trim_widget_lines()
+
+    def _mqtt_trim_widget_lines(self, max_lines: int = 500):
+        if not hasattr(self, "_mqtt_text"):
+            return
         lines = int(self._mqtt_text.index("end-1c").split(".")[0])
-        if lines > 500:
-            self._mqtt_text.delete("1.0", f"{lines - 500}.0")
+        if lines > max_lines:
+            self._mqtt_text.delete("1.0", f"{lines - max_lines}.0")
+
+    def _mqtt_render_from_buffer(self):
+        if not hasattr(self, "_mqtt_text"):
+            return
+        self._mqtt_text.delete("1.0", "end")
+        self._mqtt_rendered_count = 0
+        self._mqtt_flush_buffer_to_widget()
+
+    def _mqtt_clear_buffer_and_widget(self):
+        with self._mqtt_lock:
+            self._mqtt_messages.clear()
+        self._mqtt_rendered_count = 0
+        if hasattr(self, "_mqtt_text"):
+            self._mqtt_text.delete("1.0", "end")
+
+    def _rec_status_apply_to_ui(self):
+        if "rec_status" not in self._vars or "rec_status_file" not in self._vars:
+            return
+        self._vars["rec_status"].set(self._rec_status_cache.get("state", "—"))
+        self._vars["rec_status_file"].set(self._rec_status_cache.get("file", "—"))
+
+    def _mqtt_log_message(self, topic: str, payload: bytes):
+        """Compatibility shim for legacy call sites; routes through buffered model."""
+        self._mqtt_capture_message(topic, payload)
+        self._mqtt_flush_buffer_to_widget()
 
     def _bind_copy_menu(self, widget, strvar=None):
         """Attach a right-click Copy menu + Ctrl+C to any Entry or Text widget."""
@@ -1217,6 +1378,7 @@ class MEPGui:
 
     def _add_copyable_note(self, parent, text: str, row: int, wraplength: int = 420):
         """Render subtle gray footer text that still allows selection/copy."""
+        wraplength = min(int(wraplength), 320)
         est_lines = max(1, min(3, (len(text) // max(40, wraplength // 7)) + 1))
         note = tk.Text(
             parent,
@@ -1289,6 +1451,13 @@ class MEPGui:
         ttk.Button(btn_f, text="Refresh",
                    command=self._soc_refresh).grid(
             row=0, column=1, padx=(2, 0), sticky="ew")
+
+        self._add_copyable_note(
+            frame,
+            "Source: RFSoC service via MQTT (status topic: rfsoc/status)",
+            row=3,
+            wraplength=420,
+        )
 
     def _build_tun_tab(self, frame: ttk.Frame):
         """TUN tab: tuner status (text dump) and manual control."""
@@ -1389,6 +1558,13 @@ class MEPGui:
             "write", lambda *_: self._tun_update_capability_buttons())
         self._tun_update_capability_buttons()   # apply correct state at build time
 
+        self._add_copyable_note(
+            frame,
+            "Source: Tuner control service via MQTT (status topic: tuner_control/status)",
+            row=3,
+            wraplength=420,
+        )
+
 
     def _build_tlm_tab(self, frame: ttk.Frame):
         """TLM tab: read-only telemetry fields populated by _afe_refresh."""
@@ -1396,7 +1572,7 @@ class MEPGui:
 
         def _ro_row(parent, row, label, key, unit=""):
             """Add a label + read-only entry pair and register the StringVar."""
-            sv = tk.StringVar(value="—")
+            sv = tk.StringVar(value=self._tlm_state.get(key, "—"))
             self._vars[key] = sv
             ttk.Label(parent, text=label).grid(
                 row=row, column=0, sticky="w", padx=5, pady=2)
@@ -1407,9 +1583,20 @@ class MEPGui:
                 ttk.Label(parent, text=unit, foreground="grey").grid(
                     row=row, column=2, sticky="w")
 
+        # ---- GNSS ---- #
+        gnss_f = ttk.LabelFrame(frame, text="GNSS")
+        gnss_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
+        gnss_f.columnconfigure(1, weight=1)
+        _ro_row(gnss_f, 0, "Lock Status", "tlm_gps_fix_status")
+        _ro_row(gnss_f, 1, "Latitude", "tlm_gps_lat", "deg")
+        _ro_row(gnss_f, 2, "Longitude", "tlm_gps_lon", "deg")
+        _ro_row(gnss_f, 3, "Altitude", "tlm_gps_alt_m", "m")
+        _ro_row(gnss_f, 4, "Speed", "tlm_gps_speed_kn", "knots")
+        _ro_row(gnss_f, 5, "Visible", "tlm_gps_sats_visible")
+
         # ---- Accelerometer ---- #
         acc_f = ttk.LabelFrame(frame, text="Accelerometer")
-        acc_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
+        acc_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
         acc_f.columnconfigure(1, weight=1)
         _ro_row(acc_f, 0, "X", "tlm_acc_x", "g")
         _ro_row(acc_f, 1, "Y", "tlm_acc_y", "g")
@@ -1417,7 +1604,7 @@ class MEPGui:
 
         # ---- Gyroscope ---- #
         gyr_f = ttk.LabelFrame(frame, text="Gyroscope")
-        gyr_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        gyr_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="ew")
         gyr_f.columnconfigure(1, weight=1)
         _ro_row(gyr_f, 0, "X", "tlm_gyr_x", "deg/s")
         _ro_row(gyr_f, 1, "Y", "tlm_gyr_y", "deg/s")
@@ -1425,7 +1612,7 @@ class MEPGui:
 
         # ---- Magnetometer ---- #
         mag_f = ttk.LabelFrame(frame, text="Magnetometer")
-        mag_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="ew")
+        mag_f.grid(row=3, column=0, padx=4, pady=(2, 2), sticky="ew")
         mag_f.columnconfigure(1, weight=1)
         _ro_row(mag_f, 0, "X", "tlm_mag_x", "uT")
         _ro_row(mag_f, 1, "Y", "tlm_mag_y", "uT")
@@ -1433,27 +1620,771 @@ class MEPGui:
 
         # ---- Housekeeping ---- #
         hk_f = ttk.LabelFrame(frame, text="Housekeeping")
-        hk_f.grid(row=3, column=0, padx=4, pady=(2, 4), sticky="ew")
+        hk_f.grid(row=4, column=0, padx=4, pady=(2, 4), sticky="ew")
         hk_f.columnconfigure(1, weight=1)
         _ro_row(hk_f, 0, "Timestamp",  "tlm_hk_ts")
         _ro_row(hk_f, 1, "Temp 1",     "tlm_hk_t1", "°C")
         _ro_row(hk_f, 2, "Temp 2",     "tlm_hk_t2", "°C")
         _ro_row(hk_f, 3, "Temp 3",     "tlm_hk_t3", "°C")
 
-        ttk.Label(frame, text="Updated on AFE Refresh (IMU/HK)",
+        ttk.Label(frame, text="Updated on AFE Refresh (IMU/HK/GNSS)",
                   foreground="grey", font=("TkDefaultFont", 8)).grid(
-            row=4, column=0, pady=(0, 2))
+            row=5, column=0, pady=(0, 2))
 
         ttk.Button(frame, text="Refresh Telemetry",
                    command=self._afe_refresh).grid(
-            row=5, column=0, padx=4, pady=(0, 6), sticky="ew")
+            row=6, column=0, padx=4, pady=(0, 6), sticky="ew")
 
         self._add_copyable_note(
             frame,
             "Source: AFE service (/opt/afe/afe_service.py), helper client: /opt/mep-examples/scripts/afe.py",
-            row=6,
+            row=7,
             wraplength=420,
         )
+
+    def _tlm_state_defaults(self) -> dict:
+        return {
+            "tlm_gps_fix_status": "Unknown",
+            "tlm_gps_lat": "Unknown",
+            "tlm_gps_lon": "Unknown",
+            "tlm_gps_alt_m": "Not reported",
+            "tlm_gps_speed_kn": "0.000",
+            "tlm_gps_sats_visible": "0",
+        }
+
+    def _jetson_health_defaults(self) -> dict:
+        state = {
+            "jh_nvpmodel": "-",
+            "jh_nvpmodel_default": self._jetson_nvpmodel_choice_for_id(self._jetson_nvpmodel_default_id) or "-",
+            "jh_tegrastats_last": "Last queried: never",
+            "jh_cpu_usage": "-",
+            "jh_ram": "-",
+            "jh_disk": "-",
+            "jh_pwr_name_1": "VDD_IN",
+            "jh_pwr_name_2": "Rail 1",
+            "jh_pwr_name_3": "Rail 2",
+            "jh_pwr_val_1": "-",
+            "jh_pwr_val_2": "-",
+            "jh_pwr_val_3": "-",
+        }
+        for i in range(1, 7):
+            state[f"jh_temp_name_{i}"] = f"Temp {i}"
+            state[f"jh_temp_val_{i}"] = "-"
+        return state
+
+    def _build_jetson_health_tab(self, frame: ttk.Frame):
+        """Jetson Health tab: low-cost host readouts (temp/power/cpu/mem)."""
+        frame.columnconfigure(0, weight=1)
+
+        def _ro_row(parent, row, label, key):
+            sv = tk.StringVar(value=self._jetson_health_state.get(key, "-"))
+            self._vars[key] = sv
+            ttk.Label(parent, text=label).grid(
+                row=row, column=0, sticky="w", padx=5, pady=2)
+            e = ttk.Entry(parent, textvariable=sv, state="readonly", width=26)
+            e.grid(row=row, column=1, sticky="ew", padx=5, pady=2)
+            self._bind_copy_menu(e, sv)
+
+        # ---- System ---- #
+        sys_f = ttk.LabelFrame(frame, text="System")
+        sys_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
+        sys_f.columnconfigure(1, weight=1)
+        _ro_row(sys_f, 0, "CPU Usage", "jh_cpu_usage")
+        _ro_row(sys_f, 1, "Memory", "jh_ram")
+        _ro_row(sys_f, 2, "Disk Avail", "jh_disk")
+
+        # ---- Power Mode ---- #
+        pm_f = ttk.LabelFrame(frame, text="Power Mode")
+        pm_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        pm_f.columnconfigure(1, weight=1)
+        _ro_row(pm_f, 0, "Current", "jh_nvpmodel")
+
+        self._vars["jh_nvpmodel_conf_path"] = tk.StringVar(value="/etc/nvpmodel.conf")
+        ttk.Label(pm_f, text="Config File").grid(
+            row=1, column=0, sticky="w", padx=5, pady=2)
+        conf_e = ttk.Entry(
+            pm_f,
+            textvariable=self._vars["jh_nvpmodel_conf_path"],
+            width=26,
+            state="readonly",
+        )
+        conf_e.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+        self._bind_copy_menu(conf_e, self._vars["jh_nvpmodel_conf_path"])
+
+        mode_f = ttk.Frame(pm_f)
+        mode_f.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 4))
+        mode_f.columnconfigure(1, weight=1)
+        ttk.Label(mode_f, text="Select").grid(
+            row=0, column=0, sticky="w", pady=2)
+        mode_choices = self._jetson_nvpmodel_choice_values()
+        initial_choice = self._jetson_nvpmodel_choice_for_id(self._jetson_nvpmodel_default_id)
+        if not initial_choice and mode_choices:
+            initial_choice = mode_choices[0]
+        self._vars["jh_nvpmodel_select"] = tk.StringVar(value=initial_choice or "")
+        mode_combo = ttk.Combobox(
+            mode_f,
+            textvariable=self._vars["jh_nvpmodel_select"],
+            values=mode_choices,
+            state="readonly",
+            width=18,
+        )
+        mode_combo.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+        self._bind_copy_menu(mode_combo)
+        ttk.Button(mode_f, text="Set (required reboot!)",
+                   command=self._jetson_health_apply_nvpmodel).grid(
+            row=0, column=2, padx=(0, 2), pady=2)
+
+        # ---- Thermal ---- #
+        th_f = ttk.LabelFrame(frame, text="Thermal")
+        th_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="ew")
+        th_f.columnconfigure(1, weight=1)
+        for i in range(1, 7):
+            name_key = f"jh_temp_name_{i}"
+            val_key = f"jh_temp_val_{i}"
+            name_sv = tk.StringVar(value=self._jetson_health_state.get(name_key, f"Temp {i}"))
+            self._vars[name_key] = name_sv
+            self._vars[val_key] = tk.StringVar(value=self._jetson_health_state.get(val_key, "-"))
+            ttk.Label(th_f, textvariable=name_sv).grid(
+                row=i - 1, column=0, sticky="w", padx=5, pady=2)
+            e = ttk.Entry(th_f, textvariable=self._vars[val_key], state="readonly", width=18)
+            e.grid(row=i - 1, column=1, sticky="ew", padx=5, pady=2)
+            self._bind_copy_menu(e, self._vars[val_key])
+
+        # ---- Power ---- #
+        pw_f = ttk.LabelFrame(frame, text="Power")
+        pw_f.grid(row=3, column=0, padx=4, pady=(2, 2), sticky="ew")
+        pw_f.columnconfigure(1, weight=1)
+        for i in range(1, 4):
+            name_key = f"jh_pwr_name_{i}"
+            val_key = f"jh_pwr_val_{i}"
+            name_sv = tk.StringVar(value=self._jetson_health_state.get(name_key, f"Rail {i}"))
+            self._vars[name_key] = name_sv
+            self._vars[val_key] = tk.StringVar(value=self._jetson_health_state.get(val_key, "-"))
+            ttk.Label(pw_f, textvariable=name_sv).grid(
+                row=i - 1, column=0, sticky="w", padx=5, pady=2)
+            e = ttk.Entry(pw_f, textvariable=self._vars[val_key], state="readonly", width=24)
+            e.grid(row=i - 1, column=1, sticky="ew", padx=5, pady=2)
+            self._bind_copy_menu(e, self._vars[val_key])
+
+        self._vars["jh_tegrastats_last"] = tk.StringVar(
+            value=self._jetson_health_state.get("jh_tegrastats_last", "Last queried: never")
+        )
+        ttk.Label(
+            pw_f,
+            textvariable=self._vars["jh_tegrastats_last"],
+            foreground="grey",
+            font=("TkDefaultFont", 8),
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 0))
+
+        ttk.Button(pw_f, text="Query tegrastats",
+                   command=self._jetson_health_poll_tegrastats).grid(
+            row=4, column=0, columnspan=2, padx=5, pady=(4, 2), sticky="ew")
+
+        self._add_copyable_note(
+            frame,
+            "System rows auto-update from /proc, /sys/class/thermal, nvpmodel, and /etc/nvpmodel.conf. Applying a new mode may require root or passwordless sudo. Power rows update only when Query tegrastats is pressed.",
+            row=4,
+            wraplength=420,
+        )
+        self.root.after(250, self._jetson_health_sync_nvpmodel_choice)
+
+    def _jetson_health_set(self, key: str, value):
+        val = "-" if value is None else str(value)
+        self._jetson_health_state[key] = val
+        if key in self._vars:
+            self._vars[key].set(val)
+
+    def _jetson_health_apply(self, data: dict):
+        if not isinstance(data, dict):
+            return
+        for key, value in data.items():
+            self._jetson_health_set(key, value)
+
+    def _read_nvpmodel_config(self, path: str = "/etc/nvpmodel.conf"):
+        modes = []
+        default_id = None
+        mode_re = re.compile(r"<\s*POWER_MODEL\s+ID\s*=\s*(\d+)\s+NAME\s*=\s*([^>]+?)\s*>", re.IGNORECASE)
+        default_re = re.compile(r"<\s*PM_CONFIG\s+DEFAULT\s*=\s*(\d+)\s*>", re.IGNORECASE)
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    m = mode_re.search(s)
+                    if m:
+                        modes.append((m.group(1), m.group(2).strip()))
+                        continue
+                    m = default_re.search(s)
+                    if m:
+                        default_id = m.group(1)
+        except Exception:
+            return [], None
+
+        return modes, default_id
+
+    def _jetson_nvpmodel_choice_values(self) -> list[str]:
+        return [f"{mode_id}: {name}" for mode_id, name in self._jetson_nvpmodel_modes]
+
+    def _jetson_nvpmodel_name_for_id(self, mode_id):
+        if mode_id is None:
+            return None
+        mode_id = str(mode_id)
+        for candidate_id, name in self._jetson_nvpmodel_modes:
+            if candidate_id == mode_id:
+                return name
+        return None
+
+    def _jetson_nvpmodel_choice_for_id(self, mode_id):
+        name = self._jetson_nvpmodel_name_for_id(mode_id)
+        if name is None or mode_id is None:
+            return None
+        return f"{mode_id}: {name}"
+
+    def _jetson_nvpmodel_id_from_choice(self, choice: str):
+        m = re.match(r"\s*(\d+)\s*:", choice or "")
+        return m.group(1) if m else None
+
+    def _read_nvpmodel_status(self):
+        try:
+            out = subprocess.check_output(
+                ["nvpmodel", "-q"],
+                stderr=subprocess.DEVNULL,
+                timeout=1.5,
+                text=True,
+            )
+        except Exception:
+            return None, None
+
+        mode_name = None
+        mode_id = None
+        for line in out.splitlines():
+            s = line.strip()
+            m = re.search(r"NV\s*Power\s*Mode\s*:\s*(.+)$", s, re.IGNORECASE)
+            if m:
+                mode_name = m.group(1).strip()
+                continue
+            m = re.search(r"Power\s*Mode\s*:\s*(.+)$", s, re.IGNORECASE)
+            if m:
+                mode_name = m.group(1).strip()
+                continue
+            if s.isdigit():
+                mode_id = s
+
+        return mode_id, mode_name
+
+    def _format_nvpmodel_display(self, mode_id, mode_name):
+        if mode_name and mode_id:
+            return f"{mode_name} (ID {mode_id})"
+        if mode_name:
+            return mode_name
+        if mode_id:
+            known_name = self._jetson_nvpmodel_name_for_id(mode_id)
+            if known_name:
+                return f"{known_name} (ID {mode_id})"
+            return f"ID {mode_id}"
+        return None
+
+    def _read_thermal_sysfs(self, limit: int = 6) -> list[tuple[str, float]]:
+        out = []
+        base = "/sys/class/thermal"
+        try:
+            entries = sorted(name for name in os.listdir(base) if name.startswith("thermal_zone"))
+        except Exception:
+            return out
+
+        for name in entries:
+            t_path = os.path.join(base, name, "temp")
+            ty_path = os.path.join(base, name, "type")
+            try:
+                with open(t_path, "r", encoding="utf-8") as f:
+                    raw = f.read().strip()
+                with open(ty_path, "r", encoding="utf-8") as f:
+                    tname = f.read().strip()
+                temp_c = float(raw) / 1000.0
+                if -100.0 <= temp_c <= 250.0:
+                    out.append((tname or name, temp_c))
+            except Exception:
+                continue
+
+            if len(out) >= limit:
+                break
+
+        return out
+
+    def _read_meminfo(self):
+        total_kb = None
+        avail_kb = None
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        total_kb = int(line.split()[1])
+                    elif line.startswith("MemAvailable:"):
+                        avail_kb = int(line.split()[1])
+        except Exception:
+            return None
+
+        if total_kb is None or avail_kb is None or total_kb <= 0:
+            return None
+        used_kb = max(total_kb - avail_kb, 0)
+        return used_kb, total_kb
+
+    def _read_disk_usage(self, path: str = "/"):
+        try:
+            usage = shutil.disk_usage(path)
+        except Exception:
+            return None
+        return usage.free, usage.total
+
+    def _read_cpu_usage(self):
+        try:
+            with open("/proc/stat", "r", encoding="utf-8") as f:
+                first = f.readline().strip()
+        except Exception:
+            return None
+
+        parts = first.split()
+        if len(parts) < 5 or parts[0] != "cpu":
+            return None
+
+        try:
+            vals = [int(x) for x in parts[1:]]
+        except Exception:
+            return None
+
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        total = sum(vals)
+
+        prev = self._jetson_cpu_prev
+        self._jetson_cpu_prev = (total, idle)
+        if prev is None:
+            return None
+
+        dt = total - prev[0]
+        di = idle - prev[1]
+        if dt <= 0:
+            return None
+        return (dt - di) * 100.0 / dt
+
+    def _read_nvpmodel(self):
+        mode_id, mode_name = self._read_nvpmodel_status()
+        return self._format_nvpmodel_display(mode_id, mode_name)
+
+    def _read_tegrastats_snapshot(self):
+        """Return one tegrastats line parsed into rails and temp tokens."""
+        try:
+            out = subprocess.check_output(
+                ["tegrastats", "--interval", "1000"],
+                stderr=subprocess.DEVNULL,
+                timeout=3.0,
+                text=True,
+            )
+        except subprocess.TimeoutExpired as e:
+            out = e.output or ""
+        except Exception:
+            return {}, []
+
+        if isinstance(out, bytes):
+            out = out.decode(errors="ignore")
+
+        blob = " ".join(s.strip() for s in out.splitlines() if s.strip())
+        if not blob:
+            return {}, []
+
+        rails = {}
+        for m in re.finditer(r"([A-Z0-9_]+)\s+(\d+)mW/(\d+)mW", blob):
+            name = m.group(1)
+            inst = m.group(2)
+            avg = m.group(3)
+            rails[name] = f"{inst}/{avg} mW"
+
+        temp_map = {}
+        for m in re.finditer(r"([A-Za-z0-9_]+)@(-?\d+(?:\.\d+)?)C", blob):
+            temp_map[m.group(1)] = f"{float(m.group(2)):.1f} C"
+
+        temps = list(temp_map.items())
+
+        return rails, temps
+
+    def _jetson_health_collect(self, include_tegrastats: bool = False) -> dict:
+        data = {}
+
+        mode = self._read_nvpmodel()
+        if mode:
+            data["jh_nvpmodel"] = mode
+
+        default_choice = self._jetson_nvpmodel_choice_for_id(self._jetson_nvpmodel_default_id)
+        if default_choice:
+            data["jh_nvpmodel_default"] = default_choice
+
+        cpu = self._read_cpu_usage()
+        if cpu is not None:
+            data["jh_cpu_usage"] = f"{cpu:.1f}%"
+
+        mem = self._read_meminfo()
+        if mem is not None:
+            used_kb, total_kb = mem
+            used_mb = used_kb / 1024.0
+            total_mb = total_kb / 1024.0
+            pct = (used_kb * 100.0 / total_kb) if total_kb > 0 else 0.0
+            data["jh_ram"] = f"{used_mb:.0f}/{total_mb:.0f} MB ({pct:.1f}%)"
+
+        disk = self._read_disk_usage("/")
+        if disk is not None:
+            free_b, total_b = disk
+            free_gb = free_b / (1024.0 ** 3)
+            total_gb = total_b / (1024.0 ** 3)
+            used_pct = ((total_b - free_b) * 100.0 / total_b) if total_b > 0 else 0.0
+            data["jh_disk"] = f"{free_gb:.1f}/{total_gb:.1f} GiB free ({used_pct:.1f}% used)"
+
+        temps = [(name, f"{temp:.1f} C") for name, temp in self._read_thermal_sysfs(limit=6)]
+        rails = {}
+
+        if include_tegrastats:
+            ts_rails, ts_temps = self._read_tegrastats_snapshot()
+            rails = ts_rails
+            if not temps and ts_temps:
+                temps = ts_temps[:6]
+
+        for i in range(1, 7):
+            if i <= len(temps):
+                tname, tval = temps[i - 1]
+                data[f"jh_temp_name_{i}"] = tname
+                data[f"jh_temp_val_{i}"] = tval
+            else:
+                data[f"jh_temp_name_{i}"] = f"Temp {i}"
+                data[f"jh_temp_val_{i}"] = "-"
+
+        if include_tegrastats:
+            data["jh_pwr_name_1"] = "VDD_IN"
+            data["jh_pwr_val_1"] = rails.get("VDD_IN", "-")
+            other = [name for name in sorted(rails.keys()) if name != "VDD_IN"]
+
+            if other:
+                data["jh_pwr_name_2"] = other[0]
+                data["jh_pwr_val_2"] = rails.get(other[0], "-")
+            else:
+                data["jh_pwr_name_2"] = "Rail 1"
+                data["jh_pwr_val_2"] = "-"
+
+            if len(other) > 1:
+                data["jh_pwr_name_3"] = other[1]
+                data["jh_pwr_val_3"] = rails.get(other[1], "-")
+            else:
+                data["jh_pwr_name_3"] = "Rail 2"
+                data["jh_pwr_val_3"] = "-"
+
+        return data
+
+    def _jetson_health_poll(self):
+        # Keep background load minimal unless the user is actively viewing JET.
+        if not self._adv_frame.winfo_viewable():
+            return
+        try:
+            current = self._adv_nb.index("current")
+            if self._adv_nb.tab(current, "text") != "JET":
+                return
+        except Exception:
+            return
+
+        if self._jetson_health_busy:
+            return
+
+        self._jetson_health_busy = True
+
+        def _worker():
+            try:
+                data = self._jetson_health_collect(False)
+                self.root.after(0, lambda d=data: self._jetson_health_apply(d))
+            finally:
+                self.root.after(0, lambda: setattr(self, "_jetson_health_busy", False))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _jetson_health_sync_nvpmodel_choice(self):
+        def _worker():
+            mode_id, mode_name = self._read_nvpmodel_status()
+            display = self._format_nvpmodel_display(mode_id, mode_name)
+            choice = self._jetson_nvpmodel_choice_for_id(mode_id)
+
+            def _apply_current():
+                if display:
+                    self._jetson_health_set("jh_nvpmodel", display)
+                if choice and "jh_nvpmodel_select" in self._vars:
+                    self._vars["jh_nvpmodel_select"].set(choice)
+
+            self.root.after(0, _apply_current)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _confirm_nvpmodel_reboot(self, mode_id: str, choice: str) -> bool:
+        target = choice or f"ID {mode_id}"
+        return messagebox.askokcancel(
+            title="Apply Power Mode",
+            message=(
+                f"Applying {target} will immediately reboot this Jetson.\n\n"
+                "Press OK to apply the mode and reboot now.\n"
+                "Press Cancel to leave the current mode unchanged."
+            ),
+            parent=self.root,
+        )
+
+    def _jetson_health_apply_nvpmodel(self):
+        if self._jetson_nvpmodel_busy:
+            logging.warning("JET: nvpmodel mode change already in progress")
+            return
+
+        choice_var = self._vars.get("jh_nvpmodel_select")
+        choice = choice_var.get().strip() if choice_var is not None else ""
+        mode_id = self._jetson_nvpmodel_id_from_choice(choice)
+        if mode_id is None:
+            logging.error("JET: select a valid nvpmodel mode before applying")
+            return
+
+        if not self._confirm_nvpmodel_reboot(mode_id, choice):
+            logging.info("JET: nvpmodel mode change cancelled")
+            return
+
+        self._jetson_nvpmodel_busy = True
+        logging.warning("JET: applying nvpmodel mode %s and rebooting now", choice or mode_id)
+
+        def _worker():
+            try:
+                cmd = ["nvpmodel", "-m", mode_id]
+                cmd_prefix = []
+                if os.geteuid() != 0:
+                    # Fast capability check so we don't sit on a slow sudo path.
+                    check = subprocess.run(
+                        ["sudo", "-n", "true"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=2.0,
+                    )
+                    if check.returncode != 0:
+                        detail = (check.stderr or check.stdout or "sudo check failed").strip()
+                        logging.error(
+                            "JET: cannot set nvpmodel without root. Configure passwordless sudo for nvpmodel (sudo -n). %s",
+                            detail,
+                        )
+                        return
+                    cmd_prefix = ["sudo", "-n"]
+                    cmd = [*cmd_prefix, *cmd]
+
+                # Probe command responsiveness first so the user gets a quick,
+                # actionable failure instead of waiting a long apply timeout.
+                try:
+                    subprocess.run(
+                        [*cmd_prefix, "nvpmodel", "-q"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=8.0,
+                    )
+                except subprocess.TimeoutExpired:
+                    logging.error(
+                        "JET: nvpmodel probe timed out after 8s. This usually means nvpmodel is hanging, not a simple permission denial. Try running '%s nvpmodel -q' in a shell.",
+                        "sudo -n" if cmd_prefix else "",
+                    )
+                    return
+
+                proc = subprocess.run(
+                    cmd,
+                    input="YES\n",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=15.0,
+                )
+                if proc.returncode != 0:
+                    detail = (proc.stderr or proc.stdout or "unknown error").strip()
+                    if os.geteuid() != 0:
+                        logging.error(
+                            "JET: failed to set nvpmodel mode %s. Passwordless sudo may be required. %s",
+                            mode_id,
+                            detail,
+                        )
+                    else:
+                        logging.error("JET: failed to set nvpmodel mode %s: %s", mode_id, detail)
+                    return
+
+                detail = ((proc.stdout or "") + " " + (proc.stderr or "")).strip()
+                display = self._jetson_nvpmodel_choice_for_id(mode_id) or f"ID {mode_id}"
+
+                def _apply_result():
+                    if display:
+                        self._jetson_health_set("jh_nvpmodel", display)
+                    if "jh_nvpmodel_select" in self._vars:
+                        self._vars["jh_nvpmodel_select"].set(display)
+
+                self.root.after(0, _apply_result)
+                if detail:
+                    logging.info("JET: nvpmodel accepted %s; reboot in progress. %s", display, detail)
+                else:
+                    logging.info("JET: nvpmodel accepted %s; reboot in progress", display)
+            except FileNotFoundError:
+                logging.error("JET: could not run nvpmodel command")
+                return
+            except subprocess.TimeoutExpired as e:
+                detail = ((e.stderr or "") + " " + (e.stdout or "")).strip() if isinstance(e.stderr, str) or isinstance(e.stdout, str) else ""
+                logging.error(
+                    "JET: setting nvpmodel mode %s timed out after 15s%s",
+                    mode_id,
+                    f" ({detail})" if detail else "",
+                )
+                return
+            except Exception as e:
+                logging.error(f"JET: failed to set nvpmodel mode {mode_id}: {e}")
+                return
+            finally:
+                self.root.after(0, lambda: setattr(self, "_jetson_nvpmodel_busy", False))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _jetson_health_poll_tegrastats(self):
+        """Update power rows on demand using a one-shot tegrastats snapshot."""
+        def _worker():
+            import datetime
+
+            rails, _temps = self._read_tegrastats_snapshot()
+            queried = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            data = {
+                "jh_pwr_name_1": "VDD_IN",
+                "jh_pwr_val_1": rails.get("VDD_IN", "-"),
+                "jh_tegrastats_last": f"Last queried: {queried}",
+            }
+            other = [name for name in sorted(rails.keys()) if name != "VDD_IN"]
+
+            if other:
+                data["jh_pwr_name_2"] = other[0]
+                data["jh_pwr_val_2"] = rails.get(other[0], "-")
+            else:
+                data["jh_pwr_name_2"] = "Rail 1"
+                data["jh_pwr_val_2"] = "-"
+
+            if len(other) > 1:
+                data["jh_pwr_name_3"] = other[1]
+                data["jh_pwr_val_3"] = rails.get(other[1], "-")
+            else:
+                data["jh_pwr_name_3"] = "Rail 2"
+                data["jh_pwr_val_3"] = "-"
+
+            self.root.after(0, lambda d=data: self._jetson_health_apply(d))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _tlm_set(self, key: str, value, *, allow_empty: bool = False, force: bool = False):
+        if value is None and not force:
+            return
+        val = "" if value is None else str(value)
+        if (not allow_empty) and (not val.strip()) and (not force):
+            return
+        self._tlm_state[key] = val
+        if key in self._vars:
+            self._vars[key].set(val)
+
+    def _tlm_set_float(self, key: str, value, fmt: str):
+        try:
+            self._tlm_set(key, format(float(value), fmt))
+        except Exception:
+            return
+
+    def _tlm_mark_stale(self):
+        self._tlm_set("tlm_gps_fix_status", "Unknown", force=True)
+
+    def _tlm_extract_gnss(self, nmea_rows: list) -> dict:
+        """Extract minimal GNSS telemetry from AFE-provided NMEA rows."""
+        updates = {}
+        hints = {
+            "rmc_valid": None,
+            "gga_quality": None,
+            "gsa_mode": None,
+        }
+        visible_by_talker = {}
+
+        for parts in nmea_rows:
+            if not isinstance(parts, list) or not parts:
+                continue
+
+            sentence_id = parts[0]
+            if len(sentence_id) < 3:
+                continue
+            talker = sentence_id[:2].upper()
+            sentence = sentence_id[2:]
+
+            if sentence == "RMC":
+                if len(parts) >= 3:
+                    status = (parts[2] or "").upper()
+                    if status:
+                        hints["rmc_valid"] = (status == "A")
+
+                if len(parts) >= 7:
+                    lat = self._gps_nmea_to_decimal(parts[3], parts[4])
+                    lon = self._gps_nmea_to_decimal(parts[5], parts[6])
+                    if lat is not None:
+                        updates["tlm_gps_lat"] = f"{lat:.6f}"
+                    if lon is not None:
+                        updates["tlm_gps_lon"] = f"{lon:.6f}"
+
+                if len(parts) >= 8 and parts[7]:
+                    try:
+                        updates["tlm_gps_speed_kn"] = format(float(parts[7]), ".3f")
+                    except Exception:
+                        pass
+
+            elif sentence == "GGA":
+                if len(parts) >= 6:
+                    lat = self._gps_nmea_to_decimal(parts[2], parts[3])
+                    lon = self._gps_nmea_to_decimal(parts[4], parts[5])
+                    if lat is not None:
+                        updates["tlm_gps_lat"] = f"{lat:.6f}"
+                    if lon is not None:
+                        updates["tlm_gps_lon"] = f"{lon:.6f}"
+
+                if len(parts) >= 7 and parts[6]:
+                    try:
+                        hints["gga_quality"] = int(parts[6])
+                    except Exception:
+                        pass
+
+                if len(parts) >= 10 and parts[9]:
+                    try:
+                        updates["tlm_gps_alt_m"] = format(float(parts[9]), ".2f")
+                    except Exception:
+                        pass
+
+            elif sentence == "GSA":
+                if len(parts) >= 3 and parts[2]:
+                    try:
+                        hints["gsa_mode"] = int(parts[2])
+                    except Exception:
+                        pass
+
+            elif sentence == "GSV":
+                if len(parts) >= 4 and parts[3]:
+                    try:
+                        visible = int(parts[3])
+                        visible_by_talker[talker] = max(visible_by_talker.get(talker, 0), visible)
+                    except Exception:
+                        pass
+
+        if visible_by_talker:
+            updates["tlm_gps_sats_visible"] = str(sum(visible_by_talker.values()))
+
+        lock_status = None
+        if hints["rmc_valid"] is False:
+            lock_status = "No fix"
+        elif hints["gga_quality"] is not None:
+            lock_status = "No fix" if hints["gga_quality"] <= 0 else "Fix"
+        elif hints["gsa_mode"] is not None:
+            lock_status = "No fix" if hints["gsa_mode"] <= 1 else "Fix"
+
+        if lock_status is not None:
+            updates["tlm_gps_fix_status"] = lock_status
+
+        return updates
 
     def _tlm_apply_state(self, telem: dict):
         """Populate TLM tab read-only fields from parsed telemetry dict."""
@@ -1461,30 +2392,39 @@ class MEPGui:
             if key in self._vars:
                 self._vars[key].set(val)
 
-        acc = telem.get("PMITACC", [])
-        if len(acc) >= 4:
+        if not isinstance(telem, dict):
+            return
+
+        pmits = telem.get("pmits", {}) or {}
+        nmea_rows = telem.get("nmea", []) or []
+
+        acc = pmits.get("PMITACC", [])
+        if len(acc) >= 5:
             _set("tlm_acc_x", acc[2])
             _set("tlm_acc_y", acc[3])
             _set("tlm_acc_z", acc[4])
 
-        gyr = telem.get("PMITGYR", [])
-        if len(gyr) >= 4:
+        gyr = pmits.get("PMITGYR", [])
+        if len(gyr) >= 5:
             _set("tlm_gyr_x", gyr[2])
             _set("tlm_gyr_y", gyr[3])
             _set("tlm_gyr_z", gyr[4])
 
-        mag = telem.get("PMITMAG", [])
-        if len(mag) >= 4:
+        mag = pmits.get("PMITMAG", [])
+        if len(mag) >= 5:
             _set("tlm_mag_x", mag[2])
             _set("tlm_mag_y", mag[3])
             _set("tlm_mag_z", mag[4])
 
-        hk = telem.get("PMITHK", [])
+        hk = pmits.get("PMITHK", [])
         if len(hk) >= 9:
             _set("tlm_hk_ts", hk[1])
             _set("tlm_hk_t1", hk[6])
             _set("tlm_hk_t2", hk[7])
             _set("tlm_hk_t3", hk[8])
+
+        for key, value in self._tlm_extract_gnss(nmea_rows).items():
+            self._tlm_set(key, value, force=True)
 
     def _build_afe_tab(self, frame: ttk.Frame):
         """AFE tab: hardware register controls via Unix socket.
@@ -1630,6 +2570,13 @@ class MEPGui:
                    command=self._afe_reset_defaults).grid(
             row=0, column=1, padx=(2, 0), sticky="ew")
 
+        self._add_copyable_note(
+            frame,
+            "Source: AFE service (/opt/afe/afe_service.py), helper client: /opt/mep-examples/scripts/afe.py",
+            row=4,
+            wraplength=420,
+        )
+
     def _afe_send(self, block: int, channel: int, addr: int, value: int):
         """Send a register write to the AFE service on a background thread.
         Avoids blocking the GUI if the socket is unavailable.
@@ -1675,10 +2622,11 @@ class MEPGui:
                     reply = b"".join(chunks).decode(errors="ignore").strip()
                     if not reply:
                         logging.warning("AFE: no reply to state request (block=3)")
+                        self.root.after(0, self._tlm_mark_stale)
                         return
                     # Parse lines like "MAINREG:[0, 0, 1, ...]" or "TX1REG: [0, 1, ...]"
                     reg_data = {}
-                    telem_data = {}
+                    telem_data = {"pmits": {}, "nmea": []}
                     for line in reply.splitlines():
                         # Register lines: MAINREG:[...] or TX1REG: [...]
                         m = re.match(r'(\w+REG)\s*:\s*\[([^\]]+)\]', line)
@@ -1690,16 +2638,24 @@ class MEPGui:
                         if line.startswith('$'):
                             clean = line.split('*')[0]  # strip checksum
                             parts = clean.lstrip('$').split(',')
-                            telem_data[parts[0]] = parts
+                            if not parts or not parts[0]:
+                                continue
+                            key = parts[0].upper()
+                            if key.startswith("PMIT"):
+                                telem_data["pmits"][key] = parts
+                            elif key.startswith("G"):
+                                telem_data["nmea"].append(parts)
                     if reg_data:
                         self.root.after(0, lambda d=reg_data: self._afe_apply_state(d))
-                    if telem_data:
+                    if telem_data["pmits"] or telem_data["nmea"]:
                         self.root.after(0, lambda d=telem_data: self._tlm_apply_state(d))
-                    if not reg_data and not telem_data:
+                    if not reg_data and (not telem_data["pmits"]) and (not telem_data["nmea"]):
                         logging.warning("AFE: reply received but no data found")
                         logging.info(f"AFE raw reply:\n{reply}")
+                        self.root.after(0, self._tlm_mark_stale)
             except Exception as e:
                 logging.warning(f"AFE refresh failed: {e}")
+                self.root.after(0, self._tlm_mark_stale)
 
         logging.info("AFE: requesting state (may take up to 12s)...")
         threading.Thread(target=_query, daemon=True).start()
@@ -1708,6 +2664,19 @@ class MEPGui:
         """Update all AFE widgets from a parsed register state dict.
         _afe_updating is set True so traces don't fire hardware sends.
         """
+        if isinstance(reg_data, dict):
+            self._afe_reg_cache = dict(reg_data)
+        self._afe_sync_ui_from_cache()
+        logging.info(f"AFE widgets updated from hardware state: {list(reg_data.keys())}")
+
+    def _afe_sync_ui_from_cache(self):
+        """Apply cached AFE register state onto UI widgets when AFE tab is built."""
+        reg_data = self._afe_reg_cache
+        if not isinstance(reg_data, dict) or not reg_data:
+            return
+        if "afe_main_0" not in self._vars:
+            return
+
         self._afe_updating = True
         try:
             if "MAINREG" in reg_data:
@@ -1736,10 +2705,10 @@ class MEPGui:
                         self._vars[vkey].set(gui_val)
                     # Attenuation: addrs 4-8 are C1,C2,C4,C8,C16 bits
                     atten = sum(vals[4 + i] << i for i in range(5))
-                    self._vars[f"afe_rx{ch}_atten"].set(atten)
+                    akey = f"afe_rx{ch}_atten"
+                    self._vars[akey].set(atten)
         finally:
             self._afe_updating = False
-        logging.info(f"AFE widgets updated from hardware state: {list(reg_data.keys())}")
 
     def _afe_reset_defaults(self):
         """Restore all AFE widget vars to CSV defaults (no hardware send)."""
@@ -1799,6 +2768,11 @@ class MEPGui:
 
     def _tun_refresh(self):
         """Read latest tuner status from monitor cache, update summary fields and text dump."""
+        if "tun_state" not in self._vars or "tun_name" not in self._vars:
+            return
+        if not hasattr(self, "_tun_status_text"):
+            return
+
         status = self._monitor_states.get(TUNER_STATUS_TOPIC)
         if not isinstance(status, dict):
             text = "no status received" if status is None else str(status)
@@ -1841,7 +2815,7 @@ class MEPGui:
             text = "\n".join(lines)
         self._tun_status_text.delete("1.0", "end")
         self._tun_status_text.insert("end", text)
-        logging.info("TUN: status text updated")
+        logging.debug("TUN: status text updated")
 
     def _tun_handle_response(self, data: dict):
         """Handle a tuner command response (get_freq / get_power reply).
@@ -1853,9 +2827,13 @@ class MEPGui:
         if value is None:
             return
         if task == "get_freq":
+            if "tun_set_freq" not in self._vars:
+                return
             self._vars["tun_set_freq"].set(str(value))
             logging.info(f"TUN: freq = {value} MHz")
         elif task == "get_power":
+            if "tun_set_power" not in self._vars:
+                return
             self._vars["tun_set_power"].set(str(value))
             logging.info(f"TUN: power = {value} dBm")
 
@@ -1990,13 +2968,19 @@ class MEPGui:
 
     def _rec_status_update(self, data: dict):
         """Called on the main thread whenever a recorder status message arrives."""
-        if "rec_status" not in self._vars:
+        if not isinstance(data, dict):
             return
-        self._vars["rec_status"].set(data.get("state", "—"))
-        # try a few common field names for the current file/path
-        fpath = (data.get("file") or data.get("filename") or
-                 data.get("path") or data.get("output_file") or "—")
-        self._vars["rec_status_file"].set(str(fpath))
+        self._rec_status_cache = {
+            "state": data.get("state", "—"),
+            "file": str(
+                data.get("file")
+                or data.get("filename")
+                or data.get("path")
+                or data.get("output_file")
+                or "—"
+            ),
+        }
+        self._rec_status_apply_to_ui()
 
     def _rec_status_seed(self):
         """Seed recorder status fields from the monitor cache at startup."""
@@ -2128,6 +3112,13 @@ class MEPGui:
                    command=self._rec_reload_config).grid(
             row=1, column=0, columnspan=2, padx=4, pady=6, sticky="ew")
 
+        self._add_copyable_note(
+            frame,
+            "Source: Recorder service via MQTT (status topic: recorder/status)",
+            row=4,
+            wraplength=420,
+        )
+
     def _build_control_section(self, parent: ttk.Frame, row: int):
         """Control section: Start, Stop, and Advanced Options toggle."""
         frame = ttk.LabelFrame(parent, text="Control")
@@ -2148,12 +3139,63 @@ class MEPGui:
 
     def _toggle_advanced(self):
         """Show or hide the Advanced Options right-column panel."""
-        if self._adv_frame.winfo_viewable():
-            self._adv_frame.grid_remove()
+        if self._adv_visible:
+            # Preserve the current user-chosen left width before hiding drawer.
+            self._left_user_width = max(self._left_user_width, self._left_panel.winfo_width())
+            try:
+                self._main_pane.forget(self._adv_frame)
+            except Exception:
+                pass
+            self._adv_visible = False
             self._adv_btn_text.set("\u25b6 Advanced")
+            self._restore_left_only_width()
         else:
-            self._adv_frame.grid()
+            self._build_advanced_tabs()
+            if self._adv_frame not in self._main_pane.panes():
+                self._main_pane.add(self._adv_frame)
+            self._adv_visible = True
             self._adv_btn_text.set("\u25c0 Advanced")
+            self._ensure_advanced_drawer_width()
+
+    def _restore_left_only_width(self):
+        """Shrink window back to the left pane width when Advanced is closed."""
+        self.root.update_idletasks()
+        left_width = int(getattr(self, "_left_user_width", self._left_panel_base_width))
+        current_height = self.root.winfo_height()
+        target_width = left_width + 24
+        self.root.geometry(f"{int(target_width)}x{int(current_height)}")
+
+    def _on_main_pane_release(self, _event=None):
+        """Capture user-adjusted left pane width when the sash is dragged."""
+        if not getattr(self, "_adv_visible", False):
+            return
+        try:
+            sash_x, _ = self._main_pane.sash_coord(0)
+        except Exception:
+            return
+        self._left_user_width = max(280, int(sash_x))
+
+    def _ensure_advanced_drawer_width(self):
+        """Expand the window so opening Advanced behaves like a right-side drawer."""
+        if not hasattr(self, "_left_panel") or not getattr(self, "_adv_visible", False):
+            return
+
+        self.root.update_idletasks()
+
+        left_width = int(getattr(self, "_left_user_width", self._left_panel_base_width))
+        adv_width = 560
+        current_width = self.root.winfo_width()
+        current_height = self.root.winfo_height()
+
+        try:
+            self._main_pane.sash_place(0, left_width, 0)
+        except Exception:
+            pass
+
+        # Keep left pane fixed and grow overall width to the right for Advanced.
+        target_width = left_width + adv_width + 36
+        if current_width < target_width:
+            self.root.geometry(f"{int(target_width)}x{int(current_height)}")
 
     # ---- Recorder config helpers ---- #
 
@@ -2238,9 +3280,21 @@ class MEPGui:
             logging.Formatter("%(asctime)s %(levelname)-7s %(message)s",
                               datefmt="%H:%M:%S")
         )
+        self._text_log_handler = handler
         root_logger = logging.getLogger()
         root_logger.setLevel(logging.INFO)
         root_logger.addHandler(handler)
+        self._pump_text_log()
+
+    def _pump_text_log(self):
+        """Drain queued log records onto Tk widgets on the main thread."""
+        handler = getattr(self, "_text_log_handler", None)
+        if handler is not None:
+            try:
+                handler.flush_pending()
+            except Exception:
+                pass
+        self.root.after(50, self._pump_text_log)
 
     # ------------------------------------------------------------------ #
     #  Parameter parsing                                                   #
@@ -2479,6 +3533,7 @@ class MEPGui:
 
     def _poll_status(self):
         """Read the cached RFSoC telemetry and update the status bar and SOC tab."""
+        self._jetson_health_poll()
         if self.mep is not None:
             with self.mep._tlm_lock:
                 tlm = self.mep._tlm
