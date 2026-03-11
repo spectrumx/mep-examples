@@ -397,7 +397,7 @@ class MEPGui:
     def _gpsd_log(self, direction: str, line: str):
         if not hasattr(self, "_gpsd_text"):
             return
-        if not self._is_adv_tab_selected("GPSD"):
+        if not self._is_adv_tab_selected("GPS"):
             return
         import datetime
         ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -540,10 +540,12 @@ class MEPGui:
     def _gpsd_watch_raw_on(self):
         self._gpsd_send_command('?WATCH={"enable":true,"raw":1}')
         self._gps_set("gpsd_watch_state", "enabled raw=1", force=True)
+        self._vars["gpsd_stream_state"].set("live")
 
     def _gpsd_watch_off(self):
         self._gpsd_send_command('?WATCH={"enable":false}')
         self._gps_set("gpsd_watch_state", "disabled", force=True)
+        self._vars["gpsd_stream_state"].set("paused")
 
     def _gps_parse_nmea(self, line: str):
         clean = line.split("*")[0]
@@ -1066,7 +1068,7 @@ class MEPGui:
         gpsd_f = ttk.Frame(nb, padding=8)
         nb.add(afe_f, text="AFE")
         nb.add(rec_f, text="REC")
-        nb.add(gpsd_f, text="GPSD")
+        nb.add(gpsd_f, text="GPS")
         nb.add(tlm_f, text="TLM")
         nb.add(jh_f, text="JET")
         nb.add(soc_f, text="SOC")
@@ -1110,17 +1112,33 @@ class MEPGui:
                 ttk.Label(parent, text=unit, foreground="grey").grid(
                     row=row, column=c0 + 2, sticky="w")
 
-        ctl_f = ttk.LabelFrame(frame, text="Connection")
+        # Initialize GPSD stream state
+        self._vars["gpsd_stream_state"] = tk.StringVar(value="paused")
+
+        ctl_f = ttk.LabelFrame(frame, text="Logging")
         ctl_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
         ctl_f.columnconfigure(0, weight=1)
         ctl_f.columnconfigure(1, weight=1)
+        ctl_f.columnconfigure(2, weight=1)
 
-        ttk.Button(ctl_f, text="WATCH Raw On",
+        # Status label for live/paused state
+        state_lbl = ttk.Label(
+            ctl_f,
+            textvariable=self._vars["gpsd_stream_state"],
+            foreground="grey",
+            font=("TkFixedFont", 8),
+        )
+        state_lbl.grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=(4, 1))
+
+        ttk.Button(ctl_f, text="Stream",
                    command=self._gpsd_watch_raw_on).grid(
-            row=1, column=0, padx=5, pady=(0, 4), sticky="ew")
-        ttk.Button(ctl_f, text="WATCH Off",
+            row=1, column=0, padx=5, pady=(0, 2), sticky="ew")
+        ttk.Button(ctl_f, text="Pause",
                    command=self._gpsd_watch_off).grid(
-            row=1, column=1, padx=5, pady=(0, 4), sticky="ew")
+            row=1, column=1, padx=5, pady=(0, 2), sticky="ew")
+        ttk.Button(ctl_f, text="Clear",
+                   command=lambda: self._gpsd_text.delete("1.0", "end")).grid(
+            row=1, column=2, padx=5, pady=(0, 2), sticky="ew")
 
         st_f = ttk.LabelFrame(frame, text="Status")
         st_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
@@ -1188,9 +1206,6 @@ class MEPGui:
         ttk.Button(cmd_f, text="Send",
                    command=self._gpsd_send_manual).grid(
             row=0, column=2, padx=5, pady=3)
-        ttk.Button(cmd_f, text="Clear Log",
-                   command=lambda: self._gpsd_text.delete("1.0", "end")).grid(
-            row=1, column=0, columnspan=3, padx=5, pady=(0, 4), sticky="ew")
 
         self._add_copyable_note(
             frame,
@@ -1204,18 +1219,43 @@ class MEPGui:
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)   # log row expands
 
-        # ---- Options bar ---- #
-        opt_f = ttk.Frame(frame)
-        opt_f.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+        # Initialize MQTT stream state
+        self._mqtt_paused = False
+        self._vars["mqtt_stream_state"] = tk.StringVar(value="live")
+
+        # ---- Logging frame (Stream/Pause controls) ---- #
+        log_ctl_f = ttk.LabelFrame(frame, text="Logging")
+        log_ctl_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
+        log_ctl_f.columnconfigure(0, weight=1)
+        log_ctl_f.columnconfigure(1, weight=1)
+        log_ctl_f.columnconfigure(2, weight=1)
+
+        # Status label for live/paused state
+        state_lbl = ttk.Label(
+            log_ctl_f,
+            textvariable=self._vars["mqtt_stream_state"],
+            foreground="grey",
+            font=("TkFixedFont", 8),
+        )
+        state_lbl.grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=(4, 1))
+
+        ttk.Button(log_ctl_f, text="Stream",
+                   command=self._mqtt_stream_resume).grid(
+            row=1, column=0, padx=5, pady=(0, 2), sticky="ew")
+        ttk.Button(log_ctl_f, text="Pause",
+                   command=self._mqtt_stream_pause).grid(
+            row=1, column=1, padx=5, pady=(0, 2), sticky="ew")
+        ttk.Button(log_ctl_f, text="Clear",
+                   command=self._mqtt_clear_buffer_and_widget).grid(
+            row=1, column=2, padx=5, pady=(0, 2), sticky="ew")
+
+        # ---- Logging options ---- #
         self._vars["mqtt_suppress_announce"] = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_f, text="Suppress announce topics",
-                        variable=self._vars["mqtt_suppress_announce"]).pack(
-            side="left", padx=4)
+        ttk.Checkbutton(log_ctl_f, text="Suppress announce topics",
+                        variable=self._vars["mqtt_suppress_announce"]).grid(
+            row=2, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
         self._vars["mqtt_suppress_announce"].trace_add(
             "write", lambda *_: self._mqtt_render_from_buffer())
-        ttk.Button(opt_f, text="Clear",
-                   command=self._mqtt_clear_buffer_and_widget).pack(
-            side="right", padx=4)
 
         # ---- Message log (shorter to leave room for publish panel) ---- #
         self._mqtt_text = scrolledtext.ScrolledText(
@@ -1270,6 +1310,16 @@ class MEPGui:
         except Exception as e:
             logging.error(f"MQTT publish failed: {e}")
 
+    def _mqtt_stream_pause(self):
+        """Pause the MQTT stream log."""
+        self._mqtt_paused = True
+        self._vars["mqtt_stream_state"].set("paused")
+
+    def _mqtt_stream_resume(self):
+        """Resume the MQTT stream log."""
+        self._mqtt_paused = False
+        self._vars["mqtt_stream_state"].set("live")
+
     def _mqtt_format_entry(self, ts: str, topic: str, payload: bytes) -> str:
         try:
             decoded = payload.decode("utf-8")
@@ -1297,6 +1347,9 @@ class MEPGui:
         if not hasattr(self, "_mqtt_text"):
             return
         if not self._is_adv_tab_selected("MQTT"):
+            return
+        # Do not log if stream is paused
+        if self._mqtt_paused:
             return
 
         suppress = bool(self._vars.get("mqtt_suppress_announce", tk.BooleanVar()).get())
