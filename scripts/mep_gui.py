@@ -119,6 +119,7 @@ class MEPGui:
     CHANNEL_OPTIONS     = ["A", "B", "C", "D"]
     TUNER_OPTIONS       = ["None"] + list(TUNER_INJECTION_SIDE.keys()) + ["auto"]
     RECORDER_CONFIG_DIR = "/opt/radiohound/docker/recorder/configs"
+    DOCKER_COMPOSE_DIR  = "/opt/radiohound/docker"
     DEFAULT_SAMPLE_RATE_OPTIONS = ["1", "2", "4", "8", "10", "16", "20", "32", "64"]
     SAMPLE_RATE_OPTIONS = DEFAULT_SAMPLE_RATE_OPTIONS.copy()
     LEFT_START_WIDTH = 760
@@ -156,6 +157,17 @@ class MEPGui:
         self._mqtt_messages = deque(maxlen=2000)
         self._mqtt_lock = threading.Lock()
         self._mqtt_rendered_count = 0
+        self._docker_services = {}
+        self._docker_service_names = []
+        self._docker_log_messages = deque(maxlen=2000)
+        self._docker_log_lock = threading.Lock()
+        self._docker_log_rendered_count = 0
+        self._docker_log_paused = False
+        self._docker_log_proc = None
+        self._docker_log_busy = False
+        self._docker_log_scope = None
+        self._docker_action_busy = False
+        self._docker_compose_cmd_cache = None
 
         self._build_ui()
         self._setup_logging()
@@ -1066,8 +1078,10 @@ class MEPGui:
         tun_f = ttk.Frame(nb, padding=8)
         mqtt_f = ttk.Frame(nb, padding=8)
         gpsd_f = ttk.Frame(nb, padding=8)
+        docker_f = ttk.Frame(nb, padding=8)
         nb.add(afe_f, text="AFE")
         nb.add(rec_f, text="REC")
+        nb.add(docker_f, text="DOC")
         nb.add(gpsd_f, text="GPS")
         nb.add(tlm_f, text="TLM")
         nb.add(jh_f, text="JET")
@@ -1078,6 +1092,7 @@ class MEPGui:
 
         self._build_afe_tab(afe_f)
         self._build_rec_tab(rec_f)
+        self._build_docker_tab(docker_f)
         self._build_gpsd_tab(gpsd_f)
         self._build_tlm_tab(tlm_f)
         self._build_jetson_health_tab(jh_f)
@@ -1093,11 +1108,815 @@ class MEPGui:
     def _on_advanced_tab_changed(self, _event=None):
         if self._is_adv_tab_selected("MQTT"):
             self._mqtt_flush_buffer_to_widget()
+        if self._is_adv_tab_selected("DOC"):
+            self._docker_flush_buffer_to_widget()
+
+    def _docker_run_cmd(self, cmd: list[str], *, cwd: str | None = None, timeout: float = 10.0):
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+            )
+            return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+        except subprocess.TimeoutExpired as e:
+            out = (e.stdout or "") if isinstance(e.stdout, str) else ""
+            err = (e.stderr or "") if isinstance(e.stderr, str) else ""
+            return 124, out.strip(), (err or "command timed out").strip()
+        except Exception as e:
+            return 125, "", str(e)
+
+    def _docker_get_compose_cmd(self):
+        if self._docker_compose_cmd_cache is not None:
+            return self._docker_compose_cmd_cache
+
+        candidates = (["docker", "compose"], ["docker-compose"])
+        for cmd in candidates:
+            rc, _out, _err = self._docker_run_cmd([*cmd, "version"], timeout=3.0)
+            if rc == 0:
+                self._docker_compose_cmd_cache = cmd
+                return cmd
+
+        self._docker_compose_cmd_cache = ()
+        return ()
+
+    def _docker_parse_ps_json(self, text: str) -> dict:
+        if not text.strip():
+            return {}
+
+        rows = None
+        try:
+            rows = json.loads(text)
+        except Exception:
+            parsed = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed.append(json.loads(line))
+                except Exception:
+                    continue
+            rows = parsed
+
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            return {}
+
+        services = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            service = str(item.get("Service") or item.get("Name") or "").strip()
+            if not service:
+                continue
+
+            command = str(item.get("Command") or item.get("command") or "—")
+            publishers = item.get("Publishers")
+            ports = item.get("Ports")
+            port_items = []
+            if isinstance(publishers, list):
+                for p in publishers:
+                    if not isinstance(p, dict):
+                        continue
+                    host = str(p.get("URL") or p.get("HostIP") or "")
+                    pub = p.get("PublishedPort")
+                    tgt = p.get("TargetPort")
+                    proto = str(p.get("Protocol") or "tcp")
+                    if pub is not None and tgt is not None:
+                        left = f"{host}:{pub}" if host else str(pub)
+                        port_items.append(f"{left}->{tgt}/{proto}")
+                    elif tgt is not None:
+                        port_items.append(f"{tgt}/{proto}")
+            elif isinstance(ports, str) and ports.strip():
+                port_items.append(ports.strip())
+            elif isinstance(ports, list):
+                for p in ports:
+                    if p is not None:
+                        port_items.append(str(p))
+
+            services[service] = {
+                "container": str(item.get("Name") or "—"),
+                "state": str(item.get("State") or "—"),
+                "command": command,
+                "ports": ", ".join(port_items) if port_items else "—",
+                "status": str(item.get("Status") or "—"),
+            }
+
+        return services
+
+    def _docker_set_action_busy(self, busy: bool):
+        self._docker_action_busy = busy
+        state = "disabled" if busy else "normal"
+        for w in getattr(self, "_docker_action_widgets", []):
+            try:
+                w.configure(state=state)
+            except Exception:
+                pass
+
+    def _docker_refresh_status_async(self):
+        if self._docker_log_busy:
+            # keep refresh and stream independent but avoid refresh storms from repeated clicks
+            pass
+        if getattr(self, "_docker_refresh_busy", False):
+            return
+
+        self._docker_refresh_busy = True
+
+        def _worker():
+            engine_status = "Unavailable"
+            services = {}
+            detail = ""
+
+            rc, _out, err = self._docker_run_cmd(["docker", "info"], timeout=5.0)
+            if rc == 0:
+                engine_status = "Reachable"
+            else:
+                engine_status = "Unavailable"
+                detail = err or "docker daemon not reachable"
+
+            compose_cmd = self._docker_get_compose_cmd()
+            if compose_cmd:
+                rc, out, err = self._docker_run_cmd(
+                    [*compose_cmd, "ps", "-a", "--format", "json", "--no-trunc"],
+                    cwd=self.DOCKER_COMPOSE_DIR,
+                    timeout=8.0,
+                )
+                if rc != 0 and ("unknown flag" in (err or "").lower()):
+                    rc, out, err = self._docker_run_cmd(
+                        [*compose_cmd, "ps", "-a", "--format", "json"],
+                        cwd=self.DOCKER_COMPOSE_DIR,
+                        timeout=8.0,
+                    )
+                if rc == 0:
+                    services = self._docker_parse_ps_json(out)
+                else:
+                    detail = err or f"compose ps failed ({rc})"
+            else:
+                detail = "docker compose command not found"
+
+            def _apply():
+                import datetime
+
+                self._docker_refresh_busy = False
+                self._docker_services = dict(services)
+                self._docker_service_names = sorted(self._docker_services.keys())
+
+                self._vars["docker_engine_status"].set(engine_status)
+                self._vars["docker_compose_dir"].set(self.DOCKER_COMPOSE_DIR)
+                running = 0
+                for svc in self._docker_service_names:
+                    state = self._docker_services.get(svc, {}).get("state", "").lower()
+                    if state == "running":
+                        running += 1
+                total = len(self._docker_service_names)
+                self._vars["docker_services_summary"].set(f"{running}/{total}")
+                self._vars["docker_last_refresh"].set(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+                selected = self._vars["docker_service"].get().strip()
+                if (not selected) or (selected not in self._docker_services):
+                    self._vars["docker_service"].set(self._docker_service_names[0] if self._docker_service_names else "")
+
+                self._docker_render_service_list()
+                self._docker_apply_selected_service()
+                if detail:
+                    logging.warning("DOCKER: %s", detail)
+
+            self.root.after(0, _apply)
+
+        threading.Thread(target=_worker, daemon=True, name="docker_refresh").start()
+
+    def _docker_render_service_list(self):
+        tree = getattr(self, "_docker_services_tree", None)
+        if tree is None:
+            return
+
+        for iid in tree.get_children():
+            tree.delete(iid)
+
+        for svc in self._docker_service_names:
+            row = self._docker_services.get(svc, {})
+            tree.insert(
+                "",
+                "end",
+                iid=svc,
+                values=(
+                    row.get("state", "—"),
+                    row.get("container", "—"),
+                    row.get("command", "—"),
+                    row.get("ports", "—"),
+                ),
+            )
+
+        selected = self._vars["docker_service"].get().strip()
+        if selected and selected in self._docker_services:
+            tree.selection_set(selected)
+            tree.focus(selected)
+            tree.see(selected)
+
+    def _docker_on_service_tree_select(self, _event=None):
+        tree = getattr(self, "_docker_services_tree", None)
+        if tree is None:
+            return
+
+        selected = list(tree.selection())
+        if selected:
+            self._vars["docker_service"].set(selected[0])
+        self._docker_apply_selected_service()
+
+        mode = self._vars.get("docker_log_mode", tk.StringVar()).get().strip().lower()
+        if mode == "selected":
+            self._docker_stream_start(restart=self._docker_log_busy)
+
+    def _docker_apply_selected_service(self, *_):
+        svc = self._vars.get("docker_service", tk.StringVar()).get().strip()
+        row = self._docker_services.get(svc, {}) if svc else {}
+        self._vars["docker_selected_state"].set(row.get("state", "—"))
+        self._vars["docker_selected_container"].set(row.get("container", "—"))
+        self._vars["docker_selected_command"].set(row.get("command", "—"))
+        self._vars["docker_selected_ports"].set(row.get("ports", "—"))
+
+    def _docker_selected_services(self) -> list[str]:
+        tree = getattr(self, "_docker_services_tree", None)
+        if tree is None:
+            svc = self._docker_selected_service()
+            return [svc] if svc else []
+
+        picked = [s for s in tree.selection() if s in self._docker_services]
+        if picked:
+            return picked
+
+        svc = self._docker_selected_service()
+        return [svc] if svc else []
+
+    def _docker_selected_service(self):
+        svc = self._vars.get("docker_service", tk.StringVar()).get().strip()
+        return svc or None
+
+    def _docker_confirm_all_action(self, action_label: str) -> bool:
+        return messagebox.askokcancel(
+            title=f"Docker: {action_label}",
+            message=(
+                f"This will {action_label.lower()} all services in the compose project.\n\n"
+                "Press OK to continue, or Cancel to abort."
+            ),
+            parent=self.root,
+        )
+
+    def _docker_run_compose_action_async(
+        self,
+        action: str,
+        *,
+        services: list[str] | None = None,
+        confirm_all: bool = False,
+        extra_args: list[str] | None = None,
+    ):
+        if self._docker_action_busy:
+            logging.warning("DOCKER: another action is already in progress")
+            return
+
+        target_services = [s for s in (services or []) if s]
+
+        if (not target_services) and confirm_all:
+            if not self._docker_confirm_all_action(action.capitalize()):
+                logging.info("DOCKER: %s all cancelled", action)
+                return
+
+        compose_cmd = self._docker_get_compose_cmd()
+        if not compose_cmd:
+            logging.error("DOCKER: docker compose command not found")
+            return
+
+        cmd = [*compose_cmd, action]
+        if extra_args:
+            cmd.extend(extra_args)
+        target_desc = "all services"
+        if target_services:
+            cmd.extend(target_services)
+            target_desc = ", ".join(target_services)
+
+        self._docker_set_action_busy(True)
+        logging.info("DOCKER: running %s on %s", action, target_desc)
+
+        def _worker():
+            rc, out, err = self._docker_run_cmd(cmd, cwd=self.DOCKER_COMPOSE_DIR, timeout=40.0)
+
+            def _done():
+                self._docker_set_action_busy(False)
+                if rc == 0:
+                    logging.info("DOCKER: %s complete on %s", action, target_desc)
+                    if out:
+                        logging.info("DOCKER: %s", out)
+                else:
+                    detail = err or out or f"exit code {rc}"
+                    logging.error("DOCKER: %s failed on %s: %s", action, target_desc, detail)
+                self._docker_refresh_status_async()
+                if self._docker_log_busy:
+                    self._docker_stream_start(restart=True)
+
+            self.root.after(0, _done)
+
+        threading.Thread(target=_worker, daemon=True, name=f"docker_{action}").start()
+
+    def _docker_action_targets(self, action: str, *, emit_errors: bool = True):
+        scope = self._vars.get("docker_action_scope", tk.StringVar(value="selected")).get().strip().lower()
+        if scope == "selected":
+            picked = self._docker_selected_services()
+            if action == "down":
+                if emit_errors:
+                    logging.error("DOCKER: 'down' applies to the whole compose project; switch scope to all")
+                return None, None, None
+            if not picked:
+                if emit_errors:
+                    logging.error("DOCKER: select at least one service first")
+                return None, None, None
+            return picked, False, "selected"
+
+        # all scope
+        confirm_all = action in ("stop", "restart", "down")
+        return [], confirm_all, "all"
+
+    def _docker_preview_command(self, action: str):
+        compose_cmd = self._docker_get_compose_cmd()
+        compose_text = " ".join(compose_cmd) if compose_cmd else "docker compose"
+
+        targets, _confirm_all, scope = self._docker_action_targets(action, emit_errors=False)
+        if scope is None:
+            return f"{compose_text} {action}"
+
+        cmd = [compose_text, action]
+        if action == "up":
+            cmd.append("-d")
+            if self._vars.get("docker_up_force_recreate", tk.BooleanVar(value=False)).get():
+                cmd.append("--force-recreate")
+        if targets:
+            cmd.extend(targets)
+
+        return " ".join(cmd)
+
+    def _docker_set_hover_preview(self, text: str = ""):
+        sv = self._vars.get("docker_cmd_preview")
+        if sv is None:
+            return
+        if text:
+            sv.set(text)
+        else:
+            sv.set("Hover over an action to preview the exact compose command")
+
+    def _docker_bind_hover_preview(self, widget, action: str):
+        widget.bind("<Enter>", lambda _e: self._docker_set_hover_preview(self._docker_preview_command(action)))
+        widget.bind("<Leave>", lambda _e: self._docker_set_hover_preview(""))
+
+    def _docker_run_from_controls(self, action: str):
+        targets, confirm_all, scope = self._docker_action_targets(action)
+        if scope is None:
+            return
+
+        extra_args = []
+        if action == "up":
+            extra_args = ["-d"]
+            if self._vars.get("docker_up_force_recreate", tk.BooleanVar(value=False)).get():
+                extra_args.append("--force-recreate")
+
+        services = targets if scope == "selected" else []
+        self._docker_run_compose_action_async(
+            action,
+            services=services,
+            confirm_all=bool(confirm_all),
+            extra_args=extra_args,
+        )
+
+    def _docker_log_append(self, line: str):
+        import datetime
+
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        with self._docker_log_lock:
+            self._docker_log_messages.append((ts, line.rstrip("\n")))
+        if self._is_adv_tab_selected("DOC"):
+            self.root.after(0, self._docker_flush_buffer_to_widget)
+
+    def _docker_stream_stop(self):
+        proc = self._docker_log_proc
+        self._docker_log_proc = None
+        self._docker_log_busy = False
+        self._docker_log_scope = None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _docker_stream_start(self, *, restart: bool = False):
+        if self._docker_log_busy and not restart:
+            # "Stream" should also behave as resume.
+            self._docker_stream_resume()
+            return
+
+        compose_cmd = self._docker_get_compose_cmd()
+        if not compose_cmd:
+            logging.error("DOCKER: docker compose command not found")
+            return
+
+        mode = self._vars["docker_log_mode"].get().strip().lower() or "selected"
+        service = self._docker_selected_service()
+        scope = service if mode == "selected" else "all"
+        # Keep startup history small; on scope switch keep only a tiny recent context.
+        tail_count = "30"
+        if restart and self._docker_log_scope not in (None, scope):
+            tail_count = "15"
+        cmd = [*compose_cmd, "logs", "-f", "--tail", tail_count]
+        if mode == "selected":
+            if not service:
+                logging.error("DOCKER: select a service to stream selected logs")
+                return
+            cmd.append(service)
+
+        if restart and self._docker_log_scope not in (None, scope):
+            self._docker_clear_buffer_and_widget()
+
+        self._docker_stream_stop()
+        self._docker_log_paused = False
+        self._vars["docker_stream_state"].set("live")
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=self.DOCKER_COMPOSE_DIR,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as e:
+            logging.error("DOCKER: log stream failed to start: %s", e)
+            return
+
+        self._docker_log_proc = proc
+        self._docker_log_busy = True
+        self._docker_log_scope = scope
+        scope = service if mode == "selected" else "all services"
+        logging.info("DOCKER: streaming logs (%s)", scope)
+
+        def _reader():
+            try:
+                if proc.stdout is None:
+                    return
+                for line in proc.stdout:
+                    self._docker_log_append(line)
+            finally:
+                rc = proc.poll()
+
+                def _done():
+                    same_proc = (self._docker_log_proc is proc)
+                    if same_proc:
+                        self._docker_log_proc = None
+                        self._docker_log_busy = False
+                        self._vars["docker_stream_state"].set("paused")
+                        if rc not in (None, 0):
+                            logging.warning("DOCKER: log stream exited with code %s", rc)
+
+                self.root.after(0, _done)
+
+        threading.Thread(target=_reader, daemon=True, name="docker_logs").start()
+
+    def _docker_stream_pause(self):
+        self._docker_log_paused = True
+        self._vars["docker_stream_state"].set("paused")
+
+    def _docker_stream_resume(self):
+        if not self._docker_log_busy:
+            self._docker_stream_start()
+            return
+        self._docker_log_paused = False
+        self._vars["docker_stream_state"].set("live")
+        self._docker_flush_buffer_to_widget()
+
+    def _docker_on_log_mode_changed(self, _event=None):
+        if self._docker_log_busy:
+            self._docker_stream_start(restart=True)
+
+    def _docker_flush_buffer_to_widget(self):
+        if not hasattr(self, "_docker_log_text"):
+            return
+        if not self._is_adv_tab_selected("DOC"):
+            return
+        if self._docker_log_paused:
+            return
+
+        with self._docker_log_lock:
+            entries = list(self._docker_log_messages)
+            start = min(self._docker_log_rendered_count, len(entries))
+            tail = entries[start:]
+
+        if not tail:
+            return
+
+        for ts, line in tail:
+            clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line)
+            self._docker_log_text.insert("end", f"{ts}  ", ("docker_ts",))
+            if " | " in clean:
+                svc, msg = clean.split(" | ", 1)
+                svc = svc.strip()
+                if svc:
+                    self._docker_log_text.insert("end", f"{svc} | ", ("docker_svc",))
+                self._docker_insert_pretty_log_message(msg)
+            else:
+                self._docker_insert_pretty_log_message(clean)
+            self._docker_log_text.insert("end", "\n")
+
+        self._docker_log_text.see("end")
+        self._docker_log_rendered_count = len(entries)
+        self._docker_trim_widget_lines()
+
+    def _docker_insert_pretty_log_message(self, msg: str):
+        text = (msg or "").rstrip()
+
+        # Pretty-print JSON payloads when possible.
+        if text.startswith("{") or text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                pretty = json.dumps(parsed, indent=2, sort_keys=True)
+                self._docker_log_text.insert("end", pretty, ("docker_json",))
+                return
+            except Exception:
+                pass
+
+        m = re.match(r"^((?:\d{4}-\d{2}-\d{2}[ T])?\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\s+(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|CRITICAL)\s+(.*)$", text, re.IGNORECASE)
+        if m:
+            inner_ts, level, rest = m.groups()
+            self._docker_log_text.insert("end", f"{inner_ts} ", ("docker_ts",))
+            lvl = level.upper()
+            lvl_tag = "docker_lvl"
+            if lvl in ("ERROR", "CRITICAL"):
+                lvl_tag = "docker_err"
+            elif lvl in ("WARN", "WARNING"):
+                lvl_tag = "docker_warn"
+            elif lvl == "INFO":
+                lvl_tag = "docker_info"
+            self._docker_log_text.insert("end", f"{lvl:<8}", (lvl_tag,))
+            self._docker_log_text.insert("end", rest, ("docker_msg",))
+            return
+
+        upper = text.upper()
+        tag = "docker_msg"
+        if any(k in upper for k in ("ERROR", "EXCEPTION", "CRITICAL", "TRACEBACK", "FAILED")):
+            tag = "docker_err"
+        elif any(k in upper for k in ("WARN", "WARNING")):
+            tag = "docker_warn"
+        elif "INFO" in upper:
+            tag = "docker_info"
+        self._docker_log_text.insert("end", text, (tag,))
+
+    def _docker_trim_widget_lines(self, max_lines: int = 800):
+        if not hasattr(self, "_docker_log_text"):
+            return
+        lines = int(self._docker_log_text.index("end-1c").split(".")[0])
+        if lines > max_lines:
+            self._docker_log_text.delete("1.0", f"{lines - max_lines}.0")
+
+    def _docker_clear_buffer_and_widget(self):
+        with self._docker_log_lock:
+            self._docker_log_messages.clear()
+        self._docker_log_rendered_count = 0
+        if hasattr(self, "_docker_log_text"):
+            self._docker_log_text.delete("1.0", "end")
+
+    def _build_docker_tab(self, frame: ttk.Frame):
+        """DOC tab: compose service status, logs, and service controls."""
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
+
+        def _ro_row(parent, row, col, label, key):
+            sv = self._vars.get(key)
+            if sv is None:
+                sv = tk.StringVar(value="—")
+                self._vars[key] = sv
+            c0 = col * 3
+            ttk.Label(parent, text=label).grid(row=row, column=c0, sticky="w", padx=5, pady=2)
+            e = ttk.Entry(parent, textvariable=sv, state="readonly", width=24)
+            e.grid(row=row, column=c0 + 1, sticky="ew", padx=5, pady=2)
+            self._bind_copy_menu(e, sv)
+
+        self._vars["docker_engine_status"] = tk.StringVar(value="Unknown")
+        self._vars["docker_compose_dir"] = tk.StringVar(value=self.DOCKER_COMPOSE_DIR)
+        self._vars["docker_services_summary"] = tk.StringVar(value="0/0")
+        self._vars["docker_last_refresh"] = tk.StringVar(value="never")
+
+        st_f = ttk.LabelFrame(frame, text="Status")
+        st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
+        for c in (1, 4):
+            st_f.columnconfigure(c, weight=1)
+        st_f.columnconfigure(6, weight=0)
+
+        _ro_row(st_f, 0, 0, "Docker", "docker_engine_status")
+        _ro_row(st_f, 0, 1, "Services", "docker_services_summary")
+        _ro_row(st_f, 1, 0, "Compose Dir", "docker_compose_dir")
+        _ro_row(st_f, 1, 1, "Last Refresh", "docker_last_refresh")
+        ttk.Button(st_f, text="Refresh", width=9, command=self._docker_refresh_status_async).grid(
+            row=0, column=6, rowspan=2, padx=(8, 6), pady=2, sticky="nsew"
+        )
+
+        svc_f = ttk.LabelFrame(frame, text="Services")
+        svc_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        for c in (1, 3):
+            svc_f.columnconfigure(c, weight=1)
+        svc_f.rowconfigure(2, weight=1)
+
+        self._vars["docker_service"] = tk.StringVar(value="")
+
+        self._vars["docker_selected_state"] = tk.StringVar(value="—")
+        self._vars["docker_selected_container"] = tk.StringVar(value="—")
+        self._vars["docker_selected_command"] = tk.StringVar(value="—")
+        self._vars["docker_selected_ports"] = tk.StringVar(value="—")
+        ttk.Label(svc_f, text="Container").grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        _cn = ttk.Entry(svc_f, textvariable=self._vars["docker_selected_container"], state="readonly")
+        _cn.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+        self._bind_copy_menu(_cn, self._vars["docker_selected_container"])
+        ttk.Label(svc_f, text="State").grid(row=0, column=2, sticky="w", padx=5, pady=2)
+        _st = ttk.Entry(svc_f, textvariable=self._vars["docker_selected_state"], state="readonly")
+        _st.grid(row=0, column=3, sticky="ew", padx=5, pady=2)
+        self._bind_copy_menu(_st, self._vars["docker_selected_state"])
+        ttk.Label(svc_f, text="Command").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        _cmd = ttk.Entry(svc_f, textvariable=self._vars["docker_selected_command"], state="readonly")
+        _cmd.grid(row=1, column=1, columnspan=3, sticky="ew", padx=5, pady=2)
+        self._bind_copy_menu(_cmd, self._vars["docker_selected_command"])
+        ttk.Label(svc_f, text="Ports").grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        _ports = ttk.Entry(svc_f, textvariable=self._vars["docker_selected_ports"], state="readonly")
+        _ports.grid(row=2, column=1, columnspan=3, sticky="ew", padx=5, pady=2)
+        self._bind_copy_menu(_ports, self._vars["docker_selected_ports"])
+
+        table_f = ttk.Frame(svc_f)
+        table_f.grid(row=3, column=0, columnspan=4, sticky="nsew", padx=5, pady=(2, 4))
+        table_f.columnconfigure(0, weight=1)
+        table_f.rowconfigure(0, weight=1)
+
+        self._docker_services_tree = ttk.Treeview(
+            table_f,
+            columns=("state", "container", "command", "ports"),
+            show="headings",
+            selectmode="extended",
+            height=8,
+        )
+        self._docker_services_tree.heading("state", text="State")
+        self._docker_services_tree.heading("container", text="Container")
+        self._docker_services_tree.heading("command", text="Command")
+        self._docker_services_tree.heading("ports", text="Ports")
+        self._docker_services_tree.column("state", width=90, minwidth=80, anchor="w")
+        self._docker_services_tree.column("container", width=240, minwidth=160, anchor="w")
+        self._docker_services_tree.column("command", width=420, minwidth=240, anchor="w")
+        self._docker_services_tree.column("ports", width=320, minwidth=180, anchor="w")
+
+        ysb = ttk.Scrollbar(table_f, orient="vertical", command=self._docker_services_tree.yview)
+        xsb = ttk.Scrollbar(table_f, orient="horizontal", command=self._docker_services_tree.xview)
+        self._docker_services_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self._docker_services_tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        self._docker_services_tree.bind("<<TreeviewSelect>>", self._docker_on_service_tree_select)
+
+        ctl_f = ttk.LabelFrame(svc_f, text="Controls")
+        ctl_f.grid(row=4, column=0, columnspan=4, sticky="ew", padx=5, pady=(0, 4))
+        for i in range(5):
+            ctl_f.columnconfigure(i, weight=1)
+
+        self._vars["docker_action_scope"] = tk.StringVar(value="selected")
+        self._vars["docker_up_force_recreate"] = tk.BooleanVar(value=False)
+
+        scope_f = ttk.Frame(ctl_f)
+        scope_f.grid(row=0, column=0, columnspan=2, sticky="w", padx=2, pady=(2, 2))
+        ttk.Label(scope_f, text="Scope:").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        rb_selected = ttk.Radiobutton(scope_f, text="Selected", value="selected", variable=self._vars["docker_action_scope"])
+        rb_selected.grid(row=0, column=1, sticky="w", padx=(0, 4))
+        rb_all = ttk.Radiobutton(scope_f, text="All", value="all", variable=self._vars["docker_action_scope"])
+        rb_all.grid(row=0, column=2, sticky="w")
+
+        up_opt = ttk.Checkbutton(
+            ctl_f,
+            text="up: --force-recreate",
+            variable=self._vars["docker_up_force_recreate"],
+        )
+        up_opt.grid(row=0, column=2, columnspan=3, sticky="e", padx=2, pady=(2, 2))
+
+        b_start = ttk.Button(ctl_f, text="Start", command=lambda: self._docker_run_from_controls("start"))
+        b_start.grid(row=1, column=0, sticky="ew", padx=(0, 2), pady=(0, 2))
+        b_stop = ttk.Button(ctl_f, text="Stop", command=lambda: self._docker_run_from_controls("stop"))
+        b_stop.grid(row=1, column=1, sticky="ew", padx=2, pady=(0, 2))
+        b_restart = ttk.Button(ctl_f, text="Restart", command=lambda: self._docker_run_from_controls("restart"))
+        b_restart.grid(row=1, column=2, sticky="ew", padx=2, pady=(0, 2))
+        b_up = ttk.Button(ctl_f, text="Up", command=lambda: self._docker_run_from_controls("up"))
+        b_up.grid(row=1, column=3, sticky="ew", padx=2, pady=(0, 2))
+        b_down = ttk.Button(ctl_f, text="Down", command=lambda: self._docker_run_from_controls("down"))
+        b_down.grid(row=1, column=4, sticky="ew", padx=(2, 0), pady=(0, 2))
+
+        self._vars["docker_cmd_preview"] = tk.StringVar(
+            value="Hover over an action to preview the exact compose command"
+        )
+        ttk.Label(ctl_f, text="Command:").grid(row=2, column=0, sticky="w", padx=(2, 4), pady=(2, 2))
+        ttk.Label(
+            ctl_f,
+            textvariable=self._vars["docker_cmd_preview"],
+            foreground="grey",
+            font=("TkDefaultFont", 8),
+        ).grid(row=2, column=1, columnspan=4, sticky="w", padx=(0, 2), pady=(2, 2))
+
+        self._docker_action_widgets = [b_start, b_stop, b_restart, b_up, b_down]
+
+        self._docker_bind_hover_preview(b_start, "start")
+        self._docker_bind_hover_preview(b_stop, "stop")
+        self._docker_bind_hover_preview(b_restart, "restart")
+        self._docker_bind_hover_preview(b_up, "up")
+        self._docker_bind_hover_preview(b_down, "down")
+
+        log_f = ttk.LabelFrame(frame, text="Logs")
+        log_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="nsew")
+        log_f.columnconfigure(0, weight=1)
+        log_f.rowconfigure(1, weight=1)
+
+        log_ctl = ttk.Frame(log_f)
+        log_ctl.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+        for i in range(6):
+            log_ctl.columnconfigure(i, weight=1 if i == 0 else 0)
+
+        self._vars["docker_log_mode"] = tk.StringVar(value="selected")
+        mode_f = ttk.Frame(log_ctl)
+        mode_f.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(mode_f, text="Logs:").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        ttk.Radiobutton(
+            mode_f,
+            text="Selected",
+            value="selected",
+            variable=self._vars["docker_log_mode"],
+            command=self._docker_on_log_mode_changed,
+        ).grid(row=0, column=1, sticky="w", padx=(0, 4))
+        ttk.Radiobutton(
+            mode_f,
+            text="All",
+            value="all",
+            variable=self._vars["docker_log_mode"],
+            command=self._docker_on_log_mode_changed,
+        ).grid(row=0, column=2, sticky="w")
+
+        self._vars["docker_stream_state"] = tk.StringVar(value="paused")
+        ttk.Label(
+            log_ctl,
+            textvariable=self._vars["docker_stream_state"],
+            foreground="grey",
+            font=("TkFixedFont", 8),
+        ).grid(row=0, column=1, sticky="w", padx=(0, 8))
+
+        ttk.Button(log_ctl, text="Stream", command=self._docker_stream_start).grid(
+            row=0, column=2, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(log_ctl, text="Pause", command=self._docker_stream_pause).grid(
+            row=0, column=3, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(log_ctl, text="Clear", command=self._docker_clear_buffer_and_widget).grid(
+            row=0, column=4, sticky="ew"
+        )
+
+        self._docker_log_text = scrolledtext.ScrolledText(
+            log_f,
+            height=10,
+            wrap="word",
+            font=("TkFixedFont", 9),
+            background="#f5f5f5",
+        )
+        self._docker_log_text.tag_configure("docker_ts", foreground="#6b7280")
+        self._docker_log_text.tag_configure("docker_svc", foreground="#1d4ed8")
+        self._docker_log_text.tag_configure("docker_lvl", foreground="#334155")
+        self._docker_log_text.tag_configure("docker_msg", foreground="#111827")
+        self._docker_log_text.tag_configure("docker_json", foreground="#0f172a")
+        self._docker_log_text.tag_configure("docker_info", foreground="#0f766e")
+        self._docker_log_text.tag_configure("docker_warn", foreground="#b45309")
+        self._docker_log_text.tag_configure("docker_err", foreground="#b91c1c")
+        self._docker_log_text.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        self._docker_log_text.bind(
+            "<Key>",
+            lambda e: None if (e.state & 0x4 and e.keysym in ("c", "C", "a", "A")) else "break",
+        )
+        self._bind_copy_menu(self._docker_log_text)
+
+        self._add_copyable_note(
+            frame,
+            "Source: docker compose project at /opt/radiohound/docker",
+            row=3,
+            wraplength=420,
+        )
+        self.root.after(100, self._docker_refresh_status_async)
 
     def _build_gpsd_tab(self, frame: ttk.Frame):
         """GPSD tab: connection controls, semantic diagnostics, stream, and commands."""
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
+        frame.rowconfigure(1, weight=1)
 
         def _ro_row(parent, row, col, label, key, unit=""):
             sv = tk.StringVar(value=self._gps_state.get(key, "Not reported"))
@@ -1115,33 +1934,8 @@ class MEPGui:
         # Initialize GPSD stream state
         self._vars["gpsd_stream_state"] = tk.StringVar(value="paused")
 
-        ctl_f = ttk.LabelFrame(frame, text="Logging")
-        ctl_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
-        ctl_f.columnconfigure(0, weight=1)
-        ctl_f.columnconfigure(1, weight=1)
-        ctl_f.columnconfigure(2, weight=1)
-
-        # Status label for live/paused state
-        state_lbl = ttk.Label(
-            ctl_f,
-            textvariable=self._vars["gpsd_stream_state"],
-            foreground="grey",
-            font=("TkFixedFont", 8),
-        )
-        state_lbl.grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=(4, 1))
-
-        ttk.Button(ctl_f, text="Stream",
-                   command=self._gpsd_watch_raw_on).grid(
-            row=1, column=0, padx=5, pady=(0, 2), sticky="ew")
-        ttk.Button(ctl_f, text="Pause",
-                   command=self._gpsd_watch_off).grid(
-            row=1, column=1, padx=5, pady=(0, 2), sticky="ew")
-        ttk.Button(ctl_f, text="Clear",
-                   command=lambda: self._gpsd_text.delete("1.0", "end")).grid(
-            row=1, column=2, padx=5, pady=(0, 2), sticky="ew")
-
         st_f = ttk.LabelFrame(frame, text="Status")
-        st_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
         for c in (1, 5):
             st_f.columnconfigure(c, weight=1)
 
@@ -1172,9 +1966,31 @@ class MEPGui:
         _ro_row(st_f, 12, 0, "VDOP", "gps_vdop")
 
         log_f = ttk.LabelFrame(frame, text="GPSD Stream")
-        log_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="nsew")
+        log_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="nsew")
         log_f.columnconfigure(0, weight=1)
-        log_f.rowconfigure(0, weight=1)
+        log_f.rowconfigure(1, weight=1)
+
+        log_ctl = ttk.Frame(log_f)
+        log_ctl.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+        for c in range(4):
+            log_ctl.columnconfigure(c, weight=1 if c == 0 else 0)
+
+        ttk.Label(
+            log_ctl,
+            textvariable=self._vars["gpsd_stream_state"],
+            foreground="grey",
+            font=("TkFixedFont", 8),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        ttk.Button(log_ctl, text="Stream", command=self._gpsd_watch_raw_on).grid(
+            row=0, column=1, padx=(0, 4), sticky="ew"
+        )
+        ttk.Button(log_ctl, text="Pause", command=self._gpsd_watch_off).grid(
+            row=0, column=2, padx=(0, 4), sticky="ew"
+        )
+        ttk.Button(log_ctl, text="Clear", command=lambda: self._gpsd_text.delete("1.0", "end")).grid(
+            row=0, column=3, sticky="ew"
+        )
 
         self._gpsd_text = tk.Text(
             log_f,
@@ -1186,16 +2002,16 @@ class MEPGui:
         ysb = ttk.Scrollbar(log_f, orient="vertical", command=self._gpsd_text.yview)
         xsb = ttk.Scrollbar(log_f, orient="horizontal", command=self._gpsd_text.xview)
         self._gpsd_text.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-        self._gpsd_text.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=(4, 0))
-        ysb.grid(row=0, column=1, sticky="ns", pady=(4, 0), padx=(0, 4))
-        xsb.grid(row=1, column=0, sticky="ew", padx=(4, 0), pady=(0, 4))
+        self._gpsd_text.grid(row=1, column=0, sticky="nsew", padx=(4, 0), pady=(0, 0))
+        ysb.grid(row=1, column=1, sticky="ns", pady=(0, 0), padx=(0, 4))
+        xsb.grid(row=2, column=0, sticky="ew", padx=(4, 0), pady=(0, 4))
         self._gpsd_text.bind("<Key>",
             lambda e: None if (e.state & 0x4 and e.keysym in ("c", "C", "a", "A"))
                       else "break")
         self._bind_copy_menu(self._gpsd_text)
 
         cmd_f = ttk.LabelFrame(frame, text="Manual Command")
-        cmd_f.grid(row=3, column=0, padx=4, pady=(2, 6), sticky="ew")
+        cmd_f.grid(row=2, column=0, padx=4, pady=(2, 6), sticky="ew")
         cmd_f.columnconfigure(1, weight=1)
 
         ttk.Label(cmd_f, text="Command").grid(
@@ -1210,7 +2026,7 @@ class MEPGui:
         self._add_copyable_note(
             frame,
             "Source: gpsd service (config: /etc/default/gpsd)",
-            row=4,
+            row=3,
             wraplength=420,
         )
 
@@ -1713,6 +2529,9 @@ class MEPGui:
             "jh_cpu_usage": "-",
             "jh_ram": "-",
             "jh_disk": "-",
+            "jh_net_status": "Unknown",
+            "jh_net_mac": "-",
+            "jh_net_ip": "-",
             "jh_pwr_name_1": "VDD_IN",
             "jh_pwr_name_2": "Rail 1",
             "jh_pwr_name_3": "Rail 2",
@@ -1746,9 +2565,17 @@ class MEPGui:
         _ro_row(sys_f, 1, "Memory", "jh_ram")
         _ro_row(sys_f, 2, "Disk Avail", "jh_disk")
 
+        # ---- Network ---- #
+        net_f = ttk.LabelFrame(frame, text="Network")
+        net_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        net_f.columnconfigure(1, weight=1)
+        _ro_row(net_f, 0, "Status", "jh_net_status")
+        _ro_row(net_f, 1, "MAC", "jh_net_mac")
+        _ro_row(net_f, 2, "IP", "jh_net_ip")
+
         # ---- Power Mode ---- #
         pm_f = ttk.LabelFrame(frame, text="Power Mode")
-        pm_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        pm_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="ew")
         pm_f.columnconfigure(1, weight=1)
         _ro_row(pm_f, 0, "Current", "jh_nvpmodel")
 
@@ -1789,7 +2616,7 @@ class MEPGui:
 
         # ---- Thermal ---- #
         th_f = ttk.LabelFrame(frame, text="Thermal")
-        th_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="ew")
+        th_f.grid(row=3, column=0, padx=4, pady=(2, 2), sticky="ew")
         th_f.columnconfigure(1, weight=1)
         for i in range(1, 7):
             name_key = f"jh_temp_name_{i}"
@@ -1805,7 +2632,7 @@ class MEPGui:
 
         # ---- Power ---- #
         pw_f = ttk.LabelFrame(frame, text="Power")
-        pw_f.grid(row=3, column=0, padx=4, pady=(2, 2), sticky="ew")
+        pw_f.grid(row=4, column=0, padx=4, pady=(2, 2), sticky="ew")
         pw_f.columnconfigure(1, weight=1)
         for i in range(1, 4):
             name_key = f"jh_pwr_name_{i}"
@@ -1836,7 +2663,7 @@ class MEPGui:
         self._add_copyable_note(
             frame,
             "System rows auto-update from /proc, /sys/class/thermal, nvpmodel, and /etc/nvpmodel.conf. Applying a new mode may require root or passwordless sudo. Power rows update only when Query tegrastats is pressed.",
-            row=4,
+            row=5,
             wraplength=420,
         )
         self.root.after(250, self._jetson_health_sync_nvpmodel_choice)
@@ -2025,6 +2852,55 @@ class MEPGui:
         mode_id, mode_name = self._read_nvpmodel_status()
         return self._format_nvpmodel_display(mode_id, mode_name)
 
+    def _read_primary_network_info(self):
+        iface = None
+        try:
+            out = subprocess.check_output(["ip", "route", "show", "default"], text=True, timeout=1.0)
+            m = re.search(r"\bdev\s+(\S+)", out)
+            if m:
+                iface = m.group(1)
+        except Exception:
+            iface = None
+
+        if not iface:
+            try:
+                ifaces = [n for n in os.listdir("/sys/class/net") if n != "lo"]
+                if ifaces:
+                    iface = sorted(ifaces)[0]
+            except Exception:
+                iface = None
+
+        if not iface:
+            return "Offline", "-", "-"
+
+        mac = "-"
+        ip4 = "-"
+        oper = "unknown"
+
+        try:
+            with open(f"/sys/class/net/{iface}/address", "r", encoding="utf-8") as f:
+                mac = f.read().strip() or "-"
+        except Exception:
+            pass
+
+        try:
+            with open(f"/sys/class/net/{iface}/operstate", "r", encoding="utf-8") as f:
+                oper = (f.read().strip() or "unknown").lower()
+        except Exception:
+            pass
+
+        try:
+            out = subprocess.check_output(["ip", "-4", "addr", "show", "dev", iface], text=True, timeout=1.0)
+            m = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)\/", out)
+            if m:
+                ip4 = m.group(1)
+        except Exception:
+            pass
+
+        online = (oper == "up") and (ip4 != "-")
+        status = f"{'Online' if online else 'Offline'} ({iface})"
+        return status, mac, ip4
+
     def _read_tegrastats_snapshot(self):
         """Return one tegrastats line parsed into rails and temp tokens."""
         try:
@@ -2091,6 +2967,11 @@ class MEPGui:
             total_gb = total_b / (1024.0 ** 3)
             used_pct = ((total_b - free_b) * 100.0 / total_b) if total_b > 0 else 0.0
             data["jh_disk"] = f"{free_gb:.1f}/{total_gb:.1f} GiB free ({used_pct:.1f}% used)"
+
+        net_status, net_mac, net_ip = self._read_primary_network_info()
+        data["jh_net_status"] = net_status
+        data["jh_net_mac"] = net_mac
+        data["jh_net_ip"] = net_ip
 
         temps = [(name, f"{temp:.1f} C") for name, temp in self._read_thermal_sysfs(limit=6)]
         rails = {}
