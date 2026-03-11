@@ -47,6 +47,37 @@ TUNER_INJECTION_SIDE = {
     "TEST":    "high",
 }
 
+# External tuner names -> tuner_control service config names.
+TUNER_SERVICE_NAME_MAP = {
+    "VALON": "valon",
+    "LMX2820": "lmx2820",
+    "TEST": "dummy",
+}
+
+
+def tuner_to_canonical_name(tuner):
+    """Normalize tuner token to one of VALON/LMX2820/TEST/AUTO/NONE."""
+    if tuner is None:
+        return "NONE"
+    token = str(tuner).strip().upper()
+    if token == "":
+        return "NONE"
+    if token == "AUTO":
+        return "AUTO"
+    if token == "NONE":
+        return "NONE"
+    if token == "DUMMY":
+        return "TEST"
+    return token
+
+
+def tuner_to_service_name(tuner):
+    """Map UI/CLI tuner name to tuner_control service config name."""
+    canonical = tuner_to_canonical_name(tuner)
+    if canonical in ("NONE", "AUTO"):
+        return canonical.lower()
+    return TUNER_SERVICE_NAME_MAP.get(canonical)
+
 GREEN = "\033[92m"
 RESET = "\033[0m"
 
@@ -79,21 +110,21 @@ class MEPController:
     ):
         self.channel      = channel.upper()
         self.sample_rate  = sample_rate
-        self.tuner        = tuner
+        self.tuner        = tuner_to_canonical_name(tuner)
         self.adc_if       = adc_if
         self.capture_name = capture_name
 
         # Injection side: only meaningful when a tuner is present
-        if tuner is None:
+        if self.tuner in (None, "NONE"):
             self.injection = None
         elif injection is not None:
             self.injection = injection                          # explicit CLI override
-        elif tuner.lower() == "auto":
+        elif self.tuner == "AUTO":
             self.injection = "high"                            # auto-detect: both known tuners are high-side
-        elif tuner.upper() in TUNER_INJECTION_SIDE:
-            self.injection = TUNER_INJECTION_SIDE[tuner.upper()]
+        elif self.tuner in TUNER_INJECTION_SIDE:
+            self.injection = TUNER_INJECTION_SIDE[self.tuner]
         else:
-            raise ValueError(f"Tuner {tuner!r} not in TUNER_INJECTION_SIDE — add it")
+            raise ValueError(f"Tuner {self.tuner!r} not in TUNER_INJECTION_SIDE — add it")
 
         # "What changed" state — tracks what the recorder was last configured with
         self._active_channel     = None
@@ -228,7 +259,7 @@ class MEPController:
 
         def _normalize(value):
             if isinstance(value, str):
-                token = value.strip().upper()
+                token = tuner_to_canonical_name(value)
                 if token in TUNER_INJECTION_SIDE:
                     return token
             return None
@@ -249,7 +280,9 @@ class MEPController:
 
     def _ensure_tuner_initialized(self, force: bool = False) -> str:
         """Initialize tuner once, or re-initialize when force=True."""
-        if self.tuner is None:
+        self.tuner = tuner_to_canonical_name(self.tuner)
+
+        if self.tuner in (None, "NONE"):
             self._tuner_initialized = False
             self._resolved_tuner = None
             return "NONE"
@@ -257,18 +290,21 @@ class MEPController:
         if self._tuner_initialized and not force:
             return self._resolved_tuner or "AUTO"
 
-        if self.tuner.lower() == "auto":
+        if self.tuner == "AUTO":
             logging.info("Initializing tuner (auto)")
             self._publish(TUNER_CMD_TOPIC, {"task_name": "init_tuner", "arguments": {}})
             init_status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
             resolved_tuner = self._extract_tuner_name(init_status) or "AUTO"
             logging.info(f"Auto tuner resolved to: {resolved_tuner}")
         else:
-            resolved_tuner = self.tuner.upper()
+            resolved_tuner = self.tuner
+            service_tuner = tuner_to_service_name(self.tuner)
+            if not service_tuner:
+                raise ValueError(f"No service tuner mapping for {self.tuner!r}")
             logging.info(f"Initializing tuner ({resolved_tuner})")
             self._publish(TUNER_CMD_TOPIC, {
                 "task_name": "init_tuner",
-                "arguments": {"force_tuner": self.tuner},
+                "arguments": {"force_tuner": service_tuner},
             })
             _ = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
 
@@ -391,7 +427,7 @@ class MEPController:
         # Reset RFSoC
         self._publish(RFSOC_CMD_TOPIC, {"task_name": "reset"})
 
-        if self.tuner is None:
+        if self.tuner in (None, "NONE"):
             # ---- TUNER_NO: NCO sweeps to target frequency ----
             logging.info(f"[TUNER_NO] RFSoC NCO → {GREEN}{f_mhz:.2f} MHz{RESET}")
             self._publish(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {f_mhz}"})
@@ -563,17 +599,16 @@ def get_frequency_list(start_mhz: float, end_mhz: float, step_mhz: float):
 
 def tuner_type_arg(x: str):
     """argparse type handler — allows None/none/auto or a known tuner name."""
-    x_lower = x.strip().lower()
-    if x_lower == "none":
+    canonical = tuner_to_canonical_name(x)
+    if canonical == "NONE":
         return None
-    if x_lower == "auto":
+    if canonical == "AUTO":
         return "auto"
-    x_upper = x.strip().upper()
-    if x_upper not in TUNER_INJECTION_SIDE:
+    if canonical not in TUNER_INJECTION_SIDE:
         raise argparse.ArgumentTypeError(
             f"Invalid tuner '{x}'. Valid: {list(TUNER_INJECTION_SIDE.keys())}, auto, None"
         )
-    return x_upper
+    return canonical
 
 
 # ===== ENTRY POINT ===== #

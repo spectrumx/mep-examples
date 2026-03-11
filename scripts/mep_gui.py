@@ -35,6 +35,7 @@ from start_mep_rx import (
     MEPController,
     get_frequency_list,
     TUNER_INJECTION_SIDE,
+    tuner_to_service_name,
     RFSOC_CMD_TOPIC,
     RECORDER_CMD_TOPIC,
     RECORDER_STATUS_TOPIC,
@@ -169,6 +170,10 @@ class MEPGui:
         self._docker_action_busy = False
         self._docker_compose_cmd_cache = None
         self._docker_suppress_tree_stream = False
+        self._monitor_rfsoc_tlm = None
+        self._monitor_rfsoc_log_key = None
+        self._monitor_rfsoc_tlm_lock = threading.Lock()
+        self._monitor_rfsoc_tlm_event = threading.Event()
 
         self._build_ui()
         self._setup_logging()
@@ -817,10 +822,18 @@ class MEPGui:
                 f_c = float(data.get("f_c_hz", 0)) / 1e6
                 pps = data.get("pps_count", "?")
                 key = (state, round(f_c, 2))
-                if key != prev:
+                with self._monitor_rfsoc_tlm_lock:
+                    self._monitor_rfsoc_tlm = data
+                self._monitor_rfsoc_tlm_event.set()
+                self._monitor_states[topic] = data
+
+                if key != self._monitor_rfsoc_log_key:
                     logging.info(
                         f"RFSoC: {state}  f_c={f_c:.2f} MHz  pps={pps}")
-                    self._monitor_states[topic] = key
+                    self._monitor_rfsoc_log_key = key
+
+                if self._adv_tabs_built and "soc_state" in self._vars:
+                    self.root.after(0, lambda d=data: self._soc_apply(d))
 
             elif topic == TUNER_STATUS_TOPIC:
                 # Distinguish response messages (get_freq/get_power reply) from
@@ -1121,6 +1134,10 @@ class MEPGui:
         self._tun_refresh()
         self._afe_sync_ui_from_cache()
         self._mqtt_render_from_buffer()
+        with self._monitor_rfsoc_tlm_lock:
+            _cached_soc = dict(self._monitor_rfsoc_tlm) if isinstance(self._monitor_rfsoc_tlm, dict) else None
+        if _cached_soc:
+            self._soc_apply(_cached_soc)
         self._adv_tabs_built = True
 
     def _on_advanced_tab_changed(self, _event=None):
@@ -2113,7 +2130,7 @@ class MEPGui:
 
         ttk.Label(pub_f, text="Topic").grid(
             row=0, column=0, sticky="w", padx=5, pady=3)
-        self._vars["mqtt_pub_topic"] = tk.StringVar(value="")
+        self._vars["mqtt_pub_topic"] = tk.StringVar(value="tuner_control/command")
         ttk.Entry(pub_f, textvariable=self._vars["mqtt_pub_topic"]).grid(
             row=0, column=1, sticky="ew", padx=5, pady=3)
 
@@ -2122,6 +2139,10 @@ class MEPGui:
         self._mqtt_pub_payload = tk.Text(pub_f, height=4, wrap="word",
                                          font=("TkFixedFont", 9))
         self._mqtt_pub_payload.grid(row=1, column=1, sticky="ew", padx=5, pady=3)
+        self._mqtt_pub_payload.insert(
+            "1.0",
+            json.dumps({"arguments": {}, "task_name": "status"}, indent=2),
+        )
 
         ttk.Button(pub_f, text="Publish",
                    command=self._mqtt_publish_manual).grid(
@@ -2317,9 +2338,9 @@ class MEPGui:
         st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
         st_f.columnconfigure(1, weight=1)
         _ro_row(st_f, 0, "State",       "soc_state")
-        _ro_row(st_f, 1, "Centre Freq", "soc_fc",       "MHz")
-        _ro_row(st_f, 2, "IF Freq",     "soc_fif",      "MHz")
-        _ro_row(st_f, 3, "Sample Rate", "soc_fs",       "MHz")
+        _ro_row(st_f, 1, "Center Freq (metadata)", "soc_fc",       "MHz")
+        _ro_row(st_f, 2, "IF Frequency",            "soc_fif",      "MHz")
+        _ro_row(st_f, 3, "Sample Rate",             "soc_fs",       "MSPS")
         _ro_row(st_f, 4, "PPS Count",   "soc_pps")
         _ro_row(st_f, 5, "Channels",    "soc_channels")
 
@@ -2332,22 +2353,51 @@ class MEPGui:
                         variable=self._vars["sync_ntp"]).grid(
             row=0, column=0, sticky="w", padx=6, pady=4)
 
+        # ---- Manual control ---- #
+        tst_f = ttk.LabelFrame(frame, text="Manual Control")
+        tst_f.grid(row=2, column=0, padx=4, pady=(0, 4), sticky="ew")
+        tst_f.columnconfigure(1, weight=1)
+        ttk.Label(tst_f, text="IF (MHz)").grid(
+            row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["soc_if_test"] = tk.StringVar(value="1090")
+        ttk.Entry(tst_f, textvariable=self._vars["soc_if_test"], width=12).grid(
+            row=0, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Button(tst_f, text="Set IF", command=self._soc_set_if_test).grid(
+            row=0, column=2, padx=5, pady=3, sticky="ew")
+        ttk.Label(
+            tst_f,
+            text="Warning: do not change IF during an active capture/sweep.",
+            foreground="grey",
+            font=("TkDefaultFont", 8),
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 3))
+
         # ---- Buttons ---- #
         btn_f = ttk.Frame(frame)
-        btn_f.grid(row=2, column=0, padx=4, pady=(0, 6), sticky="ew")
+        btn_f.grid(row=3, column=0, padx=4, pady=(0, 6), sticky="ew")
         btn_f.columnconfigure(0, weight=1)
         btn_f.columnconfigure(1, weight=1)
+        btn_f.columnconfigure(2, weight=1)
         ttk.Button(btn_f, text="Reset RFSoC",
                    command=self._rfsoc_reset).grid(
             row=0, column=0, padx=(0, 2), sticky="ew")
-        ttk.Button(btn_f, text="Refresh",
+        ttk.Button(btn_f, text="Refresh TLM",
                    command=self._soc_refresh).grid(
             row=0, column=1, padx=(2, 0), sticky="ew")
+        ttk.Button(btn_f, text="Arm Next PPS",
+                   command=self._soc_arm_next_pps).grid(
+            row=0, column=2, padx=(2, 0), sticky="ew")
+
+        ttk.Label(
+            frame,
+            text="Arm Next PPS cancel path: Reset RFSoC (no explicit disarm command).",
+            foreground="grey",
+            font=("TkDefaultFont", 8),
+        ).grid(row=4, column=0, padx=4, pady=(0, 2), sticky="w")
 
         self._add_copyable_note(
             frame,
             "Source: RFSoC service via MQTT (status topic: rfsoc/status)",
-            row=3,
+            row=5,
             wraplength=420,
         )
 
@@ -2360,22 +2410,44 @@ class MEPGui:
         sum_f = ttk.LabelFrame(frame, text="Tuner Summary")
         sum_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
         sum_f.columnconfigure(1, weight=1)
-
-        ttk.Label(sum_f, text="State").grid(
-            row=0, column=0, sticky="w", padx=5, pady=2)
-        self._vars["tun_state"] = tk.StringVar(value="—")
-        _s = ttk.Entry(sum_f, textvariable=self._vars["tun_state"],
-                       state="readonly", width=18)
-        _s.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
-        self._bind_copy_menu(_s, self._vars["tun_state"])
+        sum_f.columnconfigure(2, weight=0)
 
         ttk.Label(sum_f, text="Name").grid(
-            row=1, column=0, sticky="w", padx=5, pady=2)
+            row=0, column=0, sticky="w", padx=5, pady=2)
         self._vars["tun_name"] = tk.StringVar(value="—")
         _n = ttk.Entry(sum_f, textvariable=self._vars["tun_name"],
                        state="readonly", width=18)
-        _n.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+        _n.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
         self._bind_copy_menu(_n, self._vars["tun_name"])
+
+        ttk.Label(sum_f, text="State").grid(
+            row=1, column=0, sticky="w", padx=5, pady=2)
+        self._vars["tun_state"] = tk.StringVar(value="—")
+        _s = ttk.Entry(sum_f, textvariable=self._vars["tun_state"],
+                       state="readonly", width=18)
+        _s.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+        self._bind_copy_menu(_s, self._vars["tun_state"])
+
+        ttk.Label(sum_f, text="Frequency (MHz)").grid(
+            row=2, column=0, sticky="w", padx=5, pady=2)
+        self._vars["tun_freq_summary"] = tk.StringVar(value="—")
+        _f = ttk.Entry(sum_f, textvariable=self._vars["tun_freq_summary"],
+                       state="readonly", width=18)
+        _f.grid(row=2, column=1, sticky="ew", padx=5, pady=2)
+        self._bind_copy_menu(_f, self._vars["tun_freq_summary"])
+
+        ttk.Label(sum_f, text="Lock Status").grid(
+            row=3, column=0, sticky="w", padx=5, pady=2)
+        self._vars["tun_lock_status"] = tk.StringVar(value="N/A")
+        self._tun_lock_entry = ttk.Entry(
+            sum_f, textvariable=self._vars["tun_lock_status"],
+            state="disabled", width=18)
+        self._tun_lock_entry.grid(row=3, column=1, sticky="ew", padx=5, pady=2)
+        self._bind_copy_menu(self._tun_lock_entry, self._vars["tun_lock_status"])
+        self._tun_lock_btn = ttk.Button(sum_f, text="Check Lock", command=self._tun_check_lock)
+        self._tun_lock_btn.grid(row=3, column=2, padx=(2, 5), pady=2, sticky="e")
+        ttk.Label(sum_f, text="(Valon only)", foreground="grey", font=("TkDefaultFont", 8)).grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 2))
 
         # ---- Status dump ---- #
         st_f = ttk.LabelFrame(frame, text="Tuner Status (full)")
@@ -2437,15 +2509,12 @@ class MEPGui:
         ttk.Button(ctrl_f, text="Restart Tuner",
                    command=self._tun_restart).grid(
             row=5, column=0, columnspan=4, padx=4, pady=3, sticky="ew")
-        _lock_btn = ttk.Button(ctrl_f, text="Check Lock  (Valon only)",
-                               command=self._tun_check_lock)
-        _lock_btn.grid(row=6, column=0, columnspan=4, padx=4, pady=3, sticky="ew")
         ttk.Button(ctrl_f, text="Publish: Get Status",
                    command=self._tun_send_status).grid(
-            row=7, column=0, columnspan=4, padx=4, pady=3, sticky="ew")
+            row=6, column=0, columnspan=4, padx=4, pady=3, sticky="ew")
 
         # Gate Valon-only widgets on the active tuner name
-        self._valon_only_widgets = [_pw_entry, _pw_set_btn, _pw_get_btn, _lock_btn]
+        self._valon_only_widgets = [_pw_entry, _pw_set_btn, _pw_get_btn, self._tun_lock_btn]
         self._vars["tun_name"].trace_add(
             "write", lambda *_: self._tun_update_capability_buttons())
         self._tun_update_capability_buttons()   # apply correct state at build time
@@ -3691,11 +3760,32 @@ class MEPGui:
 
     def _soc_refresh(self):
         """Query RFSoC telemetry and update SOC tab fields."""
-        if self.mep is None:
-            logging.warning("SOC: no controller connected — start a capture first")
-            return
         def _query():
-            tlm = self.mep._get_tlm(timeout_s=3.0)
+            self._monitor_rfsoc_tlm_event.clear()
+            payload = {"task_name": "get", "arguments": ["tlm"]}
+            try:
+                mqtt_publish.single(
+                    RFSOC_CMD_TOPIC,
+                    json.dumps(payload),
+                    hostname=MQTT_BROKER,
+                    port=MQTT_PORT,
+                )
+            except Exception as e:
+                logging.error(f"SOC: get tlm publish failed: {e}")
+                return
+
+            tlm = None
+            if self._monitor_rfsoc_tlm_event.wait(timeout=2.5):
+                with self._monitor_rfsoc_tlm_lock:
+                    if isinstance(self._monitor_rfsoc_tlm, dict):
+                        tlm = dict(self._monitor_rfsoc_tlm)
+
+            # Fallback to most recently cached telemetry if no immediate response arrived.
+            if tlm is None:
+                with self._monitor_rfsoc_tlm_lock:
+                    if isinstance(self._monitor_rfsoc_tlm, dict):
+                        tlm = dict(self._monitor_rfsoc_tlm)
+
             if tlm is None:
                 logging.warning("SOC: no telemetry response")
                 return
@@ -3721,6 +3811,43 @@ class MEPGui:
         except Exception as e:
             logging.error(f"RFSoC reset failed: {e}")
 
+    def _soc_arm_next_pps(self):
+        """Arm RFSoC capture for the next PPS edge."""
+        try:
+            mqtt_publish.single(
+                RFSOC_CMD_TOPIC,
+                json.dumps({"task_name": "capture_next_pps"}),
+                hostname=MQTT_BROKER,
+                port=MQTT_PORT,
+            )
+            logging.info("SOC: capture_next_pps sent (cancel by Reset RFSoC)")
+        except Exception as e:
+            logging.error(f"SOC: capture_next_pps failed: {e}")
+
+    def _soc_set_if_test(self):
+        """Set RFSoC IF frequency directly for bench testing."""
+        try:
+            if_mhz = float(self._vars["soc_if_test"].get().strip())
+        except ValueError:
+            logging.error("SOC: invalid IF frequency value")
+            return
+
+        sweep_active = self._sweep_thread and self._sweep_thread.is_alive()
+        recorder_running = bool(self.mep is not None and self.mep._recorder_running)
+        if sweep_active or recorder_running:
+            logging.warning("SOC: setting IF during active capture/sweep can disrupt capture")
+
+        try:
+            mqtt_publish.single(
+                RFSOC_CMD_TOPIC,
+                json.dumps({"task_name": "set", "arguments": f"freq_IF {if_mhz}"}),
+                hostname=MQTT_BROKER,
+                port=MQTT_PORT,
+            )
+            logging.info(f"SOC: set freq_IF {if_mhz:.3f} MHz sent")
+        except Exception as e:
+            logging.error(f"SOC: set IF failed: {e}")
+
     # ---- TUN helpers ---- #
 
     def _tun_refresh(self):
@@ -3735,6 +3862,10 @@ class MEPGui:
             text = "no status received" if status is None else str(status)
             self._vars["tun_state"].set("—")
             self._vars["tun_name"].set("—")
+            if "tun_freq_summary" in self._vars:
+                self._vars["tun_freq_summary"].set("—")
+            if "tun_lock_status" in self._vars:
+                self._vars["tun_lock_status"].set("N/A")
         else:
             self._vars["tun_state"].set(status.get("state", "—"))
             # name lives in the nested 'tuner' sub-dict
@@ -3744,10 +3875,18 @@ class MEPGui:
                 # Populate freq / power fields from tuner state
                 freq_val = tuner_sub.get("freq_mhz")
                 if freq_val is not None:
+                    if "tun_freq_summary" in self._vars:
+                        self._vars["tun_freq_summary"].set(str(freq_val))
                     self._vars["tun_set_freq"].set(str(freq_val))
+                elif "tun_freq_summary" in self._vars:
+                    self._vars["tun_freq_summary"].set("—")
                 pwr_val = tuner_sub.get("pwr_dbm")
                 if pwr_val is not None:
                     self._vars["tun_set_power"].set(str(pwr_val))
+                if "tun_lock_status" in self._vars:
+                    lock_val = tuner_sub.get("locked")
+                    if isinstance(lock_val, bool):
+                        self._vars["tun_lock_status"].set("Locked" if lock_val else "Unlocked")
             else:
                 name_val = status.get("name", "—")
             self._vars["tun_name"].set(str(name_val) if name_val else "—")
@@ -3775,17 +3914,28 @@ class MEPGui:
         logging.debug("TUN: status text updated")
 
     def _tun_handle_response(self, data: dict):
-        """Handle a tuner command response (get_freq / get_power reply).
+        """Handle a tuner command response (get_freq / get_power / get_lock_status).
         These messages carry 'task_name' and 'value' but no 'state' key.
         Update the corresponding entry field directly.
         """
         task = data.get("task_name", "")
         value = data.get("value")
         if value is None:
+            if task == "get_freq":
+                logging.warning(
+                    "TUN: get_freq returned null. The active tuner did not report a readable frequency value; "
+                    "for LMX2820 this currently appears to be cached-state only, so it stays null until a set_freq succeeds."
+                )
+            elif task == "get_power":
+                logging.warning("TUN: get_power returned null")
+            elif task == "get_lock_status":
+                logging.warning("TUN: get_lock_status returned null")
             return
         if task == "get_freq":
             if "tun_set_freq" not in self._vars:
                 return
+            if "tun_freq_summary" in self._vars:
+                self._vars["tun_freq_summary"].set(str(value))
             self._vars["tun_set_freq"].set(str(value))
             logging.info(f"TUN: freq = {value} MHz")
         elif task == "get_power":
@@ -3793,6 +3943,20 @@ class MEPGui:
                 return
             self._vars["tun_set_power"].set(str(value))
             logging.info(f"TUN: power = {value} dBm")
+        elif task == "get_lock_status":
+            if "tun_lock_status" not in self._vars:
+                return
+            if isinstance(value, dict):
+                locks = [bool(v) for v in value.values() if isinstance(v, bool)]
+                if locks:
+                    state = "Locked" if all(locks) else "Unlocked"
+                    detail = ", ".join(f"{k}={'LOCK' if bool(v) else 'UNLOCK'}" for k, v in value.items())
+                    self._vars["tun_lock_status"].set(f"{state} ({detail})")
+                else:
+                    self._vars["tun_lock_status"].set(str(value))
+            else:
+                self._vars["tun_lock_status"].set(str(value))
+            logging.info(f"TUN: lock status = {self._vars['tun_lock_status'].get()}")
 
     def _tun_init(self):
         """Send init_tuner to tuner_control service."""
@@ -3817,8 +3981,12 @@ class MEPGui:
         elif tuner == "auto":
             payload = {"task_name": "init_tuner", "arguments": {}}
         else:
+            service_tuner = tuner_to_service_name(tuner)
+            if not service_tuner:
+                logging.error(f"TUN: no service mapping for tuner '{tuner}'")
+                return
             payload = {"task_name": "init_tuner",
-                       "arguments": {"force_tuner": tuner}}
+                       "arguments": {"force_tuner": service_tuner}}
         try:
             mqtt_publish.single(TUNER_CMD_TOPIC, json.dumps(payload),
                                 hostname=MQTT_BROKER, port=MQTT_PORT)
@@ -3935,6 +4103,13 @@ class MEPGui:
                 w.configure(state=state)
             except Exception:
                 pass
+        if hasattr(self, "_tun_lock_entry"):
+            try:
+                self._tun_lock_entry.configure(state="readonly" if state == "normal" else "disabled")
+            except Exception:
+                pass
+        if "tun_lock_status" in self._vars and state != "normal":
+            self._vars["tun_lock_status"].set("N/A")
 
     # ---- REC config helpers ---- #
 
