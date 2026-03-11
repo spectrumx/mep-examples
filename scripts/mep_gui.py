@@ -18,6 +18,9 @@ import shutil
 import re
 import math
 import json
+import base64
+import struct
+import time
 import socket
 import subprocess
 import queue
@@ -174,6 +177,22 @@ class MEPGui:
         self._monitor_rfsoc_log_key = None
         self._monitor_rfsoc_tlm_lock = threading.Lock()
         self._monitor_rfsoc_tlm_event = threading.Event()
+        self._spec_lock = threading.Lock()
+        self._spec_topic_prefix = "radiohound/clients/data/"
+        self._spec_topic = self._derive_spec_topic_from_primary_mac()
+        self._spec_stream_enabled = False
+        self._spec_latest = None
+        self._spec_rows = deque(maxlen=180)
+        self._spec_render_pending = False
+        self._spec_bins = 256
+        self._spec_render_interval_ms = 80
+        self._spec_min_ingest_interval_s = 0.03
+        self._spec_last_ingest_mono = 0.0
+        self._spec_frame_seq = 0
+        self._spec_last_rendered_seq = -1
+        self._spec_wf_row_counter = 0
+        self._spec_wf_row_tags = deque()
+        self._spec_color_lut = self._spec_build_color_lut()
 
         self._build_ui()
         self._setup_logging()
@@ -215,6 +234,47 @@ class MEPGui:
         if "10" in self.SAMPLE_RATE_OPTIONS:
             return "10"
         return self.SAMPLE_RATE_OPTIONS[0]
+
+    def _derive_spec_topic_from_primary_mac(self) -> str:
+        """Build radiohound data topic from the system primary-route MAC address.
+
+        This is intentionally strict: if the primary interface or MAC cannot be
+        resolved, startup fails rather than silently using an incorrect topic.
+        """
+        primary_if = None
+        try:
+            with open("/proc/net/route", "r", encoding="utf-8") as fh:
+                next(fh, None)  # header
+                for line in fh:
+                    cols = line.strip().split()
+                    if len(cols) < 4:
+                        continue
+                    iface, dest_hex, _gateway_hex, flags_hex = cols[0], cols[1], cols[2], cols[3]
+                    if dest_hex != "00000000":
+                        continue
+                    flags = int(flags_hex, 16)
+                    if (flags & 0x2) == 0:
+                        continue
+                    primary_if = iface
+                    break
+        except Exception as e:
+            raise RuntimeError(f"SPEC topic derivation failed reading /proc/net/route: {e}")
+
+        if not primary_if:
+            raise RuntimeError("SPEC topic derivation failed: no primary route interface found")
+
+        mac_path = f"/sys/class/net/{primary_if}/address"
+        try:
+            with open(mac_path, "r", encoding="utf-8") as fh:
+                mac = fh.read().strip().lower()
+        except Exception as e:
+            raise RuntimeError(f"SPEC topic derivation failed reading {mac_path}: {e}")
+
+        if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", mac):
+            raise RuntimeError(f"SPEC topic derivation failed: invalid MAC '{mac}' on {primary_if}")
+
+        node_id = mac.replace(":", "")
+        return f"{self._spec_topic_prefix}{node_id}"
 
     # ------------------------------------------------------------------ #
     #  Direct gpsd monitor                                                #
@@ -851,6 +911,9 @@ class MEPGui:
                         if self._adv_tabs_built and "tun_state" in self._vars:
                             self.root.after(0, self._tun_refresh)
 
+            elif topic.startswith(self._spec_topic_prefix):
+                self._spec_handle_stream_message(topic, data)
+
         mon = mqtt_client.Client(
             callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2,
             client_id="mep_gui_monitor",
@@ -890,6 +953,10 @@ class MEPGui:
         self.root.rowconfigure(0, weight=1)
 
         self._vars = {}
+        # REC vars must exist even before Advanced/REC tab is built.
+        self._vars["rec_status"] = tk.StringVar(value="—")
+        self._vars["rec_status_file"] = tk.StringVar(value="—")
+        self._vars["rec_active_config"] = tk.StringVar(value="—")
 
         # Horizontal split container with a draggable sash (resize handle).
         self._main_pane = tk.PanedWindow(
@@ -1013,27 +1080,37 @@ class MEPGui:
 
         ttk.Label(frame, text="Capture Name").grid(
             row=0, column=0, sticky="w", padx=5, pady=4)
-        import datetime
-        default_capture_name = datetime.datetime.now().strftime("capture_%Y%m%d_%H%M%S")
-        self._vars["capture_name"] = tk.StringVar(value=default_capture_name)
+        self._vars["capture_name"] = tk.StringVar(value="")
         ttk.Entry(frame, textvariable=self._vars["capture_name"], width=20).grid(
             row=0, column=1, columnspan=3, sticky="ew", padx=5, pady=4)
 
+        ttk.Label(
+            frame,
+            text=(
+                "data saved to /data/captures/<<capture_name>>,\n"
+                "or data/captures/livestream if name is blank"
+            ),
+            foreground="grey",
+            font=("TkDefaultFont", 8),
+            anchor="center",
+            justify="center",
+        ).grid(row=1, column=0, columnspan=4, sticky="ew", padx=5, pady=(0, 4))
+
         ttk.Label(frame, text="Channel").grid(
-            row=1, column=0, sticky="w", padx=5, pady=4)
+            row=2, column=0, sticky="w", padx=5, pady=4)
         self._vars["channel"] = tk.StringVar(value="A")
         ttk.Combobox(
             frame, textvariable=self._vars["channel"],
             values=self.CHANNEL_OPTIONS, width=16, state="readonly",
-        ).grid(row=1, column=1, sticky="ew", padx=5, pady=4)
+        ).grid(row=2, column=1, sticky="ew", padx=5, pady=4)
 
         ttk.Label(frame, text="Sample Rate (MHz)").grid(
-            row=1, column=2, sticky="w", padx=5, pady=4)
+            row=2, column=2, sticky="w", padx=5, pady=4)
         self._vars["sample_rate"] = tk.StringVar(value=self._default_sample_rate())
         ttk.Combobox(
             frame, textvariable=self._vars["sample_rate"],
             values=self.SAMPLE_RATE_OPTIONS, width=16, state="readonly",
-        ).grid(row=1, column=3, sticky="ew", padx=5, pady=4)
+        ).grid(row=2, column=3, sticky="ew", padx=5, pady=4)
 
     def _build_updown_section(self, parent: ttk.Frame, row: int):
         """Up/Down Convert section: Tuner, RFSoC IF, Injection Mode, Synth LO."""
@@ -1106,6 +1183,7 @@ class MEPGui:
         tlm_f = ttk.Frame(nb, padding=8)
         jh_f = ttk.Frame(nb, padding=8)
         soc_f = ttk.Frame(nb, padding=8)
+        spec_f = ttk.Frame(nb, padding=8)
         tun_f = ttk.Frame(nb, padding=8)
         mqtt_f = ttk.Frame(nb, padding=8)
         gpsd_f = ttk.Frame(nb, padding=8)
@@ -1117,6 +1195,7 @@ class MEPGui:
         nb.add(tlm_f, text="TLM")
         nb.add(jh_f, text="JET")
         nb.add(soc_f, text="SOC")
+        nb.add(spec_f, text="SPEC")
         nb.add(tun_f, text="TUN")
         nb.add(mqtt_f, text="MQTT")
         nb.bind("<<NotebookTabChanged>>", self._on_advanced_tab_changed)
@@ -1128,6 +1207,7 @@ class MEPGui:
         self._build_tlm_tab(tlm_f)
         self._build_jetson_health_tab(jh_f)
         self._build_soc_tab(soc_f)
+        self._build_spec_tab(spec_f)
         self._build_tun_tab(tun_f)
         self._build_mqtt_tab(mqtt_f)
         self._rec_status_apply_to_ui()
@@ -1143,6 +1223,8 @@ class MEPGui:
     def _on_advanced_tab_changed(self, _event=None):
         if self._is_adv_tab_selected("MQTT"):
             self._mqtt_flush_buffer_to_widget()
+        if self._is_adv_tab_selected("SPEC"):
+            self._spec_request_render()
         if self._is_adv_tab_selected("DOC"):
             self._docker_flush_buffer_to_widget()
 
@@ -2116,7 +2198,7 @@ class MEPGui:
         # ---- Message log (shorter to leave room for publish panel) ---- #
         self._mqtt_text = scrolledtext.ScrolledText(
             frame, height=12, wrap="word", font=("TkFixedFont", 9),
-            background="#f5f5f5")
+            background="#f5f5f5", exportselection=False)
         self._mqtt_text.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 2))
         self._mqtt_text.bind("<Key>",
             lambda e: None if (e.state & 0x4 and e.keysym in ("c", "C", "a", "A"))
@@ -2155,6 +2237,455 @@ class MEPGui:
             wraplength=420,
         )
         self._mqtt_render_from_buffer()
+
+    def _build_spec_tab(self, frame: ttk.Frame):
+        """SPEC tab: live FFT line plot and rolling waterfall from MQTT spectrum frames."""
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
+        frame.rowconfigure(3, weight=1)
+
+        cfg_f = ttk.LabelFrame(frame, text="Stream")
+        cfg_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
+        cfg_f.columnconfigure(1, weight=1)
+        ttk.Label(cfg_f, text="Topic").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["spec_topic"] = tk.StringVar(value=self._spec_topic)
+        self._spec_topic_entry = ttk.Entry(cfg_f, textvariable=self._vars["spec_topic"], exportselection=False)
+        self._spec_topic_entry.grid(
+            row=0, column=1, sticky="ew", padx=5, pady=3
+        )
+        self._bind_copy_menu(self._spec_topic_entry)
+        ttk.Button(cfg_f, text="Stream", command=self._spec_stream_on).grid(
+            row=0, column=2, padx=(2, 2), pady=3
+        )
+        ttk.Button(cfg_f, text="Pause", command=self._spec_stream_off).grid(
+            row=0, column=3, padx=(2, 5), pady=3
+        )
+        self._vars["spec_stream_state"] = tk.StringVar(value="paused")
+        ttk.Label(cfg_f, textvariable=self._vars["spec_stream_state"], foreground="grey").grid(
+            row=1, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 2)
+        )
+
+        ctl_f = ttk.LabelFrame(frame, text="Display")
+        ctl_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        ctl_f.columnconfigure(1, weight=1)
+        self._vars["spec_autoscale"] = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ctl_f, text="Auto color scale", variable=self._vars["spec_autoscale"],
+                        command=self._spec_request_render).grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(ctl_f, text="Min").grid(row=0, column=1, sticky="e", padx=(5, 2), pady=2)
+        self._vars["spec_vmin"] = tk.DoubleVar(value=-120.0)
+        self._spec_min_scale = ttk.Scale(ctl_f, from_=-200.0, to=50.0, variable=self._vars["spec_vmin"],
+                                         command=lambda _v: self._spec_request_render())
+        self._spec_min_scale.grid(row=0, column=2, sticky="ew", padx=2, pady=2)
+        ttk.Label(ctl_f, text="Max").grid(row=0, column=3, sticky="e", padx=(8, 2), pady=2)
+        self._vars["spec_vmax"] = tk.DoubleVar(value=0.0)
+        self._spec_max_scale = ttk.Scale(ctl_f, from_=-200.0, to=50.0, variable=self._vars["spec_vmax"],
+                                         command=lambda _v: self._spec_request_render())
+        self._spec_max_scale.grid(row=0, column=4, sticky="ew", padx=2, pady=2)
+        ttk.Label(ctl_f, text="FFT Bins").grid(row=1, column=0, sticky="w", padx=5, pady=(0, 2))
+        self._vars["spec_bins"] = tk.IntVar(value=self._spec_bins)
+        bin_vals = (64, 128, 256, 512, 1024, 2048)
+        bin_f = ttk.Frame(ctl_f)
+        bin_f.grid(row=1, column=1, columnspan=4, sticky="w", padx=(2, 2), pady=(0, 2))
+        self._spec_bin_buttons = {}
+        for i, n in enumerate(bin_vals):
+            btn = tk.Button(
+                bin_f,
+                text=str(n),
+                width=4,
+                relief="raised",
+                padx=2,
+                pady=1,
+                command=lambda v=n: self._spec_apply_bins(v),
+            )
+            btn.grid(row=0, column=i, padx=(0 if i == 0 else 2, 0), pady=0, sticky="w")
+            self._spec_bin_buttons[n] = btn
+        ctl_f.columnconfigure(2, weight=1)
+        ctl_f.columnconfigure(4, weight=1)
+        self._spec_update_bin_button_states()
+
+        self._spec_line_canvas = tk.Canvas(frame, height=170, background="#111111", highlightthickness=1,
+                                           highlightbackground="#333333")
+        self._spec_line_canvas.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="nsew")
+        self._spec_line_canvas.bind("<Motion>", lambda e: self._spec_cursor_update(e, from_waterfall=False))
+        self._spec_line_canvas.bind("<Button-1>", lambda e: self._spec_cursor_update(e, from_waterfall=False))
+
+        self._spec_wf_canvas = tk.Canvas(frame, height=220, background="#000000", highlightthickness=1,
+                                         highlightbackground="#333333")
+        self._spec_wf_canvas.grid(row=3, column=0, padx=4, pady=(2, 2), sticky="nsew")
+        self._spec_wf_canvas.bind("<Motion>", lambda e: self._spec_cursor_update(e, from_waterfall=True))
+        self._spec_wf_canvas.bind("<Button-1>", lambda e: self._spec_cursor_update(e, from_waterfall=True))
+
+        self._vars["spec_summary"] = tk.StringVar(value="Paused. Press Stream to start SPEC updates")
+        ttk.Label(frame, textvariable=self._vars["spec_summary"], foreground="grey",
+                  font=("TkDefaultFont", 8)).grid(row=4, column=0, sticky="w", padx=4, pady=(0, 2))
+        self._vars["spec_cursor"] = tk.StringVar(value="Cursor: —")
+        ttk.Label(frame, textvariable=self._vars["spec_cursor"], foreground="grey",
+                  font=("TkDefaultFont", 8)).grid(row=5, column=0, sticky="w", padx=4, pady=(0, 2))
+
+        self._add_copyable_note(
+            frame,
+            "Source: MQTT topic radiohound/clients/data/<device-id> (base64 float32 bins)",
+            row=6,
+            wraplength=420,
+        )
+
+    def _spec_apply_topic(self):
+        topic = self._vars.get("spec_topic", tk.StringVar(value=self._spec_topic)).get().strip()
+        if not topic:
+            logging.error("SPEC: topic is empty")
+            return
+        self._spec_topic = topic
+        with self._spec_lock:
+            self._spec_rows.clear()
+            self._spec_latest = None
+            self._spec_last_rendered_seq = -1
+            self._spec_wf_row_counter = 0
+            self._spec_wf_row_tags.clear()
+        if hasattr(self, "_spec_wf_canvas"):
+            self._spec_wf_canvas.delete("all")
+        if hasattr(self, "_spec_line_canvas"):
+            self._spec_line_canvas.delete("all")
+        if "spec_summary" in self._vars:
+            if self._spec_stream_enabled:
+                self._vars["spec_summary"].set(f"Listening on {self._spec_topic}")
+            else:
+                self._vars["spec_summary"].set(f"Paused on {self._spec_topic}. Press Stream to start")
+
+    def _spec_stream_on(self):
+        # Stream always targets the current Topic field value.
+        self._spec_apply_topic()
+        self._spec_stream_enabled = True
+        if "spec_stream_state" in self._vars:
+            self._vars["spec_stream_state"].set("streaming")
+        if "spec_summary" in self._vars and self._spec_latest is None:
+            self._vars["spec_summary"].set(f"Listening on {self._spec_topic}")
+        self._spec_request_render()
+
+    def _spec_stream_off(self):
+        self._spec_stream_enabled = False
+        if "spec_stream_state" in self._vars:
+            self._vars["spec_stream_state"].set("paused")
+        if "spec_summary" in self._vars:
+            self._vars["spec_summary"].set(f"Paused on {self._spec_topic}. Press Stream to start")
+
+    def _spec_update_bin_button_states(self):
+        if not hasattr(self, "_spec_bin_buttons"):
+            return
+        for n, btn in self._spec_bin_buttons.items():
+            if n == self._spec_bins:
+                btn.configure(relief="sunken", bd=3)
+            else:
+                btn.configure(relief="raised", bd=2)
+
+    def _spec_apply_bins(self, n=None):
+        allowed = {64, 128, 256, 512, 1024, 2048}
+        try:
+            if n is None:
+                n = int(self._vars.get("spec_bins", tk.IntVar(value=self._spec_bins)).get())
+            else:
+                n = int(n)
+        except Exception:
+            logging.error("SPEC: bins must be an integer")
+            self._vars["spec_bins"].set(self._spec_bins)
+            self._spec_update_bin_button_states()
+            return
+        if n not in allowed:
+            logging.error("SPEC: bins must be one of 64, 128, 256, 512, 1024, 2048")
+            self._vars["spec_bins"].set(self._spec_bins)
+            self._spec_update_bin_button_states()
+            return
+        self._vars["spec_bins"].set(n)
+        if n == self._spec_bins:
+            self._spec_update_bin_button_states()
+            return
+        self._spec_bins = n
+        self._spec_update_bin_button_states()
+        self._spec_apply_topic()
+        if self._spec_stream_enabled and "spec_summary" in self._vars:
+            self._vars["spec_summary"].set(f"Listening on {self._spec_topic} (bins={self._spec_bins})")
+
+    def _spec_decode_bins(self, data_b64: str):
+        raw = base64.b64decode(data_b64)
+        if len(raw) < 4:
+            return []
+        n = len(raw) // 4
+        raw = raw[: n * 4]
+        return [x[0] for x in struct.iter_unpack("<f", raw)]
+
+    def _spec_resample(self, values, n_out: int):
+        if not values:
+            return []
+        if len(values) == n_out:
+            return list(values)
+        if len(values) < 2:
+            return [float(values[0])] * n_out
+        step = (len(values) - 1) / max(1, n_out - 1)
+        out = []
+        for i in range(n_out):
+            src = i * step
+            j = int(src)
+            frac = src - j
+            if j >= len(values) - 1:
+                out.append(float(values[-1]))
+            else:
+                a = float(values[j])
+                b = float(values[j + 1])
+                out.append(a + (b - a) * frac)
+        return out
+
+    def _spec_build_color_lut(self):
+        lut = []
+        for idx in range(256):
+            t = idx / 255.0
+            if t < 0.33:
+                u = t / 0.33
+                r, g, b = 0, int(255 * u), int(128 + 127 * u)
+            elif t < 0.66:
+                u = (t - 0.33) / 0.33
+                r, g, b = int(255 * u), 255, int(255 * (1.0 - u))
+            else:
+                u = (t - 0.66) / 0.34
+                r, g, b = 255, int(255 * (1.0 - u)), 0
+            lut.append((r, g, b))
+        return lut
+
+    def _spec_render_waterfall_row(self, row, vmin: float, vmax: float):
+        if not row:
+            return
+        ww = max(10, self._spec_wf_canvas.winfo_width())
+        wh = max(10, self._spec_wf_canvas.winfo_height())
+
+        # Shift existing history down by one pixel, then draw newest row at y=0.
+        self._spec_wf_canvas.move("specwf", 0, 1)
+        row_tag = f"specwf_row_{self._spec_wf_row_counter}"
+        self._spec_wf_row_counter += 1
+
+        scale = 255.0 / (vmax - vmin) if vmax > vmin else 0.0
+        n = len(row)
+        for i, v in enumerate(row):
+            x0 = int(i * ww / n)
+            x1 = int((i + 1) * ww / n)
+            if x1 <= x0:
+                x1 = x0 + 1
+            if scale <= 0.0:
+                idx = 0
+            else:
+                idx = int((float(v) - vmin) * scale)
+                if idx < 0:
+                    idx = 0
+                elif idx > 255:
+                    idx = 255
+            r, g, b = self._spec_color_lut[idx]
+            self._spec_wf_canvas.create_rectangle(
+                x0, 0, x1, 1,
+                outline="",
+                fill=f"#{r:02x}{g:02x}{b:02x}",
+                tags=("specwf", row_tag),
+            )
+
+        self._spec_wf_row_tags.append(row_tag)
+        while len(self._spec_wf_row_tags) > wh:
+            stale = self._spec_wf_row_tags.popleft()
+            self._spec_wf_canvas.delete(stale)
+
+    def _spec_get_abs_freq_limits(self, latest: dict, n_bins: int):
+        cf = latest.get("center_frequency")
+        fmin_off = latest.get("fmin")
+        fmax_off = latest.get("fmax")
+        if isinstance(cf, (int, float)) and isinstance(fmin_off, (int, float)) and isinstance(fmax_off, (int, float)):
+            return float(cf + fmin_off), float(cf + fmax_off)
+        return 0.0, float(max(0, n_bins - 1))
+
+    def _spec_fmt_freq(self, hz: float):
+        return f"{hz/1e6:.3f} MHz"
+
+    def _spec_amp_to_db(self, amp: float):
+        # Convert linear amplitude to dBFS-like scale with floor protection.
+        a = abs(float(amp))
+        if a < 1e-12:
+            a = 1e-12
+        return 20.0 * math.log10(a)
+
+    def _spec_fmt_amp(self, amp: float):
+        return f"{float(amp):.2f} dB"
+
+    def _spec_bin_to_freq(self, idx: int, n_bins: int, latest: dict):
+        f0, f1 = self._spec_get_abs_freq_limits(latest, n_bins)
+        if n_bins <= 1:
+            return f0
+        return f0 + (f1 - f0) * (idx / (n_bins - 1))
+
+    def _spec_cursor_update(self, event, from_waterfall: bool):
+        with self._spec_lock:
+            latest = dict(self._spec_latest) if isinstance(self._spec_latest, dict) else None
+            rows = list(self._spec_rows)
+        if not latest or not rows:
+            return
+
+        if from_waterfall:
+            canvas = self._spec_wf_canvas
+        else:
+            canvas = self._spec_line_canvas
+        w = max(10, canvas.winfo_width())
+
+        row_latest = latest.get("row", [])
+        n = len(row_latest)
+        if n <= 0:
+            return
+
+        x = 0 if event.x < 0 else (w - 1 if event.x >= w else event.x)
+        idx = int(round(x * (n - 1) / max(1, w - 1)))
+        idx = 0 if idx < 0 else (n - 1 if idx >= n else idx)
+        freq_hz = self._spec_bin_to_freq(idx, n, latest)
+
+        if from_waterfall:
+            h = max(1, self._spec_wf_canvas.winfo_height())
+            y = 0 if event.y < 0 else (h - 1 if event.y >= h else event.y)
+            row_offset = int(y)
+            if row_offset >= len(rows):
+                row_offset = len(rows) - 1
+            entry = rows[-1 - row_offset]
+            amp = float(entry["row"][idx])
+            ts = entry.get("ts", "?")
+            label = f"Cursor: f={self._spec_fmt_freq(freq_hz)}  t={ts}  amp={self._spec_fmt_amp(amp)}"
+        else:
+            amp = float(row_latest[idx])
+            ts = latest.get("ts", "?")
+            label = f"Cursor: f={self._spec_fmt_freq(freq_hz)}  t={ts}  amp={self._spec_fmt_amp(amp)}"
+
+        if "spec_cursor" in self._vars:
+            self._vars["spec_cursor"].set(label)
+
+    def _spec_handle_stream_message(self, topic: str, data: dict):
+        if not self._spec_stream_enabled:
+            return
+        if topic != self._spec_topic:
+            return
+        now = time.monotonic()
+        if (now - self._spec_last_ingest_mono) < self._spec_min_ingest_interval_s:
+            return
+        self._spec_last_ingest_mono = now
+        try:
+            bins = self._spec_decode_bins(data.get("data", ""))
+        except Exception as e:
+            logging.debug(f"SPEC: decode failed: {e}")
+            return
+        if not bins:
+            return
+        row_lin = self._spec_resample(bins, self._spec_bins)
+        row = [self._spec_amp_to_db(v) for v in row_lin]
+        metadata = data.get("metadata", {}) if isinstance(data.get("metadata"), dict) else {}
+        with self._spec_lock:
+            self._spec_rows.append({"row": row, "ts": data.get("timestamp")})
+            self._spec_frame_seq += 1
+            self._spec_latest = {
+                "ts": data.get("timestamp"),
+                "center_frequency": data.get("center_frequency"),
+                "sample_rate": data.get("sample_rate"),
+                "n": len(bins),
+                "row": row,
+                "fmin": metadata.get("fmin"),
+                "fmax": metadata.get("fmax"),
+                "scan_time": metadata.get("scan_time"),
+            }
+        if self._is_adv_tab_selected("SPEC"):
+            self.root.after(0, self._spec_request_render)
+
+    def _spec_request_render(self):
+        if not self._spec_stream_enabled:
+            return
+        if self._spec_render_pending:
+            return
+        self._spec_render_pending = True
+        self.root.after(self._spec_render_interval_ms, self._spec_render)
+
+    def _spec_render(self):
+        self._spec_render_pending = False
+        if not hasattr(self, "_spec_line_canvas") or not hasattr(self, "_spec_wf_canvas"):
+            return
+        with self._spec_lock:
+            latest = dict(self._spec_latest) if isinstance(self._spec_latest, dict) else None
+            rows = list(self._spec_rows)
+            seq = self._spec_frame_seq
+        if not latest or not rows:
+            return
+        if seq == self._spec_last_rendered_seq:
+            return
+        self._spec_last_rendered_seq = seq
+
+        vals = latest.get("row", [])
+        if not vals:
+            return
+
+        auto = bool(self._vars.get("spec_autoscale", tk.BooleanVar(value=True)).get())
+        if auto:
+            vmin = min(min(r["row"]) for r in rows)
+            vmax = max(max(r["row"]) for r in rows)
+        else:
+            vmin = float(self._vars.get("spec_vmin", tk.DoubleVar(value=-120.0)).get())
+            vmax = float(self._vars.get("spec_vmax", tk.DoubleVar(value=0.0)).get())
+
+        self._spec_line_canvas.delete("all")
+        w = max(10, self._spec_line_canvas.winfo_width())
+        h = max(10, self._spec_line_canvas.winfo_height())
+        n = len(vals)
+        points = []
+        for i, v in enumerate(vals):
+            x = int(i * (w - 1) / max(1, n - 1))
+            y_norm = 0.0 if vmax <= vmin else (float(v) - vmin) / (vmax - vmin)
+            y_norm = 0.0 if y_norm < 0.0 else (1.0 if y_norm > 1.0 else y_norm)
+            y = int((1.0 - y_norm) * (h - 1))
+            points.extend((x, y))
+        if len(points) >= 4:
+            self._spec_line_canvas.create_line(*points, fill="#6ad7ff", width=1)
+        self._spec_line_canvas.create_text(6, 6, anchor="nw", fill="#cccccc", text="Live FFT")
+        self._spec_line_canvas.create_text(6, h // 2, anchor="w", fill="#aaaaaa", text="Amplitude (dB)")
+        self._spec_line_canvas.create_text(6, 20, anchor="nw", fill="#888888", text=f"max {self._spec_fmt_amp(vmax)}")
+        self._spec_line_canvas.create_text(6, h - 20, anchor="sw", fill="#888888", text=f"min {self._spec_fmt_amp(vmin)}")
+        f0, f1 = self._spec_get_abs_freq_limits(latest, n)
+        self._spec_line_canvas.create_text(6, h - 4, anchor="sw", fill="#aaaaaa",
+                                           text=self._spec_fmt_freq(f0))
+        self._spec_line_canvas.create_text(w - 6, h - 4, anchor="se", fill="#aaaaaa",
+                                           text=self._spec_fmt_freq(f1))
+        self._spec_line_canvas.create_text(w // 2, h - 4, anchor="s", fill="#aaaaaa",
+                                           text="Frequency")
+
+        self._spec_render_waterfall_row(vals, vmin, vmax)
+        self._spec_wf_canvas.delete("specwf_label")
+        wf_w = max(10, self._spec_wf_canvas.winfo_width())
+        wf_h = max(10, self._spec_wf_canvas.winfo_height())
+        self._spec_wf_canvas.create_text(6, 6, anchor="nw", fill="#cccccc",
+                                         text="Waterfall", tags=("specwf_label",))
+        scan_t = latest.get("scan_time")
+        if isinstance(scan_t, (int, float)) and scan_t > 0:
+            visible_rows = max(1, len(self._spec_wf_row_tags))
+            span = scan_t * visible_rows
+            self._spec_wf_canvas.create_text(wf_w // 2, 6,
+                                             anchor="n", fill="#aaaaaa", text="now",
+                                             tags=("specwf_label",))
+            self._spec_wf_canvas.create_text(wf_w // 2, wf_h - 4,
+                                             anchor="s", fill="#aaaaaa",
+                                             text=f"-{span:.1f} s", tags=("specwf_label",))
+        self._spec_wf_canvas.create_text(wf_w // 2,
+                                         wf_h - 20,
+                                         anchor="s", fill="#aaaaaa", text="Time",
+                                         tags=("specwf_label",))
+        self._spec_wf_canvas.create_text(6, self._spec_wf_canvas.winfo_height() - 18,
+                                         anchor="sw", fill="#aaaaaa", text=self._spec_fmt_freq(f0),
+                                         tags=("specwf_label",))
+        self._spec_wf_canvas.create_text(self._spec_wf_canvas.winfo_width() - 6,
+                                         self._spec_wf_canvas.winfo_height() - 18,
+                                         anchor="se", fill="#aaaaaa", text=self._spec_fmt_freq(f1),
+                                         tags=("specwf_label",))
+
+        if "spec_summary" in self._vars:
+            ts = latest.get("ts", "?")
+            cf = latest.get("center_frequency", "?")
+            sr = latest.get("sample_rate", "?")
+            n_in = latest.get("n", "?")
+            self._vars["spec_summary"].set(
+                f"ts={ts}   cf={cf} Hz   sr={sr} Hz   bins={n_in}"
+            )
 
     def _mqtt_publish_manual(self):
         """Publish an arbitrary MQTT message from the manual publish panel."""
@@ -2267,26 +2798,44 @@ class MEPGui:
         self._mqtt_flush_buffer_to_widget()
 
     def _bind_copy_menu(self, widget, strvar=None):
-        """Attach a right-click Copy menu + Ctrl+C to any Entry or Text widget."""
+        """Attach right-click Copy/Paste + Ctrl+C for Entry/Text widgets."""
         menu = tk.Menu(widget, tearoff=0)
+        def _popup_menu(e):
+            # On Linux/X11, default right-click handlers can clear the current
+            # selection before the context menu command runs.
+            menu.tk_popup(e.x_root, e.y_root)
+            return "break"
+
         def _copy():
             try:
-                sel = widget.selection_get()
-            except tk.TclError:
-                if strvar is not None:
-                    sel = strvar.get()
+                if isinstance(widget, (tk.Text, scrolledtext.ScrolledText)):
+                    ranges = widget.tag_ranges("sel")
+                    if len(ranges) < 2:
+                        return
+                    sel = widget.get(ranges[0], ranges[1])
+                elif isinstance(widget, (tk.Entry, ttk.Entry, ttk.Spinbox, tk.Spinbox)):
+                    if not widget.selection_present():
+                        return
+                    sel = widget.selection_get()
                 else:
-                    try:
-                        sel = widget.get("1.0", "end-1c")
-                    except Exception:
-                        try:
-                            sel = widget.get()
-                        except Exception:
-                            return
+                    sel = widget.selection_get()
+            except Exception:
+                return
             self.root.clipboard_clear()
             self.root.clipboard_append(sel)
+
+        def _paste():
+            try:
+                data = self.root.clipboard_get()
+            except Exception:
+                return
+            try:
+                widget.insert("insert", data)
+            except Exception:
+                return
         menu.add_command(label="Copy", command=_copy)
-        widget.bind("<Button-3>", lambda e: menu.post(e.x_root, e.y_root))
+        menu.add_command(label="Paste", command=_paste)
+        widget.bind("<Button-3>", _popup_menu)
         widget.bind("<Control-c>", lambda e: (_copy(), "break")[1])
 
     def _add_copyable_note(self, parent, text: str, row: int, wraplength: int = 420):
@@ -4160,7 +4709,8 @@ class MEPGui:
 
         ttk.Label(status_frame, text="State").grid(
             row=0, column=0, sticky="w", padx=5, pady=2)
-        self._vars["rec_status"] = tk.StringVar(value="—")
+        if "rec_status" not in self._vars:
+            self._vars["rec_status"] = tk.StringVar(value="—")
         _se = ttk.Entry(status_frame, textvariable=self._vars["rec_status"],
                         state="readonly", width=18)
         _se.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
@@ -4168,7 +4718,8 @@ class MEPGui:
 
         ttk.Label(status_frame, text="File").grid(
             row=1, column=0, sticky="w", padx=5, pady=2)
-        self._vars["rec_status_file"] = tk.StringVar(value="—")
+        if "rec_status_file" not in self._vars:
+            self._vars["rec_status_file"] = tk.StringVar(value="—")
         _fe = ttk.Entry(status_frame, textvariable=self._vars["rec_status_file"],
                         state="readonly", width=18)
         _fe.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
@@ -4251,7 +4802,8 @@ class MEPGui:
 
         ttk.Label(cfg_frame, text="Active Config").grid(
             row=0, column=0, sticky="w", padx=5, pady=3)
-        self._vars["rec_active_config"] = tk.StringVar(value="—")
+        if "rec_active_config" not in self._vars:
+            self._vars["rec_active_config"] = tk.StringVar(value="—")
         ttk.Entry(cfg_frame, textvariable=self._vars["rec_active_config"],
                   state="readonly", width=12).grid(
             row=0, column=1, sticky="ew", padx=5, pady=3)
@@ -4567,7 +5119,8 @@ class MEPGui:
             )
             # Update active config display
             config_name = f"sr{params['sample_rate']}MHz"
-            self._vars["rec_active_config"].set(config_name)
+            if "rec_active_config" in self._vars:
+                self._vars["rec_active_config"].set(config_name)
 
         # Runtime fields can change without recreating controller/tuner session.
         self.mep.channel = params["channel"]
@@ -4577,7 +5130,8 @@ class MEPGui:
 
         # Keep active config display in sync with current sample-rate selection.
         config_name = f"sr{params['sample_rate']}MHz"
-        self._vars["rec_active_config"].set(config_name)
+        if "rec_active_config" in self._vars:
+            self._vars["rec_active_config"].set(config_name)
 
         return self.mep
 
