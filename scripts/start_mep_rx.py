@@ -100,6 +100,10 @@ class MEPController:
         self._active_sample_rate = None
         self._recorder_running   = False
 
+        # Tuner lifecycle state
+        self._tuner_initialized = False
+        self._resolved_tuner    = None
+
         # Stop flag — set by request_stop() to interrupt _dwell() and run_sweep()
         self._stop_flag = threading.Event()
 
@@ -125,6 +129,10 @@ class MEPController:
         self._client.connect(broker, port, keepalive=60)
         self._client.loop_start()
         time.sleep(0.5)
+
+        # Initialize tuner once for this controller lifecycle.
+        if self.tuner is not None:
+            self._ensure_tuner_initialized(force=False)
 
     # ------------------------------------------------------------------ #
     #  MQTT internals                                                      #
@@ -239,6 +247,39 @@ class MEPController:
                         return resolved
         return None
 
+    def _ensure_tuner_initialized(self, force: bool = False) -> str:
+        """Initialize tuner once, or re-initialize when force=True."""
+        if self.tuner is None:
+            self._tuner_initialized = False
+            self._resolved_tuner = None
+            return "NONE"
+
+        if self._tuner_initialized and not force:
+            return self._resolved_tuner or "AUTO"
+
+        if self.tuner.lower() == "auto":
+            logging.info("Initializing tuner (auto)")
+            self._publish(TUNER_CMD_TOPIC, {"task_name": "init_tuner", "arguments": {}})
+            init_status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
+            resolved_tuner = self._extract_tuner_name(init_status) or "AUTO"
+            logging.info(f"Auto tuner resolved to: {resolved_tuner}")
+        else:
+            resolved_tuner = self.tuner.upper()
+            logging.info(f"Initializing tuner ({resolved_tuner})")
+            self._publish(TUNER_CMD_TOPIC, {
+                "task_name": "init_tuner",
+                "arguments": {"force_tuner": self.tuner},
+            })
+            _ = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
+
+        self._resolved_tuner = resolved_tuner
+        self._tuner_initialized = True
+        return resolved_tuner
+
+    def reinit_tuner(self) -> str:
+        """Explicitly re-initialize tuner; intended for manual TUN-tab action."""
+        return self._ensure_tuner_initialized(force=True)
+
     def disconnect(self):
         self._client.loop_stop()
         self._client.disconnect()
@@ -341,7 +382,7 @@ class MEPController:
         Full tune + capture-arm sequence for one frequency step.
 
         TUNER_NO:   Reset → set NCO to f_hz → metadata → channel → capture
-        TUNER_YES:  Reset → set fixed IF → init tuner (auto or forced) →
+        TUNER_YES:  Reset → set fixed IF →
                     compute LO (low/high side) → set LO → PLL check →
                     metadata → channel → capture → TLM
         """
@@ -361,24 +402,10 @@ class MEPController:
             if self.adc_if is None:
                 raise ValueError("adc_if is required when a tuner is specified")
 
-            resolved_tuner = self.tuner.upper()
+            resolved_tuner = self._ensure_tuner_initialized(force=False)
 
             # Set fixed IF
             self._publish(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {self.adc_if}"})
-            time.sleep(0.1)
-
-            # Init tuner: auto-select or force a specific type
-            if self.tuner.lower() == "auto":
-                logging.debug("Tuner: auto-select (not forcing tuner type)")
-                self._publish(TUNER_CMD_TOPIC, {"task_name": "init_tuner", "arguments": {}})
-                init_status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
-                resolved_tuner = self._extract_tuner_name(init_status) or "AUTO"
-                logging.info(f"Auto tuner resolved to: {resolved_tuner}")
-            else:
-                self._publish(TUNER_CMD_TOPIC, {
-                    "task_name": "init_tuner",
-                    "arguments": {"force_tuner": self.tuner},
-                })
             time.sleep(0.1)
 
             # LO calculation depends on injection side
@@ -429,12 +456,15 @@ class MEPController:
     #  Scan recipes  (from "Start Scan" flowchart)                        #
     # ------------------------------------------------------------------ #
 
-    def run_single(self, f_hz: float):
+    def run_single(self, f_hz: float, dwell_s: float = None):
         """
         Single-frequency capture with 'what changed' recorder logic.
 
         Sample rate or channel changed → stop recorder, tune_and_arm, restart recorder
         Frequency only (or first run)  → tune_and_arm; start recorder if not running
+
+        If dwell_s is given (and > 0), blocks for that duration then stops the recorder.
+        Without dwell_s the recorder keeps running until stopped explicitly.
         """
         sample_rate_changed = (self.sample_rate != self._active_sample_rate)
         channel_changed     = (self.channel     != self._active_channel)
@@ -453,6 +483,10 @@ class MEPController:
             if not self._recorder_running:
                 self.start_recorder()
 
+        if dwell_s is not None and dwell_s > 0:
+            self._dwell(dwell_s)
+            self.stop_recorder()
+
     def run_sweep(self, freqs_hz, dwell_s: float, restart_interval: int = None):
         """
         Sweep recipe: start recorder once, tune_and_arm + dwell per step.
@@ -466,18 +500,21 @@ class MEPController:
         self.start_recorder()
         last_restart = time.time()
 
-        for f_hz in freqs_hz:
-            if self._stop_flag.is_set():
-                logging.info("Sweep interrupted by stop flag")
-                break
+        try:
+            for f_hz in freqs_hz:
+                if self._stop_flag.is_set():
+                    logging.info("Sweep interrupted by stop flag")
+                    break
 
-            if restart_interval is not None and time.time() - last_restart >= restart_interval:
-                logging.info("Restart interval reached — restarting recorder")
-                self.start_recorder()
-                last_restart = time.time()
+                if restart_interval is not None and time.time() - last_restart >= restart_interval:
+                    logging.info("Restart interval reached — restarting recorder")
+                    self.start_recorder()
+                    last_restart = time.time()
 
-            self.tune_and_arm(f_hz)
-            self._dwell(dwell_s)
+                self.tune_and_arm(f_hz)
+                self._dwell(dwell_s)
+        finally:
+            self.stop_recorder()
 
     # ------------------------------------------------------------------ #
     #  Utilities                                                           #

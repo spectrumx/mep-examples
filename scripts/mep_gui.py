@@ -168,6 +168,7 @@ class MEPGui:
         self._docker_log_scope = None
         self._docker_action_busy = False
         self._docker_compose_cmd_cache = None
+        self._docker_suppress_tree_stream = False
 
         self._build_ui()
         self._setup_logging()
@@ -951,13 +952,28 @@ class MEPGui:
         self._tune_notebook.add(single_f, text="Single")
         self._tune_notebook.add(sweep_f,  text="Sweep")
 
-        # Single tab: Freq only
+        # Shared vars used by both tabs — initialize before any widget references them
+        self._vars["freq_start"]           = tk.StringVar(value="7000")
+        self._vars["dwell"]                = tk.StringVar(value="5")
+        self._vars["single_dwell_enabled"] = tk.BooleanVar(value=False)
+
+        # Single tab: Freq + optional timed Dwell
         single_f.columnconfigure(1, weight=1)
-        self._vars["freq_start"] = tk.StringVar(value="7000")
+        single_f.columnconfigure(2, weight=0)
         ttk.Label(single_f, text="Freq (MHz)").grid(
             row=0, column=0, sticky="w", padx=5, pady=4)
         ttk.Entry(single_f, textvariable=self._vars["freq_start"], width=20).grid(
-            row=0, column=1, sticky="ew", padx=5, pady=4)
+            row=0, column=1, columnspan=2, sticky="ew", padx=5, pady=4)
+        ttk.Label(single_f, text="Dwell (s)").grid(
+            row=1, column=0, sticky="w", padx=5, pady=4)
+        self._single_dwell_entry = ttk.Entry(
+            single_f, textvariable=self._vars["dwell"], width=14, state="disabled")
+        self._single_dwell_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=4)
+        ttk.Checkbutton(
+            single_f, text="Enable",
+            variable=self._vars["single_dwell_enabled"],
+            command=self._toggle_single_dwell,
+        ).grid(row=1, column=2, sticky="w", padx=5, pady=4)
 
         # Sweep tab: Start, End, Step, Dwell
         sweep_f.columnconfigure(1, weight=1)
@@ -984,7 +1000,9 @@ class MEPGui:
 
         ttk.Label(frame, text="Capture Name").grid(
             row=0, column=0, sticky="w", padx=5, pady=4)
-        self._vars["capture_name"] = tk.StringVar(value="")
+        import datetime
+        default_capture_name = datetime.datetime.now().strftime("capture_%Y%m%d_%H%M%S")
+        self._vars["capture_name"] = tk.StringVar(value=default_capture_name)
         ttk.Entry(frame, textvariable=self._vars["capture_name"], width=20).grid(
             row=0, column=1, columnspan=3, sticky="ew", padx=5, pady=4)
 
@@ -1278,8 +1296,9 @@ class MEPGui:
                 self._vars["docker_last_refresh"].set(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
                 selected = self._vars["docker_service"].get().strip()
-                if (not selected) or (selected not in self._docker_services):
-                    self._vars["docker_service"].set(self._docker_service_names[0] if self._docker_service_names else "")
+                if selected and selected not in self._docker_services:
+                    # Previously selected service disappeared — clear it, but don't auto-pick
+                    self._vars["docker_service"].set("")
 
                 self._docker_render_service_list()
                 self._docker_apply_selected_service()
@@ -1314,9 +1333,11 @@ class MEPGui:
 
         selected = self._vars["docker_service"].get().strip()
         if selected and selected in self._docker_services:
+            self._docker_suppress_tree_stream = True
             tree.selection_set(selected)
             tree.focus(selected)
             tree.see(selected)
+            self._docker_suppress_tree_stream = False
 
     def _docker_on_service_tree_select(self, _event=None):
         tree = getattr(self, "_docker_services_tree", None)
@@ -1329,8 +1350,10 @@ class MEPGui:
         self._docker_apply_selected_service()
 
         mode = self._vars.get("docker_log_mode", tk.StringVar()).get().strip().lower()
-        if mode == "selected":
-            self._docker_stream_start(restart=self._docker_log_busy)
+        if not self._docker_suppress_tree_stream:
+            mode = self._vars.get("docker_log_mode", tk.StringVar()).get().strip().lower()
+            if mode == "selected":
+                self._docker_stream_start(restart=self._docker_log_busy)
 
     def _docker_apply_selected_service(self, *_):
         svc = self._vars.get("docker_service", tk.StringVar()).get().strip()
@@ -3774,6 +3797,21 @@ class MEPGui:
     def _tun_init(self):
         """Send init_tuner to tuner_control service."""
         tuner = self._vars["tuner"].get()
+        if self.mep is not None:
+            try:
+                selected_tuner = None if tuner == "None" else tuner
+                self.mep.tuner = selected_tuner
+                adc_if_s = self._vars["adc_if"].get().strip()
+                self.mep.adc_if = float(adc_if_s) if (adc_if_s and selected_tuner) else None
+                self.mep.injection = self._vars["injection_mode"].get().lower() if selected_tuner else None
+                resolved = self.mep.reinit_tuner()
+                logging.info(f"TUN: tuner re-initialized via controller ({resolved})")
+                if tuner.lower() == "valon":
+                    self.root.after(3000, self._tun_check_lock)
+                return
+            except Exception as e:
+                logging.error(f"TUN init via controller failed: {e}")
+
         if tuner == "None":
             payload = {"task_name": "init_tuner", "arguments": {}}
         elif tuner == "auto":
@@ -4251,6 +4289,15 @@ class MEPGui:
         sample_rate = int(self._vars["sample_rate"].get())
         injection   = self._vars["injection_mode"].get().lower()  # "high" or "low"
 
+        dwell_enabled = self._vars["single_dwell_enabled"].get()
+        dwell_raw     = self._vars["dwell"].get().strip()
+        try:
+            dwell_s = float(dwell_raw) if (dwell_enabled and dwell_raw) else None
+        except ValueError:
+            raise ValueError(f"Invalid dwell value: {dwell_raw!r}")
+        if dwell_s is not None and dwell_s <= 0:
+            dwell_s = None  # 0 or negative = no auto-stop
+
         return {
             "freq_start":   freq_start,
             "channel":      channel,
@@ -4259,6 +4306,7 @@ class MEPGui:
             "capture_name": capture_name,
             "sample_rate":  sample_rate,
             "injection":    injection,
+            "dwell":        dwell_s,
         }
 
     def _parse_sweep_params(self) -> dict:
@@ -4303,17 +4351,16 @@ class MEPGui:
 
     def _get_or_create_mep(self, params: dict) -> MEPController:
         """
-        Return the existing MEPController when config is unchanged.
-        Otherwise disconnect the old one and create a fresh connection.
+        Return a stable MEPController and update runtime fields in place.
+
+        Recreate only when tuner identity/fixed IF changes. Channel, sample rate,
+        injection mode, and capture name are runtime parameters and do not require
+        reconnecting the controller or reinitializing tuner state.
         """
         needs_new = (
             self.mep is None
-            or self.mep.channel       != params["channel"]
-            or self.mep.sample_rate   != params["sample_rate"]
             or self.mep.tuner         != params["tuner"]
             or self.mep.adc_if        != params["adc_if"]
-            or self.mep.capture_name  != params["capture_name"]
-            or self.mep.injection     != params["injection"]
         )
 
         if needs_new:
@@ -4347,11 +4394,26 @@ class MEPGui:
             config_name = f"sr{params['sample_rate']}MHz"
             self._vars["rec_active_config"].set(config_name)
 
+        # Runtime fields can change without recreating controller/tuner session.
+        self.mep.channel = params["channel"]
+        self.mep.sample_rate = params["sample_rate"]
+        self.mep.capture_name = params["capture_name"]
+        self.mep.injection = params["injection"]
+
+        # Keep active config display in sync with current sample-rate selection.
+        config_name = f"sr{params['sample_rate']}MHz"
+        self._vars["rec_active_config"].set(config_name)
+
         return self.mep
 
     # ------------------------------------------------------------------ #
     #  Button handlers                                                     #
     # ------------------------------------------------------------------ #
+
+    def _toggle_single_dwell(self):
+        """Enable or disable the Single-tab dwell entry based on the checkbox state."""
+        state = "normal" if self._vars["single_dwell_enabled"].get() else "disabled"
+        self._single_dwell_entry.config(state=state)
 
     def _start(self):
         """Dispatch to single or sweep based on the active Tune tab."""
@@ -4409,10 +4471,14 @@ class MEPGui:
             try:
                 mep = self._get_or_create_mep(params)
                 mep._stop_flag.clear()
-                f_hz = int(params["freq_start"] * 1e6)
-                logging.info(f"Starting single capture at {params['freq_start']} MHz")
-                mep.run_single(f_hz)
-                self._status_var.set("Single capture running")
+                f_hz    = int(params["freq_start"] * 1e6)
+                dwell_s = params["dwell"]
+                if dwell_s is not None:
+                    logging.info(f"Starting single capture at {params['freq_start']} MHz, dwell={dwell_s}s")
+                else:
+                    logging.info(f"Starting single capture at {params['freq_start']} MHz (no dwell)")
+                mep.run_single(f_hz, dwell_s=dwell_s)
+                self._status_var.set("Idle" if dwell_s is not None else "Single capture running")
             except Exception as e:
                 logging.error(f"Single capture error: {e}", exc_info=True)
                 self._status_var.set("Error")
