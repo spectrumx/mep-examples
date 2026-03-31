@@ -49,6 +49,9 @@ from start_mep_rx import (
     CHANNEL_OPTIONS,
     TUNER_OPTIONS,
     SAMPLE_RATE_OPTIONS,
+    AFE_DEFAULT_LOG_PATH,
+    AFE_DEFAULT_LOG_RATE_S,
+    AFE_DEFAULT_LOG_RATE_RANGE,
     RFSOC_CMD_TOPIC,
     RECORDER_CMD_TOPIC,
     RECORDER_STATUS_TOPIC,
@@ -143,12 +146,6 @@ class MEPGui:
         self._jetson_cpu_prev = None
         self._jetson_health_state = {}
         
-        # AFE register cache
-        self._afe_reg_cache = {}
-        
-        # Recorder status cache
-        self._rec_status_cache = {"state": "—", "file": "—"}
-        
         # MQTT streaming
         self._mqtt_messages = deque(maxlen=2000)
         self._mqtt_lock = threading.Lock()
@@ -184,15 +181,24 @@ class MEPGui:
         self._spec_wf_row_tags = deque()
         self._spec_color_lut = self._spec_build_color_lut()
 
+        # False until root.mainloop() is running; _gui_call routes to _gui_queue until then,
+        # so emit-cached callbacks drain via _pump_gui_queue after the window is first rendered.
+        self._mainloop_started = False
+
         self._vars = {}
+        print("  Building UI widget tree...", flush=True)
         self._build_ui()
         self._setup_logging()
 
         # ---- MQTT bus (always-on) ----
+        print("  Connecting to MQTT broker...", flush=True)
         self.bus = MEPBus()
         self.capture = None  # created on Start click via _get_or_create_capture
 
         # ---- Register listeners on bus (always active) ----
+        # NOTE: announce MUST be registered before registers so that
+        # emit-cached fires _on_afe_announce first, populating _afe_reg_pins
+        # before register data tries to use them.
         self.bus.on_message(self._on_mqtt_message)
         self.bus.on_connection_state(self._on_mqtt_connection_state)
         self.bus.on_status(RECORDER_STATUS_TOPIC, self._on_recorder_status)
@@ -203,13 +209,14 @@ class MEPGui:
         self.bus.on_status(AFE_IMU_TOPIC, self._on_imu)
         self.bus.on_status(AFE_MAG_TOPIC, self._on_mag)
         self.bus.on_status(AFE_HK_TOPIC, self._on_hk)
-        self.bus.on_status(AFE_REGISTERS_TOPIC, self._on_afe_registers)
         self.bus.on_status(AFE_ANNOUNCE_TOPIC, self._on_afe_announce)
+        self.bus.on_status(AFE_REGISTERS_TOPIC, self._on_afe_registers)
         self.bus.on_status_pattern(self.bus.spec_topic, self._on_spec_data)
 
-        # Seed UI from cached retained payloads that may have arrived before listeners were registered.
-        self._seed_ui_from_cache()
-        
+        # Refresh status grid from any cached state.
+        self._refresh_status_grid()
+        print("  Startup complete — entering event loop.", flush=True)
+
         # ---- SPEC topic (pattern from bus) ----
         self._spec_topic = self.bus.spec_topic
         if "spec_topic" in self._vars:
@@ -235,7 +242,6 @@ class MEPGui:
     def _on_recorder_status(self, data: dict):
         state = data.get("state", "—")
         logging.info(f"Recorder: {state}")
-        self._gui_call(self._rec_status_update, data)
         self._gui_call(self._refresh_status_grid)
 
     def _on_rfsoc_status(self, data: dict):
@@ -243,16 +249,12 @@ class MEPGui:
         pps = data.get("pps_count", "?")
         state = data.get("state", "?")
         logging.info(f"RFSoC: {state}  f_c={f_c:.2f} MHz  pps={pps}")
-        self._gui_call(self._soc_apply, data)
         self._gui_call(self._refresh_status_grid)
 
     def _on_tuner_status(self, data: dict):
-        if "task_name" in data and "value" in data and "state" not in data:
-            self._gui_call(self._tun_handle_response, data)
-        else:
+        if not ("task_name" in data and "value" in data and "state" not in data):
             state = data.get("state", "?")
             logging.info(f"Tuner: {state}")
-        self._gui_call(self._tun_refresh)
         self._gui_call(self._refresh_status_grid)
 
     def _on_afe_status(self, data: dict):
@@ -279,22 +281,7 @@ class MEPGui:
     def _on_afe_announce(self, data: dict):
         """Handle afe/announce retained message — populate dynamic widgets."""
         self._gui_call(self._apply_afe_announce, data)
-
-    def _seed_ui_from_cache(self):
-        """Apply already-cached MQTT state to UI once after listener registration."""
-        self._refresh_status_grid()
-
-        tlm = self.bus.get_cached_status(RFSOC_STATUS_TOPIC)
-        if isinstance(tlm, dict):
-            self._soc_apply(tlm)
-
-        rec = self.bus.get_cached_status(RECORDER_STATUS_TOPIC)
-        if isinstance(rec, dict):
-            self._rec_status_update(rec)
-
-        tun = self.bus.get_cached_status(TUNER_STATUS_TOPIC)
-        if isinstance(tun, dict):
-            self._tun_refresh()
+        self._gui_call(self._afe_refresh)
 
     def _apply_afe_announce(self, data: dict):
         """Populate all announce-driven widgets on the GUI thread."""
@@ -344,9 +331,35 @@ class MEPGui:
         # ---- Logging (rate range) ---- #
         log_ref = describe.get("logging", {}).get("reference", {})
         log_rate_range = log_ref.get("log_rate_range", [])
+        if not (isinstance(log_rate_range, list) and len(log_rate_range) >= 2):
+            log_rate_range = [AFE_DEFAULT_LOG_RATE_RANGE[0], AFE_DEFAULT_LOG_RATE_RANGE[1]]
+
+        log_path_default = (
+            log_ref.get("log_path_default")
+            or log_ref.get("default_log_path")
+            or log_ref.get("path_default")
+            or AFE_DEFAULT_LOG_PATH
+        )
+        log_rate_default = (
+            log_ref.get("log_rate_default")
+            or log_ref.get("default_log_rate")
+            or log_ref.get("default")
+            or AFE_DEFAULT_LOG_RATE_S
+        )
+
+        try:
+            log_rate_default = int(log_rate_default)
+        except (TypeError, ValueError):
+            log_rate_default = AFE_DEFAULT_LOG_RATE_S
+        log_rate_default = max(int(log_rate_range[0]), min(int(log_rate_range[1]), log_rate_default))
+
+        self._vars["log_path"].set(str(log_path_default))
+        self._vars["log_rate"].set(log_rate_default)
+
         if log_rate_range and hasattr(self, "_tlm_log_rate_spin"):
             self._tlm_log_rate_spin.configure(from_=log_rate_range[0], to=log_rate_range[1])
-            self._vars["log_rate"].set(log_rate_range[0])
+        if log_rate_range and hasattr(self, "_log_rate_spin"):
+            self._log_rate_spin.configure(from_=log_rate_range[0], to=log_rate_range[1])
 
         logging.info("GUI: announce data applied to all dynamic widgets")
 
@@ -357,28 +370,40 @@ class MEPGui:
     def _gui_call(self, func, *args, **kwargs):
         if self._gui_queue_closed:
             return
-        if threading.current_thread() is threading.main_thread():
+        if threading.current_thread() is threading.main_thread() and self._mainloop_started:
             func(*args, **kwargs)
             return
         self._gui_queue.put((func, args, kwargs))
 
     def _pump_gui_queue(self):
+        """Drain queued GUI callbacks, yielding to the event loop between items.
+
+        Each tick processes one item then reschedules immediately (after(0))
+        so that Tk can handle rendering and user input between heavy callbacks
+        (e.g. _afe_populate_from_announce creating dozens of X11 widgets).
+        When the queue is empty, drops back to the 20ms polling interval.
+        """
         if self._gui_queue_closed:
             return
-        while True:
+        try:
+            func, args, kwargs = self._gui_queue.get_nowait()
+        except queue.Empty:
             try:
-                func, args, kwargs = self._gui_queue.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                func(*args, **kwargs)
+                self.root.after(20, self._pump_gui_queue)
             except tk.TclError:
                 self._gui_queue_closed = True
-                return
-            except Exception:
-                logging.exception("GUI dispatch callback failed")
+            return
         try:
-            self.root.after(20, self._pump_gui_queue)
+            func(*args, **kwargs)
+        except tk.TclError:
+            self._gui_queue_closed = True
+            return
+        except Exception:
+            logging.exception("GUI dispatch callback failed")
+        # Reschedule immediately to drain remaining items, but yield so Tk
+        # can process expose/configure events between each callback.
+        try:
+            self.root.after(0, self._pump_gui_queue)
         except tk.TclError:
             self._gui_queue_closed = True
 
@@ -428,11 +453,6 @@ class MEPGui:
             self.capture.sample_rate_mhz = params["sample_rate_mhz"]
             self.capture.capture_name = params["capture_name"]
             self.capture.injection = params["injection"]
-
-        # Keep active config display in sync with current sample-rate selection
-        config_name = f"sr{params['sample_rate_mhz']}MHz"
-        if "rec_active_config" in self._vars:
-            self._vars["rec_active_config"].set(config_name)
 
         return self.capture
 
@@ -900,35 +920,49 @@ class MEPGui:
         nb.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
         self._adv_nb = nb
 
-        afe_f  = ttk.Frame(nb, padding=8)
-        rec_f  = ttk.Frame(nb, padding=8)
-        docker_f = ttk.Frame(nb, padding=8)
-        tlm_f  = ttk.Frame(nb, padding=8)
-        jh_f = ttk.Frame(nb, padding=8)
-        soc_f  = ttk.Frame(nb, padding=8)
-        spec_f = ttk.Frame(nb, padding=8)
-        tun_f  = ttk.Frame(nb, padding=8)
-        mqtt_f = ttk.Frame(nb, padding=8)
-        nb.add(afe_f,  text="AFE")
-        nb.add(rec_f,  text="REC")
-        nb.add(docker_f, text="DOC")
-        nb.add(tlm_f,  text="TLM")
-        nb.add(jh_f, text="JET")
-        nb.add(soc_f,  text="SOC")
-        nb.add(spec_f, text="SPEC")
-        nb.add(tun_f,  text="TUN")
-        nb.add(mqtt_f, text="MQTT")
+        # Lazy tab loading: create empty frames, build contents on first view.
+        # This avoids ~400 X11 round-trips at startup over SSH.
+        self._tab_builders = {
+            "AFE":  self._build_afe_tab,
+            "REC":  self._build_rec_tab,
+            "DOC":  self._build_docker_tab,
+            "TLM":  self._build_tlm_tab,
+            "JET":  self._build_jetson_health_tab,
+            "SOC":  self._build_soc_tab,
+            "SPEC": self._build_spec_tab,
+            "TUN":  self._build_tun_tab,
+            "MQTT": self._build_mqtt_tab,
+        }
+        self._tab_frames = {}
+        self._tabs_built: set[str] = set()
+
+        for name in self._tab_builders:
+            f = ttk.Frame(nb, padding=8)
+            nb.add(f, text=name)
+            self._tab_frames[name] = f
+
         nb.bind("<<NotebookTabChanged>>", self._on_adv_tab_changed)
 
-        self._build_afe_tab(afe_f)
-        self._build_rec_tab(rec_f)
-        self._build_docker_tab(docker_f)
-        self._build_tlm_tab(tlm_f)
-        self._build_jetson_health_tab(jh_f)
-        self._build_soc_tab(soc_f)
-        self._build_spec_tab(spec_f)
-        self._build_tun_tab(tun_f)
-        self._build_mqtt_tab(mqtt_f)
+        # AFE tab needs self._afe_frame set early so _afe_populate_from_announce
+        # can build dynamic widgets before the tab is ever viewed.
+        self._afe_frame = self._tab_frames["AFE"]
+        self._afe_frame.columnconfigure(0, weight=1)
+
+    def _ensure_tab_built(self, tab_text: str):
+        """Build tab contents on first access (lazy loading)."""
+        if tab_text in self._tabs_built:
+            return
+        builder = self._tab_builders.get(tab_text)
+        if builder is None:
+            return
+        frame = self._tab_frames[tab_text]
+        builder(frame)
+        self._tabs_built.add(tab_text)
+
+    def _get_current_tab_text(self) -> str:
+        """Return the text label of the currently selected advanced tab."""
+        idx = self._adv_nb.index("current")
+        return self._adv_nb.tab(idx, "text")
 
     def _is_adv_tab_selected(self, tab_text: str) -> bool:
         """Return True only when Advanced is visible and the named tab is active."""
@@ -939,13 +973,17 @@ class MEPGui:
         if not self._adv_frame.winfo_viewable():
             return False
         try:
-            current = self._adv_nb.index("current")
-            return self._adv_nb.tab(current, "text") == tab_text
+            return self._get_current_tab_text() == tab_text
         except Exception:
             return False
 
     def _on_adv_tab_changed(self, event=None):
-        if self._is_adv_tab_selected("MQTT"):
+        try:
+            tab_text = self._get_current_tab_text()
+        except Exception:
+            return
+        self._ensure_tab_built(tab_text)
+        if tab_text == "MQTT":
             self._mqtt_render_from_buffer()
 
     # ---- MQTT tab ---- #
@@ -1574,12 +1612,6 @@ class MEPGui:
         self._mqtt_rendered_count = 0
         if hasattr(self, "_mqtt_text"):
             self._mqtt_text.delete("1.0", "end")
-
-    def _rec_status_apply_to_ui(self):
-        if "rec_status" not in self._vars or "rec_status_file" not in self._vars:
-            return
-        self._vars["rec_status"].set(self._rec_status_cache.get("state", "—"))
-        self._vars["rec_status_file"].set(self._rec_status_cache.get("file", "—"))
 
     def _mqtt_log_message(self, topic: str, payload: bytes):
         """Compatibility shim for legacy call sites; routes through buffered model."""
@@ -2363,6 +2395,10 @@ class MEPGui:
                    command=self._soc_arm_next_pps).grid(
             row=0, column=2, padx=(2, 0), sticky="ew")
 
+        # Register tab-specific MQTT → UI. Emit-cached fires inline if data exists.
+        self.bus.on_status(RFSOC_STATUS_TOPIC,
+                          lambda data: self._gui_call(self._soc_apply, data))
+
     # ---- TUN tab ---- #
 
     def _build_tun_tab(self, frame: ttk.Frame):
@@ -2460,6 +2496,13 @@ class MEPGui:
         self._vars["tun_name"].trace_add(
             "write", lambda *_: self._tun_update_capability_buttons())
         self._tun_update_capability_buttons()
+
+        # Register tab-specific MQTT → UI. Emit-cached fires inline if data exists.
+        def _tun_status_for_tab(data: dict):
+            if "task_name" in data and "value" in data and "state" not in data:
+                self._gui_call(self._tun_handle_response, data)
+            self._gui_call(self._tun_refresh)
+        self.bus.on_status(TUNER_STATUS_TOPIC, _tun_status_for_tab)
 
     # ---- TLM tab ---- #
 
@@ -2626,13 +2669,20 @@ class MEPGui:
         ttk.Radiobutton(rb_f, text="Disable", variable=self._vars["log_enabled"], value="disabled").pack(side="left")
 
         ttk.Label(log_f, text="Log Path").grid(row=1, column=0, sticky="w", padx=5, pady=2)
-        self._vars["log_path"] = tk.StringVar(value="/var/log/mep/")
-        ttk.Entry(log_f, textvariable=self._vars["log_path"]).grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+        self._vars["log_path"] = tk.StringVar(value=AFE_DEFAULT_LOG_PATH)
+        self._tlm_log_path_entry = ttk.Entry(log_f, textvariable=self._vars["log_path"])
+        self._tlm_log_path_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+        self._bind_copy_menu(self._tlm_log_path_entry, self._vars["log_path"], allow_paste=True)
 
         ttk.Label(log_f, text="Log Interval (s)").grid(row=2, column=0, sticky="w", padx=5, pady=2)
-        self._vars["log_rate"] = tk.IntVar(value=1)
+        self._vars["log_rate"] = tk.IntVar(value=AFE_DEFAULT_LOG_RATE_S)
         self._tlm_log_rate_spin = ttk.Spinbox(
-            log_f, from_=1, to=3600, increment=1, textvariable=self._vars["log_rate"], width=10
+            log_f,
+            from_=AFE_DEFAULT_LOG_RATE_RANGE[0],
+            to=AFE_DEFAULT_LOG_RATE_RANGE[1],
+            increment=1,
+            textvariable=self._vars["log_rate"],
+            width=10,
         )
         self._tlm_log_rate_spin.grid(row=2, column=1, sticky="w", padx=5, pady=2)
         ttk.Button(log_f, text="Get", width=8,
@@ -2658,15 +2708,19 @@ class MEPGui:
         # Log path
         ttk.Label(logging_f, text="Log Path").grid(
             row=1, column=0, sticky="w", padx=5, pady=3)
-        self._vars["log_path"] = tk.StringVar(value="/var/log/mep/")
-        ttk.Entry(logging_f, textvariable=self._vars["log_path"]).grid(
-            row=1, column=1, sticky="ew", padx=5, pady=3)
+        self._vars["log_path"] = tk.StringVar(value=AFE_DEFAULT_LOG_PATH)
+        self._config_log_path_entry = ttk.Entry(logging_f, textvariable=self._vars["log_path"])
+        self._config_log_path_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=3)
+        self._bind_copy_menu(self._config_log_path_entry, self._vars["log_path"], allow_paste=True)
 
         # Log rate (interval in seconds)
         ttk.Label(logging_f, text="Log Rate (s)").grid(
             row=2, column=0, sticky="w", padx=5, pady=3)
-        self._vars["log_rate"] = tk.IntVar(value=0)
-        self._log_rate_spin = ttk.Spinbox(logging_f, from_=0, to=0, increment=1,
+        self._vars["log_rate"] = tk.IntVar(value=AFE_DEFAULT_LOG_RATE_S)
+        self._log_rate_spin = ttk.Spinbox(logging_f,
+                    from_=AFE_DEFAULT_LOG_RATE_RANGE[0],
+                    to=AFE_DEFAULT_LOG_RATE_RANGE[1],
+                    increment=1,
                     textvariable=self._vars["log_rate"],
                     width=12)
         self._log_rate_spin.grid(row=2, column=1, sticky="w", padx=5, pady=3)
@@ -2705,11 +2759,13 @@ class MEPGui:
     # ---- AFE tab ---- #
 
     def _build_afe_tab(self, frame: ttk.Frame):
-        frame.columnconfigure(0, weight=1)
-        self._afe_frame = frame
-        self._afe_placeholder = ttk.Label(frame, text="Waiting for AFE service announce…",
-                                          foreground="grey")
-        self._afe_placeholder.grid(row=0, column=0, padx=20, pady=20)
+        # _afe_frame and columnconfigure already set in _build_advanced_section.
+        # If _afe_populate_from_announce already ran (from emit-cached before
+        # the user opened this tab), dynamic widgets are already present.
+        if not hasattr(self, "_afe_reg_pins"):
+            self._afe_placeholder = ttk.Label(frame, text="Waiting for AFE service announce…",
+                                              foreground="grey")
+            self._afe_placeholder.grid(row=0, column=0, padx=20, pady=20)
 
         # Bottom buttons (always present)
         btn_f = ttk.Frame(frame)
@@ -2731,6 +2787,9 @@ class MEPGui:
         devices = reg_ref.get("devices", [])
         rx_devices = reg_ref.get("rx_devices", [])
         atten_range = reg_ref.get("attenuation_db_range", [0, 31])
+        if not isinstance(reg_pins, dict) or not reg_pins:
+            logging.warning("AFE: announce has no register_pins — cannot populate tab")
+            return
         tx_devices = [d for d in devices if d.startswith("tx")]
 
         # Remove placeholder
@@ -3011,6 +3070,14 @@ class MEPGui:
         ttk.Button(cfg_frame, text="Reload Config",
                    command=self._rec_reload_config).grid(
             row=1, column=0, columnspan=2, padx=4, pady=6, sticky="ew")
+
+        # Register tab-specific MQTT → UI. Emit-cached fires inline if data exists.
+        self.bus.on_status(RECORDER_STATUS_TOPIC,
+                          lambda data: self._gui_call(self._rec_status_ui_update, data))
+
+        # Set initial active config from current sample rate selection.
+        config_name = f"sr{self._vars['sample_rate_mhz'].get()}MHz"
+        self._vars["rec_active_config"].set(config_name)
 
     # ------------------------------------------------------------------ #
     #  AFE helpers
@@ -3934,8 +4001,6 @@ class MEPGui:
             self._vars["tun_set_power"].set(str(value))
             logging.info(f"TUN: power = {value} dBm")
         elif task == "get_lock_status":
-            if "tun_lock_status" not in self._vars:
-                return
             if isinstance(value, dict):
                 locks = [bool(v) for v in value.values() if isinstance(v, bool)]
                 if locks:
@@ -4010,28 +4075,12 @@ class MEPGui:
     #  REC helpers
     # ------------------------------------------------------------------ #
 
-    def _rec_status_update(self, data: dict):
-        self._rec_status_cache = {
-            "state": data.get("state", "—"),
-            "file": (
-                data.get("file")
-                or data.get("filename")
-                or data.get("path")
-                or data.get("output_file")
-                or "—"
-            ),
-        }
-        if "rec_status" not in self._vars:
-            return
+    def _rec_status_ui_update(self, data: dict):
+        """Update REC tab widgets from recorder status (only called after tab is built)."""
         self._vars["rec_status"].set(data.get("state", "—"))
         fpath = (data.get("file") or data.get("filename") or
                  data.get("path") or data.get("output_file") or "—")
         self._vars["rec_status_file"].set(str(fpath))
-
-    def _rec_status_seed(self):
-        cached = self.bus.get_cached_status(RECORDER_STATUS_TOPIC)
-        if isinstance(cached, dict):
-            self._rec_status_update(cached)
 
     def _rec_reload_config(self):
         sr = self._vars["sample_rate_mhz"].get()
@@ -4097,6 +4146,7 @@ class MEPGui:
             self._adv_frame.grid_remove()
             self._adv_btn_text.set("\u25b6 Advanced")
         else:
+            self._ensure_tab_built(self._get_current_tab_text())
             self._adv_frame.grid()
             self._adv_btn_text.set("\u25c0 Advanced")
 
@@ -4208,13 +4258,6 @@ class MEPGui:
     def _configure_mep(self, params: dict):
         """Create or update CaptureController with GUI params."""
         self.capture = self._get_or_create_capture(params)
-
-        if self._vars.get("sync_ntp") and self._vars["sync_ntp"].get():
-            logging.info("Syncing NTP on RFSoC...")
-            sync_ntp_on_rfsoc(os.path.dirname(os.path.abspath(__file__)))
-
-        config_name = f"sr{params['sample_rate_mhz']}MHz"
-        self._vars["rec_active_config"].set(config_name)
 
     # ------------------------------------------------------------------ #
     #  Button handlers
@@ -4339,8 +4382,7 @@ def main():
     root = tk.Tk()
     print("Loading MEP Control App...", flush=True)
     app  = MEPGui(root)
-    print("MEP GUI: initialization complete", flush=True)
-    print("MEP GUI: waiting 200 ms for X11 kickstart", flush=True)
+    print("MEP GUI: initialization complete — starting event loop.", flush=True)
 
     def _on_close():
         logging.info("Window closed — cleaning up")
@@ -4369,20 +4411,16 @@ def main():
 
     root.protocol("WM_DELETE_WINDOW", _on_close)
 
-    # --- X11 REMOTE FIX FOR MAC START ---
-    # Ensure all pending draw operations are processed
-    root.update_idletasks()
-    
-    # Programmatic "Minimize/Restore" to wake up XQuartz
-    # 200ms delay gives the SSH tunnel a moment to stabilize
+    # Programmatic "Minimize/Restore" to wake up XQuartz on first render.
+    # 200ms lets the event loop process the initial draw before kickstarting.
     def kickstart():
         root.withdraw()
         root.deiconify()
         logging.info("X11 render kickstart complete")
 
     root.after(200, kickstart)
-    # --- X11 REMOTE FIX FOR MAC END ---
 
+    app._mainloop_started = True
     root.mainloop()
 
 

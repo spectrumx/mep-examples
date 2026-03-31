@@ -42,6 +42,11 @@ LOG_DIR     = os.path.join(os.path.expanduser("~"), "log", "spectrumx")
 MQTT_BROKER = "localhost"
 MQTT_PORT   = 1883
 
+# AFE logging defaults shared with GUI/CLI callers.
+AFE_DEFAULT_LOG_PATH = "/data/log_telemetry"
+AFE_DEFAULT_LOG_RATE_S = 1
+AFE_DEFAULT_LOG_RATE_RANGE = (1, 3600)
+
 # Command and Status Topics
 RFSOC_CMD_TOPIC       = "rfsoc/command"
 RFSOC_STATUS_TOPIC    = "rfsoc/status"
@@ -65,62 +70,6 @@ SPEC_TOPIC_PATTERN    = "radiohound/clients/data/#"
 
 # Topics that support synchronous _wait_for_status() during sweep orchestration
 _SYNC_STATUS_TOPICS = (RFSOC_STATUS_TOPIC, RECORDER_STATUS_TOPIC, TUNER_STATUS_TOPIC)
-
-# ===== RP2040 FIRMWARE REGISTER MAPS ===== #
-# Copy-paste directly from RP2040 circuitpython - do not modify! This is not the source of truth!
-# GUI derives presentation from these definitions.
-
-
-MISC_PINS = [
-    {"pin": 0, "name": "TRIG_TX_SRC_SEL",    "default": 1, "0": "Internal",       "1": "External"},
-    {"pin": 1, "name": "TRIG_RX_SRC_SEL",    "default": 1, "0": "Internal",       "1": "External"},
-    {"pin": 2, "name": "EXT_TX_TRIG_ENABLE", "default": 1, "0": "Enabled",        "1": "Disabled"},
-    {"pin": 3, "name": "EXT_RX_TRIG_ENABLE", "default": 1, "0": "Enabled",        "1": "Disabled"},
-    {"pin": 4, "name": "NOT_USED_4",          "default": 0, "0": "Reserved",       "1": "Reserved"},
-    {"pin": 5, "name": "EXT_BIAS_ENABLE",     "default": 0, "0": "Disabled",       "1": "Enabled"},
-    {"pin": 6, "name": "TEST_LED",            "default": 0, "0": "Off",            "1": "On"},
-    {"pin": 7, "name": "PPS_SOURCE_SEL",      "default": 1, "0": "External",       "1": "Internal GNSS"},
-    {"pin": 8, "name": "REF_SOURCE_SEL",      "default": 1, "0": "External",       "1": "Internal OCXO"},
-    {"pin": 9, "name": "GNSS_ANT_SEL",        "default": 0, "0": "External",       "1": "Internal"},
-]
-
-TX_PINS = [
-    {"pin": 0, "name": "NOT_USED_0",          "default": 0, "0": "Reserved",       "1": "Reserved"},
-    {"pin": 1, "name": "TX_BLANK_SEL",        "default": 1, "0": "Blanked",        "1": "Not blanked"},
-    {"pin": 2, "name": "FILTER_BYPASS_SEL",   "default": 1, "0": "Filtered",       "1": "Bypassed"},
-    {"pin": 3, "name": "NOT_USED_3",          "default": 0, "0": "Reserved",       "1": "Reserved"},
-    {"pin": 4, "name": "NOT_USED_4",          "default": 0, "0": "Reserved",       "1": "Reserved"},
-    {"pin": 5, "name": "NOT_USED_5",          "default": 0, "0": "Reserved",       "1": "Reserved"},
-    {"pin": 6, "name": "NOT_USED_6",          "default": 0, "0": "Reserved",       "1": "Reserved"},
-    {"pin": 7, "name": "NOT_USED_7",          "default": 0, "0": "Reserved",       "1": "Reserved"},
-    {"pin": 8, "name": "NOT_USED_8",          "default": 0, "0": "Reserved",       "1": "Reserved"},
-    {"pin": 9, "name": "TEST_LED",            "default": 0, "0": "Off",            "1": "On"},
-]
-
-RX_PINS = [
-    {"pin": 0, "name": "CHAN_BIAS_EN",        "default": 0, "0": "Disabled",       "1": "Enabled"},
-    {"pin": 1, "name": "INT_RF_TRIG_SEL",     "default": 1, "0": "Not asserted",   "1": "Asserted"},
-    {"pin": 2, "name": "FILTER_BYPASS_SEL",   "default": 1, "0": "Bypassed",       "1": "Filtered"},
-    {"pin": 3, "name": "AMP_BYPASS_SEL",      "default": 1, "0": "Bypassed",       "1": "Enabled"},
-    {"pin": 4, "name": "ATTEN_C1",            "default": 0, "0": "Skip +1dB",      "1": "Add +1dB"},
-    {"pin": 5, "name": "ATTEN_C2",            "default": 0, "0": "Skip +2dB",      "1": "Add +2dB"},
-    {"pin": 6, "name": "ATTEN_C4",            "default": 0, "0": "Skip +4dB",      "1": "Add +4dB"},
-    {"pin": 7, "name": "ATTEN_C8",            "default": 0, "0": "Skip +8dB",      "1": "Add +8dB"},
-    {"pin": 8, "name": "ATTEN_C16",           "default": 0, "0": "Skip +16dB",     "1": "Add +16dB"},
-    {"pin": 9, "name": "TEST_LED",            "default": 0, "0": "Off",            "1": "On"},
-]
-
-# Board layout: device name -> (pin_map, daisy_group, daisy_position)
-# daisy_group == chain length. daisy_position is 1-indexed from far end of chain.
-DEVICES = {
-    "misc": (MISC_PINS, 1, 1),
-    "tx1":  (TX_PINS,   2, 1),
-    "tx2":  (TX_PINS,   2, 2),
-    "rx1":  (RX_PINS,   4, 1),
-    "rx2":  (RX_PINS,   4, 2),
-    "rx3":  (RX_PINS,   4, 3),
-    "rx4":  (RX_PINS,   4, 4),
-}
 
 # Owned by the Recorder service. This is not the source of truth of this information.
 RECORDER_CHANNEL_PORTS = {"A": 60134, "B": 60133, "C": 60132, "D": 60131}
@@ -679,8 +628,19 @@ class MEPBus:
     # ------------------------------------------------------------------ #
 
     def on_status(self, topic: str, callback: Callable[[dict], None]):
-        """Register callback(data: dict) for JSON messages on a specific topic."""
+        """Register callback(data: dict) for JSON messages on a specific topic.
+
+        If cached data already exists for this topic (e.g. a retained message
+        that arrived before the listener was registered), the callback is fired
+        immediately on the calling thread.
+        """
         self._listeners.setdefault(topic, []).append(callback)
+        cached = self.get_cached_status(topic)
+        if isinstance(cached, dict):
+            try:
+                callback(cached)
+            except Exception as e:
+                logging.warning("Status listener initial emit failed for %s: %s", topic, e)
 
     def on_message(self, callback: Callable[[str, bytes], None]):
         """Register callback(topic, payload_bytes) for ALL MQTT messages."""
