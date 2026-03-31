@@ -37,6 +37,7 @@ from start_mep_rx import (
     MEPBus,
     CaptureController,
     DockerManager,
+    GPSDMonitor,
     get_frequency_list,
     resolve_injection,
     sync_ntp_on_rfsoc,
@@ -194,6 +195,7 @@ class MEPGui:
         print("  Connecting to MQTT broker...", flush=True)
         self.bus = MEPBus()
         self.capture = None  # created on Start click via _get_or_create_capture
+        self._gps_monitor = None
 
         # ---- Register listeners on bus (always active) ----
         # NOTE: announce MUST be registered before registers so that
@@ -926,6 +928,7 @@ class MEPGui:
             "AFE":  self._build_afe_tab,
             "REC":  self._build_rec_tab,
             "DOC":  self._build_docker_tab,
+            "GPS":  self._build_gps_tab,
             "TLM":  self._build_tlm_tab,
             "JET":  self._build_jetson_health_tab,
             "SOC":  self._build_soc_tab,
@@ -987,6 +990,164 @@ class MEPGui:
             self._mqtt_render_from_buffer()
 
     # ---- MQTT tab ---- #
+
+    # ---- GPS tab ---- #
+
+    def _build_gps_tab(self, frame: ttk.Frame):
+        """GPS tab: gpsd status, decoded GPS state, stream log, and manual commands."""
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        if self._gps_monitor is None:
+            self._gps_monitor = GPSDMonitor()
+            self._gps_monitor.on_state(lambda state: self._gui_call(self._gps_apply_state, state))
+            self._gps_monitor.on_line(lambda direction, line: self._gui_call(self._gps_log_line, direction, line))
+            self._gps_monitor.start()
+
+        def _ro_row(parent, row, col, label, key, unit=""):
+            current = self._gps_monitor.get_state().get(key, "Not reported")
+            sv = tk.StringVar(value=current)
+            self._vars[key] = sv
+            c0 = col * 4
+            ttk.Label(parent, text=label).grid(row=row, column=c0, sticky="w", padx=5, pady=2)
+            e = ttk.Entry(parent, textvariable=sv, state="readonly", width=18)
+            e.grid(row=row, column=c0 + 1, sticky="ew", padx=5, pady=2)
+            self._bind_copy_menu(e, sv)
+            if unit:
+                ttk.Label(parent, text=unit, foreground="grey").grid(row=row, column=c0 + 2, sticky="w")
+
+        self._vars["gpsd_stream_state"] = tk.StringVar(value="paused")
+
+        st_f = ttk.LabelFrame(frame, text="Status")
+        st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
+        for c in (1, 5):
+            st_f.columnconfigure(c, weight=1)
+
+        _ro_row(st_f, 0, 0, "Status", "gpsd_conn_status")
+        _ro_row(st_f, 0, 1, "Device", "gpsd_device")
+        _ro_row(st_f, 1, 0, "Driver", "gpsd_driver")
+        _ro_row(st_f, 1, 1, "Baud", "gpsd_baud", "bps")
+        _ro_row(st_f, 2, 0, "Update Rate", "gpsd_update_rate_s", "s")
+        _ro_row(st_f, 2, 1, "WATCH", "gpsd_watch_state")
+        _ro_row(st_f, 3, 0, "Summary", "gps_summary")
+
+        _ro_row(st_f, 4, 0, "Fix Status", "gps_fix_status")
+        _ro_row(st_f, 4, 1, "Fix Quality", "gps_fix_quality")
+        _ro_row(st_f, 5, 0, "UTC Time", "gps_utc_time")
+        _ro_row(st_f, 5, 1, "Altitude", "gps_alt_m", "m")
+        _ro_row(st_f, 6, 0, "Latitude", "gps_lat", "deg")
+        _ro_row(st_f, 6, 1, "Longitude", "gps_lon", "deg")
+        _ro_row(st_f, 7, 0, "Speed", "gps_speed_kn", "knots")
+
+        _ro_row(st_f, 8, 0, "Visible Total", "gps_sats_visible")
+        _ro_row(st_f, 8, 1, "Used In Fix", "gps_sats_used")
+        _ro_row(st_f, 9, 0, "GPS Visible", "gps_sats_gps")
+        _ro_row(st_f, 9, 1, "GLONASS Visible", "gps_sats_glonass")
+        _ro_row(st_f, 10, 0, "Galileo Visible", "gps_sats_galileo")
+        _ro_row(st_f, 10, 1, "BeiDou Visible", "gps_sats_beidou")
+        _ro_row(st_f, 11, 0, "PDOP", "gps_pdop")
+        _ro_row(st_f, 11, 1, "HDOP", "gps_hdop")
+        _ro_row(st_f, 12, 0, "VDOP", "gps_vdop")
+
+        log_f = ttk.LabelFrame(frame, text="GPSD Stream")
+        log_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="nsew")
+        log_f.columnconfigure(0, weight=1)
+        log_f.rowconfigure(1, weight=1)
+
+        log_ctl = ttk.Frame(log_f)
+        log_ctl.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+        for c in range(4):
+            log_ctl.columnconfigure(c, weight=1 if c == 0 else 0)
+
+        ttk.Label(
+            log_ctl,
+            textvariable=self._vars["gpsd_stream_state"],
+            foreground="grey",
+            font=("TkFixedFont", 8),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        ttk.Button(log_ctl, text="Stream", command=self._gps_stream_on).grid(
+            row=0, column=1, padx=(0, 4), sticky="ew"
+        )
+        ttk.Button(log_ctl, text="Pause", command=self._gps_stream_off).grid(
+            row=0, column=2, padx=(0, 4), sticky="ew"
+        )
+        ttk.Button(log_ctl, text="Clear", command=lambda: self._gpsd_text.delete("1.0", "end")).grid(
+            row=0, column=3, sticky="ew"
+        )
+
+        self._gpsd_text = tk.Text(
+            log_f,
+            height=12,
+            wrap="none",
+            font=("TkFixedFont", 9),
+            background="#f5f5f5",
+        )
+        ysb = ttk.Scrollbar(log_f, orient="vertical", command=self._gpsd_text.yview)
+        xsb = ttk.Scrollbar(log_f, orient="horizontal", command=self._gpsd_text.xview)
+        self._gpsd_text.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self._gpsd_text.grid(row=1, column=0, sticky="nsew", padx=(4, 0), pady=(0, 0))
+        ysb.grid(row=1, column=1, sticky="ns", pady=(0, 0), padx=(0, 4))
+        xsb.grid(row=2, column=0, sticky="ew", padx=(4, 0), pady=(0, 4))
+        self._gpsd_text.bind(
+            "<Key>",
+            lambda e: None if (e.state & 0x4 and e.keysym in ("c", "C", "a", "A")) else "break",
+        )
+        self._bind_copy_menu(self._gpsd_text)
+
+        cmd_f = ttk.LabelFrame(frame, text="Manual Command")
+        cmd_f.grid(row=2, column=0, padx=4, pady=(2, 6), sticky="ew")
+        cmd_f.columnconfigure(1, weight=1)
+
+        ttk.Label(cmd_f, text="Command").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["gpsd_cmd"] = tk.StringVar(value='?VERSION;')
+        ttk.Entry(cmd_f, textvariable=self._vars["gpsd_cmd"]).grid(
+            row=0, column=1, sticky="ew", padx=5, pady=3
+        )
+        ttk.Button(cmd_f, text="Send", command=self._gps_send_manual).grid(
+            row=0, column=2, padx=5, pady=3
+        )
+
+        self._add_copyable_note(
+            frame,
+            "Source: gpsd service (config: /etc/default/gpsd)",
+            row=3,
+            wraplength=420,
+        )
+
+        self._gps_apply_state(self._gps_monitor.get_state())
+
+    def _gps_apply_state(self, state: dict):
+        for key, value in state.items():
+            if key in self._vars:
+                self._vars[key].set(str(value))
+
+    def _gps_log_line(self, direction: str, line: str):
+        if not hasattr(self, "_gpsd_text"):
+            return
+        if not self._is_adv_tab_selected("GPS"):
+            return
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self._gpsd_text.insert("end", f"{ts}  {direction}  {line}\n")
+        self._gpsd_text.see("end")
+        lines = int(self._gpsd_text.index("end-1c").split(".")[0])
+        if lines > 800:
+            self._gpsd_text.delete("1.0", f"{lines - 800}.0")
+
+    def _gps_stream_on(self):
+        self._gps_monitor.set_watch(enable=True, raw=1)
+        self._vars["gpsd_stream_state"].set("live")
+
+    def _gps_stream_off(self):
+        self._gps_monitor.set_watch(enable=False)
+        self._vars["gpsd_stream_state"].set("paused")
+
+    def _gps_send_manual(self):
+        cmd = self._vars["gpsd_cmd"].get().strip()
+        if not cmd:
+            logging.error("GPSD: command is empty")
+            return
+        self._gps_monitor.send_command(cmd)
 
     # ---- DOCKER tab ---- #
     # (built by _build_docker_tab below the DOCKER helpers section)
@@ -4407,6 +4568,11 @@ def main():
                 app.bus.disconnect()
         except Exception as e:
             logging.debug(f"Exception during cleanup: {e}")
+        try:
+            if getattr(app, "_gps_monitor", None) is not None:
+                app._gps_monitor.stop()
+        except Exception as e:
+            logging.debug(f"Exception stopping GPS monitor during cleanup: {e}")
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _on_close)

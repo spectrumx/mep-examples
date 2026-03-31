@@ -30,7 +30,9 @@ import json
 import os
 import re
 import math
+import socket
 import subprocess
+import queue
 from collections import deque
 from datetime import datetime
 import threading
@@ -561,6 +563,552 @@ def set_jetson_power_mode_detailed(mode_id: str) -> dict:
         result["error_code"] = "exception"
         result["detail"] = str(e)
         return result
+
+
+# ===== GPSD MONITOR (business logic; GUI-agnostic) ===== #
+
+class GPSDMonitor:
+    """Persistent gpsd stream monitor with semantic GPS state decoding.
+
+    Responsibilities:
+    - Maintain one reconnecting socket session to gpsd.
+    - Decode gpsd JSON + NMEA into stable semantic state fields.
+    - Accept outbound gpsd commands via queue.
+    - Emit line/state updates through registered callbacks.
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 2947, reconnect_delay_s: float = 5.0):
+        self._host = host
+        self._port = port
+        self._reconnect_delay_s = reconnect_delay_s
+
+        self._cmd_queue: queue.Queue[str] = queue.Queue()
+        self._run = False
+        self._thread: Optional[threading.Thread] = None
+
+        self._state_lock = threading.Lock()
+        self._state = self._state_defaults()
+
+        self._line_callbacks: list[Callable[[str, str], None]] = []
+        self._state_callbacks: list[Callable[[dict], None]] = []
+
+        self._fix_hints = {
+            "rmc_valid": None,
+            "gga_quality": None,
+            "tpv_mode": None,
+            "gsa_mode": None,
+        }
+        self._gsv_partial: dict[str, dict] = {}
+        self._gsv_last_complete: dict[str, dict] = {}
+
+    def _state_defaults(self) -> dict:
+        return {
+            "gpsd_conn_status": "Connecting...",
+            "gpsd_device": "Not reported",
+            "gpsd_driver": "Not reported",
+            "gpsd_baud": "Not reported",
+            "gpsd_update_rate_s": "Not reported",
+            "gpsd_watch_state": "Not reported",
+            "gps_summary": "Waiting for gpsd data",
+            "gps_fix_status": "Unknown",
+            "gps_fix_quality": "Not reported",
+            "gps_utc_time": "Unknown",
+            "gps_lat": "Unknown",
+            "gps_lon": "Unknown",
+            "gps_alt_m": "Not reported",
+            "gps_speed_kn": "0.000",
+            "gps_sats_visible": "0",
+            "gps_sats_used": "0",
+            "gps_sats_gps": "0",
+            "gps_sats_glonass": "0",
+            "gps_sats_galileo": "0",
+            "gps_sats_beidou": "0",
+            "gps_pdop": "Not reported",
+            "gps_hdop": "Not reported",
+            "gps_vdop": "Not reported",
+        }
+
+    def on_line(self, callback: Callable[[str, str], None]):
+        self._line_callbacks.append(callback)
+
+    def on_state(self, callback: Callable[[dict], None], emit_initial: bool = True):
+        self._state_callbacks.append(callback)
+        if emit_initial:
+            callback(self.get_state())
+
+    def get_state(self) -> dict:
+        with self._state_lock:
+            return dict(self._state)
+
+    def start(self):
+        if self._run:
+            return
+        self._run = True
+        self._thread = threading.Thread(target=self._worker, daemon=True, name="gpsd_monitor")
+        self._thread.start()
+
+    def stop(self):
+        self._run = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def send_command(self, cmd: str):
+        cmd = (cmd or "").strip()
+        if not cmd:
+            raise ValueError("GPSD command cannot be empty")
+        self._cmd_queue.put(cmd)
+
+    def set_watch(self, enable: bool, raw: int = 0):
+        if enable:
+            self.send_command(f'?WATCH={{"enable":true,"raw":{int(raw)}}}')
+        else:
+            self.send_command('?WATCH={"enable":false}')
+
+    def _emit_line(self, direction: str, line: str):
+        for cb in list(self._line_callbacks):
+            try:
+                cb(direction, line)
+            except Exception as e:
+                logging.warning(f"GPSD line callback failed: {e}")
+
+    def _emit_state(self):
+        snap = self.get_state()
+        for cb in list(self._state_callbacks):
+            try:
+                cb(snap)
+            except Exception as e:
+                logging.warning(f"GPSD state callback failed: {e}")
+
+    def _set(self, key: str, value, force: bool = False):
+        if value is None and not force:
+            return
+        val = "" if value is None else str(value)
+        if not force and not val.strip():
+            return
+        with self._state_lock:
+            self._state[key] = val
+
+    def _set_float(self, key: str, value, fmt: str):
+        self._set(key, format(float(value), fmt))
+
+    def _worker(self):
+        while self._run:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(5.0)
+                    s.connect((self._host, self._port))
+                    s.settimeout(0.5)
+
+                    self._set("gpsd_conn_status", "Connected", force=True)
+                    self._emit_state()
+
+                    init_cmd = '?WATCH={"enable":true,"raw":0};'
+                    s.sendall((init_cmd + "\n").encode("ascii", errors="ignore"))
+                    self._emit_line("TX", init_cmd)
+                    self._set("gpsd_watch_state", "enabled raw=0", force=True)
+                    self._emit_state()
+
+                    buf = ""
+                    while self._run:
+                        self._drain_command_queue(s)
+
+                        try:
+                            data = s.recv(4096)
+                        except socket.timeout:
+                            continue
+
+                        if not data:
+                            raise ConnectionError("gpsd closed socket")
+
+                        buf += data.decode("ascii", errors="ignore")
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            line = line.strip()
+                            if not line:
+                                continue
+                            self._handle_line(line)
+
+            except Exception as e:
+                self._set("gpsd_conn_status", f"Disconnected ({e})", force=True)
+                self._set("gps_fix_status", "Unknown", force=True)
+                self._recompute_fix_and_summary()
+                self._emit_state()
+
+            if self._run:
+                time.sleep(self._reconnect_delay_s)
+
+    def _drain_command_queue(self, sock: socket.socket):
+        while True:
+            try:
+                cmd = self._cmd_queue.get_nowait().strip()
+            except queue.Empty:
+                return
+
+            if not cmd:
+                continue
+            if not cmd.endswith(";"):
+                cmd += ";"
+            sock.sendall((cmd + "\n").encode("ascii", errors="ignore"))
+            self._emit_line("TX", cmd)
+
+    def _handle_line(self, line: str):
+        self._emit_line("RX", line)
+
+        if line.startswith("$"):
+            self._parse_nmea(line)
+            self._emit_state()
+            return
+
+        if not line.startswith("{"):
+            return
+
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            return
+
+        self._apply_json(msg)
+        self._emit_state()
+
+    def _apply_json(self, msg: dict):
+        if not isinstance(msg, dict):
+            return
+
+        cls = str(msg.get("class", "")).upper()
+        if not cls:
+            return
+
+        if cls == "DEVICE":
+            self._set("gpsd_device", msg.get("path"))
+            self._set("gpsd_driver", msg.get("driver"))
+            if msg.get("bps") is not None:
+                self._set("gpsd_baud", str(int(msg.get("bps"))))
+            if msg.get("cycle") is not None:
+                self._set_float("gpsd_update_rate_s", msg.get("cycle"), ".2f")
+
+        elif cls == "DEVICES":
+            devs = msg.get("devices")
+            if isinstance(devs, list) and devs and isinstance(devs[0], dict):
+                self._apply_json(dict(devs[0], **{"class": "DEVICE"}))
+
+        elif cls == "WATCH":
+            enabled = msg.get("enable")
+            raw = msg.get("raw")
+            nmea = msg.get("nmea")
+            state = "Not reported"
+            if enabled is not None:
+                state = "enabled" if bool(enabled) else "disabled"
+                if raw is not None:
+                    state += f" raw={raw}"
+                if nmea is not None:
+                    state += f" nmea={bool(nmea)}"
+            self._set("gpsd_watch_state", state, force=True)
+
+        elif cls == "VERSION":
+            rel = msg.get("release")
+            rev = msg.get("rev")
+            if rel:
+                text = f"gpsd {rel}"
+                if rev:
+                    text += f" ({rev})"
+                self._set("gpsd_driver", text, force=True)
+
+        elif cls == "TPV":
+            if msg.get("mode") is not None:
+                self._fix_hints["tpv_mode"] = int(msg.get("mode"))
+            if msg.get("time"):
+                self._set("gps_utc_time", msg.get("time"))
+            if msg.get("lat") is not None:
+                self._set_float("gps_lat", msg.get("lat"), ".6f")
+            if msg.get("lon") is not None:
+                self._set_float("gps_lon", msg.get("lon"), ".6f")
+            if msg.get("alt") is not None:
+                self._set_float("gps_alt_m", msg.get("alt"), ".2f")
+            if msg.get("speed") is not None:
+                self._set_float("gps_speed_kn", float(msg.get("speed")) * 1.943844, ".3f")
+
+        elif cls == "SKY":
+            sats = msg.get("satellites")
+            if isinstance(sats, list):
+                visible = len(sats)
+                used = 0
+                counts = {"GPS": 0, "GLONASS": 0, "GALILEO": 0, "BEIDOU": 0}
+                for sat in sats:
+                    if not isinstance(sat, dict):
+                        continue
+                    if sat.get("used") is True:
+                        used += 1
+                    gnssid = sat.get("gnssid")
+                    if gnssid == 0:
+                        counts["GPS"] += 1
+                    elif gnssid == 2:
+                        counts["GALILEO"] += 1
+                    elif gnssid == 3:
+                        counts["BEIDOU"] += 1
+                    elif gnssid == 6:
+                        counts["GLONASS"] += 1
+
+                self._set("gps_sats_visible", str(visible), force=True)
+                self._set("gps_sats_used", str(used), force=True)
+                self._set("gps_sats_gps", str(counts["GPS"]), force=True)
+                self._set("gps_sats_glonass", str(counts["GLONASS"]), force=True)
+                self._set("gps_sats_galileo", str(counts["GALILEO"]), force=True)
+                self._set("gps_sats_beidou", str(counts["BEIDOU"]), force=True)
+
+            if msg.get("pdop") is not None:
+                self._set_float("gps_pdop", msg.get("pdop"), ".2f")
+            if msg.get("hdop") is not None:
+                self._set_float("gps_hdop", msg.get("hdop"), ".2f")
+            if msg.get("vdop") is not None:
+                self._set_float("gps_vdop", msg.get("vdop"), ".2f")
+
+        self._recompute_fix_and_summary()
+
+    def _parse_nmea(self, line: str):
+        clean = line.split("*")[0]
+        parts = clean.lstrip("$").split(",")
+        if not parts or len(parts[0]) < 3:
+            return
+
+        talker = parts[0][:2]
+        sentence = parts[0][2:]
+
+        if sentence == "RMC":
+            self._parse_rmc(parts)
+        elif sentence == "GGA":
+            self._parse_gga(parts)
+        elif sentence == "GSA":
+            self._parse_gsa(parts)
+        elif sentence == "GSV":
+            self._parse_gsv(talker, parts)
+        elif sentence == "ZDA":
+            self._parse_zda(parts)
+
+        self._recompute_fix_and_summary()
+
+    def _parse_rmc(self, parts: list[str]):
+        if len(parts) < 10:
+            return
+
+        t_utc = self._fmt_iso_from_rmc(parts[1], parts[9])
+        if t_utc:
+            self._set("gps_utc_time", t_utc)
+
+        status = (parts[2] or "").upper()
+        if status:
+            self._fix_hints["rmc_valid"] = (status == "A")
+
+        lat = self._nmea_to_decimal(parts[3], parts[4])
+        lon = self._nmea_to_decimal(parts[5], parts[6])
+        if lat is not None:
+            self._set("gps_lat", f"{lat:.6f}")
+        if lon is not None:
+            self._set("gps_lon", f"{lon:.6f}")
+
+        if parts[7]:
+            self._set_float("gps_speed_kn", parts[7], ".3f")
+
+    def _parse_gga(self, parts: list[str]):
+        if len(parts) < 10:
+            return
+
+        t_utc = self._fmt_hms(parts[1])
+        if t_utc:
+            self._set("gps_utc_time", t_utc)
+
+        lat = self._nmea_to_decimal(parts[2], parts[3])
+        lon = self._nmea_to_decimal(parts[4], parts[5])
+        if lat is not None:
+            self._set("gps_lat", f"{lat:.6f}")
+        if lon is not None:
+            self._set("gps_lon", f"{lon:.6f}")
+
+        if parts[6]:
+            q = int(parts[6])
+            self._fix_hints["gga_quality"] = q
+            self._set("gps_fix_quality", self._fix_quality_text(q), force=True)
+
+        if parts[7]:
+            self._set("gps_sats_used", str(int(parts[7])), force=True)
+        if parts[8]:
+            self._set_float("gps_hdop", parts[8], ".2f")
+        if parts[9]:
+            self._set_float("gps_alt_m", parts[9], ".2f")
+
+    def _parse_gsa(self, parts: list[str]):
+        if len(parts) < 18:
+            return
+
+        if parts[2]:
+            self._fix_hints["gsa_mode"] = int(parts[2])
+
+        used = sum(1 for sv in parts[3:15] if sv.strip())
+        self._set("gps_sats_used", str(used), force=True)
+
+        if parts[15]:
+            self._set_float("gps_pdop", parts[15], ".2f")
+        if parts[16]:
+            self._set_float("gps_hdop", parts[16], ".2f")
+        if parts[17]:
+            self._set_float("gps_vdop", parts[17], ".2f")
+
+    def _parse_gsv(self, talker: str, parts: list[str]):
+        if len(parts) < 4:
+            return
+
+        total_msgs = int(parts[1] or 0)
+        msg_num = int(parts[2] or 0)
+        total_visible = int(parts[3] or 0)
+        if total_msgs <= 0 or msg_num <= 0:
+            return
+
+        key = talker.upper()
+        cycle = self._gsv_partial.get(key)
+        if cycle is None or msg_num == 1 or cycle.get("expected") != total_msgs:
+            cycle = {
+                "expected": total_msgs,
+                "seen": set(),
+                "visible": total_visible,
+                "counts": {"GPS": 0, "GLONASS": 0, "GALILEO": 0, "BEIDOU": 0},
+            }
+            self._gsv_partial[key] = cycle
+
+        cycle["seen"].add(msg_num)
+        cycle["visible"] = max(cycle["visible"], total_visible)
+
+        idx = 4
+        while idx + 3 < len(parts):
+            prn_txt = parts[idx].strip()
+            if prn_txt:
+                prn = int(prn_txt)
+                const = self._constellation_from_prn(key, prn)
+                if const in cycle["counts"]:
+                    cycle["counts"][const] += 1
+            idx += 4
+
+        if len(cycle["seen"]) >= cycle["expected"]:
+            self._gsv_last_complete[key] = {
+                "visible": cycle["visible"],
+                "counts": dict(cycle["counts"]),
+            }
+            self._gsv_partial.pop(key, None)
+
+            totals = {"GPS": 0, "GLONASS": 0, "GALILEO": 0, "BEIDOU": 0}
+            visible_total = 0
+            for data in self._gsv_last_complete.values():
+                visible_total += int(data.get("visible", 0))
+                for const in totals:
+                    totals[const] += int(data.get("counts", {}).get(const, 0))
+
+            if visible_total > 0:
+                self._set("gps_sats_visible", str(visible_total), force=True)
+            self._set("gps_sats_gps", str(totals["GPS"]), force=True)
+            self._set("gps_sats_glonass", str(totals["GLONASS"]), force=True)
+            self._set("gps_sats_galileo", str(totals["GALILEO"]), force=True)
+            self._set("gps_sats_beidou", str(totals["BEIDOU"]), force=True)
+
+    def _parse_zda(self, parts: list[str]):
+        if len(parts) < 5:
+            return
+        t = self._fmt_hms(parts[1])
+        d = parts[2]
+        m = parts[3]
+        y = parts[4]
+        if t and d and m and y:
+            self._set("gps_utc_time", f"{y}-{m.zfill(2)}-{d.zfill(2)}T{t}")
+
+    def _recompute_fix_and_summary(self):
+        fix = "Unknown"
+        if self._fix_hints.get("rmc_valid") is False:
+            fix = "No fix"
+        elif isinstance(self._fix_hints.get("gga_quality"), int):
+            q = self._fix_hints["gga_quality"]
+            fix = "No fix" if q <= 0 else self._fix_quality_text(q)
+        elif isinstance(self._fix_hints.get("tpv_mode"), int):
+            mode = self._fix_hints["tpv_mode"]
+            fix = "No fix" if mode <= 1 else ("2D" if mode == 2 else "3D")
+        elif isinstance(self._fix_hints.get("gsa_mode"), int):
+            mode = self._fix_hints["gsa_mode"]
+            fix = "No fix" if mode <= 1 else ("2D" if mode == 2 else "3D")
+
+        self._set("gps_fix_status", fix, force=True)
+        if fix == "No fix":
+            self._set("gps_fix_quality", "Invalid", force=True)
+
+        with self._state_lock:
+            summary = (
+                f"{self._state.get('gpsd_conn_status', 'Unknown')} | "
+                f"Fix: {self._state.get('gps_fix_status', 'Unknown')} | "
+                f"Sats used/visible: {self._state.get('gps_sats_used', '0')}/"
+                f"{self._state.get('gps_sats_visible', '0')} | "
+                f"Device: {self._state.get('gpsd_device', 'Not reported')}"
+            )
+        self._set("gps_summary", summary, force=True)
+
+    def _nmea_to_decimal(self, raw: str, hemi: str):
+        if not raw:
+            return None
+        v = float(raw)
+        deg = int(v // 100)
+        minutes = v - (deg * 100)
+        decimal = deg + minutes / 60.0
+        hemi = (hemi or "").upper()
+        if hemi in ("S", "W"):
+            decimal *= -1.0
+        return decimal
+
+    def _fmt_hms(self, hhmmss: str):
+        if not hhmmss or len(hhmmss) < 6:
+            return None
+        core = hhmmss.split(".")[0]
+        if len(core) < 6:
+            return None
+        return f"{core[0:2]}:{core[2:4]}:{core[4:6]}Z"
+
+    def _fmt_iso_from_rmc(self, hhmmss: str, ddmmyy: str):
+        if not hhmmss or not ddmmyy or len(ddmmyy) != 6:
+            return self._fmt_hms(hhmmss)
+        t = self._fmt_hms(hhmmss)
+        if t is None:
+            return None
+        day = ddmmyy[0:2]
+        month = ddmmyy[2:4]
+        year = int(ddmmyy[4:6])
+        year += 2000 if year < 80 else 1900
+        return f"{year:04d}-{month}-{day}T{t}"
+
+    def _fix_quality_text(self, quality: int):
+        table = {
+            0: "Invalid",
+            1: "GPS",
+            2: "DGPS",
+            3: "PPS",
+            4: "RTK",
+            5: "Float RTK",
+            6: "Estimated",
+            7: "Manual",
+            8: "Simulation",
+        }
+        return table.get(quality, f"Quality {quality}")
+
+    def _constellation_from_prn(self, talker: str, prn: int):
+        talker = (talker or "").upper()
+        if talker == "GP":
+            return "GPS"
+        if talker == "GL":
+            return "GLONASS"
+        if talker == "GA":
+            return "GALILEO"
+        if talker in ("GB", "BD"):
+            return "BEIDOU"
+        if 65 <= prn <= 96:
+            return "GLONASS"
+        if 201 <= prn <= 237:
+            return "BEIDOU"
+        if 301 <= prn <= 336:
+            return "GALILEO"
+        return "GPS"
 
 
 # ===== MEP BUS ===== #
