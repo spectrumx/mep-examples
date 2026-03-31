@@ -75,7 +75,7 @@ from start_mep_rx import (
 # ===== LAYOUT CONSTANTS ===== #
 LEFT_PANEL_WIDTH = 450
 ADV_PANEL_WIDTH = 475
-DEFAULT_WIN_HEIGHT = 700
+DEFAULT_WIN_HEIGHT = 750
 
 
 # ===== TEXT LOGGING HANDLER ===== #
