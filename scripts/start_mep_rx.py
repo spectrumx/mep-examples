@@ -1,12 +1,23 @@
 #!/opt/radiohound/python313/bin/python
 """
-start_mep_rx_v2.py
+start_mep_rx.py
 
-Automate tuning and starting the RFSoC I/Q stream.
-Supports single-frequency capture and frequency sweep.
+MEP system controller — MQTT gateway for RFSoC, recorder, tuner, and AFE.
 
-All control is done via direct MQTT publishes — no subprocess calls,
-no hardware-driver imports (tuner_*, mep_rfsoc).
+Architecture:
+    MEPBus            — always-on MQTT connection, listener registry, thin command publishers
+    CaptureController — on-demand sweep/record orchestrator (owns sync-wait + recipes)
+    System functions   — pure subprocess utilities (Jetson power, network info, NTP)
+
+Usage (CLI):
+    python start_mep_rx.py -f1 7000 -f2 8000 -s 10 -d 60 -c A -r 10
+
+Usage (imported by mep_gui.py):
+    from start_mep_rx import MEPBus, CaptureController
+    bus = MEPBus()
+    cap = CaptureController(bus)
+    cap.configure_sweep(channel="A", sample_rate_mhz=10)
+    cap.run_sweep(freqs_hz, dwell_s=60)
 
 Author: john.marino@colorado.edu
 """
@@ -17,10 +28,13 @@ import time
 import logging
 import json
 import os
+import re
 import math
+import subprocess
+from collections import deque
 from datetime import datetime
 import threading
-from typing import Optional
+from typing import Optional, Callable
 import paho.mqtt.client as mqtt_lib
 
 # ===== CONFIG ===== #
@@ -28,226 +42,1174 @@ LOG_DIR     = os.path.join(os.path.expanduser("~"), "log", "spectrumx")
 MQTT_BROKER = "localhost"
 MQTT_PORT   = 1883
 
-RFSOC_CMD_TOPIC      = "rfsoc/command"
-RFSOC_STATUS_TOPIC   = "rfsoc/status"
-RECORDER_CMD_TOPIC   = "recorder/command"
+# Command and Status Topics
+RFSOC_CMD_TOPIC       = "rfsoc/command"
+RFSOC_STATUS_TOPIC    = "rfsoc/status"
+RECORDER_CMD_TOPIC    = "recorder/command"
 RECORDER_STATUS_TOPIC = "recorder/status"
-TUNER_CMD_TOPIC      = "tuner_control/command"
-TUNER_STATUS_TOPIC   = "tuner_control/status"
+TUNER_CMD_TOPIC       = "tuner_control/command"
+TUNER_STATUS_TOPIC    = "tuner_control/status"
+AFE_CMD_TOPIC         = "afe/command"
+AFE_RESPONSE_TOPIC    = "afe/response"
+AFE_STATUS_TOPIC      = "afe/status"
+AFE_ANNOUNCE_TOPIC    = "afe/announce"
+AFE_EVENT_TOPIC       = "afe/event"
+AFE_GNSS_TOPIC        = "afe/data/gps"
+AFE_IMU_TOPIC         = "afe/data/imu"
+AFE_MAG_TOPIC         = "afe/data/mag"
+AFE_HK_TOPIC          = "afe/data/hk"
+AFE_REGISTERS_TOPIC   = "afe/status/registers"
 
-STATUS_TOPICS = (RFSOC_STATUS_TOPIC, RECORDER_STATUS_TOPIC, TUNER_STATUS_TOPIC)
+# SPEC data topic pattern (matches any radiohound client spectrum stream)
+SPEC_TOPIC_PATTERN    = "radiohound/clients/data/#"
 
+# Topics that support synchronous _wait_for_status() during sweep orchestration
+_SYNC_STATUS_TOPICS = (RFSOC_STATUS_TOPIC, RECORDER_STATUS_TOPIC, TUNER_STATUS_TOPIC)
+
+# ===== RP2040 FIRMWARE REGISTER MAPS ===== #
+# Copy-paste directly from RP2040 circuitpython - do not modify! This is not the source of truth!
+# GUI derives presentation from these definitions.
+
+
+MISC_PINS = [
+    {"pin": 0, "name": "TRIG_TX_SRC_SEL",    "default": 1, "0": "Internal",       "1": "External"},
+    {"pin": 1, "name": "TRIG_RX_SRC_SEL",    "default": 1, "0": "Internal",       "1": "External"},
+    {"pin": 2, "name": "EXT_TX_TRIG_ENABLE", "default": 1, "0": "Enabled",        "1": "Disabled"},
+    {"pin": 3, "name": "EXT_RX_TRIG_ENABLE", "default": 1, "0": "Enabled",        "1": "Disabled"},
+    {"pin": 4, "name": "NOT_USED_4",          "default": 0, "0": "Reserved",       "1": "Reserved"},
+    {"pin": 5, "name": "EXT_BIAS_ENABLE",     "default": 0, "0": "Disabled",       "1": "Enabled"},
+    {"pin": 6, "name": "TEST_LED",            "default": 0, "0": "Off",            "1": "On"},
+    {"pin": 7, "name": "PPS_SOURCE_SEL",      "default": 1, "0": "External",       "1": "Internal GNSS"},
+    {"pin": 8, "name": "REF_SOURCE_SEL",      "default": 1, "0": "External",       "1": "Internal OCXO"},
+    {"pin": 9, "name": "GNSS_ANT_SEL",        "default": 0, "0": "External",       "1": "Internal"},
+]
+
+TX_PINS = [
+    {"pin": 0, "name": "NOT_USED_0",          "default": 0, "0": "Reserved",       "1": "Reserved"},
+    {"pin": 1, "name": "TX_BLANK_SEL",        "default": 1, "0": "Blanked",        "1": "Not blanked"},
+    {"pin": 2, "name": "FILTER_BYPASS_SEL",   "default": 1, "0": "Filtered",       "1": "Bypassed"},
+    {"pin": 3, "name": "NOT_USED_3",          "default": 0, "0": "Reserved",       "1": "Reserved"},
+    {"pin": 4, "name": "NOT_USED_4",          "default": 0, "0": "Reserved",       "1": "Reserved"},
+    {"pin": 5, "name": "NOT_USED_5",          "default": 0, "0": "Reserved",       "1": "Reserved"},
+    {"pin": 6, "name": "NOT_USED_6",          "default": 0, "0": "Reserved",       "1": "Reserved"},
+    {"pin": 7, "name": "NOT_USED_7",          "default": 0, "0": "Reserved",       "1": "Reserved"},
+    {"pin": 8, "name": "NOT_USED_8",          "default": 0, "0": "Reserved",       "1": "Reserved"},
+    {"pin": 9, "name": "TEST_LED",            "default": 0, "0": "Off",            "1": "On"},
+]
+
+RX_PINS = [
+    {"pin": 0, "name": "CHAN_BIAS_EN",        "default": 0, "0": "Disabled",       "1": "Enabled"},
+    {"pin": 1, "name": "INT_RF_TRIG_SEL",     "default": 1, "0": "Not asserted",   "1": "Asserted"},
+    {"pin": 2, "name": "FILTER_BYPASS_SEL",   "default": 1, "0": "Bypassed",       "1": "Filtered"},
+    {"pin": 3, "name": "AMP_BYPASS_SEL",      "default": 1, "0": "Bypassed",       "1": "Enabled"},
+    {"pin": 4, "name": "ATTEN_C1",            "default": 0, "0": "Skip +1dB",      "1": "Add +1dB"},
+    {"pin": 5, "name": "ATTEN_C2",            "default": 0, "0": "Skip +2dB",      "1": "Add +2dB"},
+    {"pin": 6, "name": "ATTEN_C4",            "default": 0, "0": "Skip +4dB",      "1": "Add +4dB"},
+    {"pin": 7, "name": "ATTEN_C8",            "default": 0, "0": "Skip +8dB",      "1": "Add +8dB"},
+    {"pin": 8, "name": "ATTEN_C16",           "default": 0, "0": "Skip +16dB",     "1": "Add +16dB"},
+    {"pin": 9, "name": "TEST_LED",            "default": 0, "0": "Off",            "1": "On"},
+]
+
+# Board layout: device name -> (pin_map, daisy_group, daisy_position)
+# daisy_group == chain length. daisy_position is 1-indexed from far end of chain.
+DEVICES = {
+    "misc": (MISC_PINS, 1, 1),
+    "tx1":  (TX_PINS,   2, 1),
+    "tx2":  (TX_PINS,   2, 2),
+    "rx1":  (RX_PINS,   4, 1),
+    "rx2":  (RX_PINS,   4, 2),
+    "rx3":  (RX_PINS,   4, 3),
+    "rx4":  (RX_PINS,   4, 4),
+}
+
+# Owned by the Recorder service. This is not the source of truth of this information.
 RECORDER_CHANNEL_PORTS = {"A": 60134, "B": 60133, "C": 60132, "D": 60131}
 
-# Which side does each physical tuner inject from?
-# Both available tuners are high-side: LO = RF + IF
 TUNER_INJECTION_SIDE = {
     "VALON":   "high",
     "LMX2820": "high",
     "TEST":    "high",
 }
 
-# External tuner names -> tuner_control service config names.
-TUNER_SERVICE_NAME_MAP = {
-    "VALON": "valon",
-    "LMX2820": "lmx2820",
-    "TEST": "dummy",
-}
+# Hardware configuration options (for dropdowns/validation)
+# CHANNEL_OPTIONS derived from RECORDER_CHANNEL_PORTS
+CHANNEL_OPTIONS     = list(sorted(RECORDER_CHANNEL_PORTS.keys()))
+TUNER_OPTIONS       = ["None"] + list(TUNER_INJECTION_SIDE.keys()) + ["auto"]
 
-
-def tuner_to_canonical_name(tuner):
-    """Normalize tuner token to one of VALON/LMX2820/TEST/AUTO/NONE."""
-    if tuner is None:
-        return "NONE"
-    token = str(tuner).strip().upper()
-    if token == "":
-        return "NONE"
-    if token == "AUTO":
-        return "AUTO"
-    if token == "NONE":
-        return "NONE"
-    if token == "DUMMY":
-        return "TEST"
-    return token
-
-
-def tuner_to_service_name(tuner):
-    """Map UI/CLI tuner name to tuner_control service config name."""
-    canonical = tuner_to_canonical_name(tuner)
-    if canonical in ("NONE", "AUTO"):
-        return canonical.lower()
-    return TUNER_SERVICE_NAME_MAP.get(canonical)
+RECORDER_CONFIG_DIR = "/opt/radiohound/docker/recorder/configs"
+DOCKER_COMPOSE_DIR = "/opt/radiohound/docker"
 
 GREEN = "\033[92m"
 RESET = "\033[0m"
 
 
-# ===== MEP CONTROLLER ===== #
+# ===== HELPERS ===== #
 
-class MEPController:
+def get_frequency_list(start_mhz: float, end_mhz: float, step_mhz: float):
+    start_hz = int(start_mhz * 1e6)
+    step_hz  = int(step_mhz  * 1e6)
+    if math.isnan(end_mhz):
+        return [start_hz]
+    end_hz = int(end_mhz * 1e6)
+    return range(start_hz, end_hz + step_hz, step_hz)
+
+
+def resolve_injection(tuner: str, injection_override: str = None) -> str:
+    """Determine injection side for a given tuner.
+    Returns 'high' or 'low'. Raises ValueError for unknown tuners.
     """
-    Orchestrates RFSoC, recorder, and tuner via MQTT.
+    if injection_override:
+        return injection_override
+    if tuner.lower() == "auto":
+        return "high"
+    if tuner.upper() in TUNER_INJECTION_SIDE:
+        return TUNER_INJECTION_SIDE[tuner.upper()]
+    raise ValueError(f"Tuner {tuner!r} not in TUNER_INJECTION_SIDE — add it or pass --injection")
 
-    Recipes (from system flowcharts):
-      tune_and_arm(f_hz)         — full tune+capture sequence (one step)
-      start_recorder()           — configure and enable DigitalRF recorder
-      stop_recorder()            — disable recorder
-      run_sweep(...)             — start recorder, loop tune_and_arm, dwell
-      run_single(f_hz)           — single freq; restarts recorder only if
-                                   sample_rate or channel changed
-    """
 
-    def __init__(
-        self,
-        channel:      str,
-        sample_rate:  int,
-        tuner:        str   = None,   # "VALON", "LMX2820", "TEST", "auto", or None
-        adc_if:       float = None,   # Fixed RFSoC IF in MHz (required with tuner)
-        injection:    str   = None,   # "high"/"low" — overrides TUNER_INJECTION_SIDE
-        capture_name: str   = None,   # Save under {capture_name}/sr.../ch...; None → ringbuffer
-        broker:       str   = MQTT_BROKER,
-        port:         int   = MQTT_PORT,
-    ):
-        self.channel      = channel.upper()
-        self.sample_rate  = sample_rate
-        self.tuner        = tuner_to_canonical_name(tuner)
-        self.adc_if       = adc_if
-        self.capture_name = capture_name
-
-        # Injection side: only meaningful when a tuner is present
-        if self.tuner in (None, "NONE"):
-            self.injection = None
-        elif injection is not None:
-            self.injection = injection                          # explicit CLI override
-        elif self.tuner == "AUTO":
-            self.injection = "high"                            # auto-detect: both known tuners are high-side
-        elif self.tuner in TUNER_INJECTION_SIDE:
-            self.injection = TUNER_INJECTION_SIDE[self.tuner]
-        else:
-            raise ValueError(f"Tuner {self.tuner!r} not in TUNER_INJECTION_SIDE — add it")
-
-        # "What changed" state — tracks what the recorder was last configured with
-        self._active_channel     = None
-        self._active_sample_rate = None
-        self._recorder_running   = False
-
-        # Tuner lifecycle state
-        self._tuner_initialized = False
-        self._resolved_tuner    = None
-
-        # Stop flag — set by request_stop() to interrupt _dwell() and run_sweep()
-        self._stop_flag = threading.Event()
-
-        # ---- MQTT setup ----
-        self._tlm       = None
-        self._tlm_lock  = threading.Lock()
-        self._tlm_event = threading.Event()
-
-        # Per-topic status storage for feedback from recorder and tuner services
-        self._status       = {t: None  for t in STATUS_TOPICS}
-        self._status_lock  = threading.Lock()
-        self._status_events = {t: threading.Event() for t in STATUS_TOPICS}
-
-        self._client = mqtt_lib.Client(
-            callback_api_version=mqtt_lib.CallbackAPIVersion.VERSION2,
-            client_id=f"mep_rx_v2_{int(time.time())}",
+def tuner_type_arg(x: str):
+    """argparse type handler — allows None/none/auto or a known tuner name."""
+    x_lower = x.strip().lower()
+    if x_lower == "none":
+        return None
+    if x_lower == "auto":
+        return "auto"
+    x_upper = x.strip().upper()
+    if x_upper not in TUNER_INJECTION_SIDE:
+        raise argparse.ArgumentTypeError(
+            f"Invalid tuner '{x}'. Valid: {list(TUNER_INJECTION_SIDE.keys())}, auto, None"
         )
-        self._client.on_connect    = self._on_connect
-        self._client.on_message    = self._on_message
+    return x_upper
+
+
+def discover_sample_rate_options(recorder_config_dir: str = RECORDER_CONFIG_DIR) -> list[str]:
+    """Discover available sample rates from recorder config filenames (sr{N}MHz.yaml).
+    
+    Falls back to default options if directory doesn't exist or no configs match.
+    """
+    default_rates = ["1", "2", "4", "8", "10", "16", "20", "32", "64"]
+    pattern = re.compile(r"^sr(\d+)MHz\.yaml$")
+    rates = set()
+    
+    try:
+        for name in os.listdir(recorder_config_dir):
+            match = pattern.match(name)
+            if match:
+                rates.add(int(match.group(1)))
+    except OSError as e:
+        logging.warning(
+            "Could not read recorder config directory '%s': %s. Using default sample rates.",
+            recorder_config_dir,
+            e,
+        )
+        return default_rates.copy()
+    
+    if not rates:
+        logging.warning(
+            "No sample-rate configs matching 'sr{N}MHz.yaml' in '%s'. Using default sample rates.",
+            recorder_config_dir,
+        )
+        return default_rates.copy()
+    
+    return [str(rate) for rate in sorted(rates)]
+
+
+def derive_spec_topic_from_primary_mac(spec_topic_prefix: str = "radiohound/clients/data/") -> Optional[str]:
+    """Build radiohound data topic from the system primary-route MAC address.
+    
+    Returns the derived topic string, or None if system network info cannot be read.
+    Logs detailed errors but does not raise exceptions.
+    """
+    primary_if = None
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8") as fh:
+            next(fh, None)  # header
+            for line in fh:
+                cols = line.strip().split()
+                if len(cols) < 4:
+                    continue
+                iface, dest_hex, _gateway_hex, flags_hex = cols[0], cols[1], cols[2], cols[3]
+                if dest_hex != "00000000":
+                    continue
+                flags = int(flags_hex, 16)
+                if (flags & 0x2) == 0:
+                    continue
+                primary_if = iface
+                break
+    except Exception as e:
+        logging.warning(f"SPEC topic derivation failed reading /proc/net/route: {e}")
+        return None
+    
+    if not primary_if:
+        logging.warning("SPEC topic derivation failed: no primary route interface found")
+        return None
+    
+    mac_path = f"/sys/class/net/{primary_if}/address"
+    try:
+        with open(mac_path, "r", encoding="utf-8") as fh:
+            mac = fh.read().strip().lower()
+    except Exception as e:
+        logging.warning(f"SPEC topic derivation failed reading {mac_path}: {e}")
+        return None
+    
+    if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", mac):
+        logging.warning(f"SPEC topic derivation failed: invalid MAC '{mac}' on {primary_if}")
+        return None
+    
+    node_id = mac.replace(":", "")
+    topic = f"{spec_topic_prefix}{node_id}"
+    logging.info(f"Derived SPEC topic: {topic} (from {primary_if} MAC {mac})")
+    return topic
+
+
+# ===== Discover available sample rates from recorder configs ===== #
+SAMPLE_RATE_OPTIONS = discover_sample_rate_options()
+
+# ===== SYSTEM-LEVEL FUNCTIONS (pure subprocess, no MQTT) ===== #
+
+def sync_ntp_on_rfsoc(scripts_dir: str = None) -> bool:
+    """Run NTP sync script on RFSoC. Returns True if successful."""
+    if scripts_dir is None:
+        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+
+    script_path = os.path.join(scripts_dir, "rfsoc_update_ntp.bash")
+    try:
+        result = os.system(script_path)
+        if result == 0:
+            logging.info("NTP sync completed successfully")
+            return True
+        else:
+            logging.warning(f"NTP sync script exited with code {result}")
+            return False
+    except Exception as e:
+        logging.warning(f"Failed to run NTP sync: {e}")
+        return False
+
+
+def get_primary_network_info_detailed() -> dict:
+    """Query primary network interface info with structured diagnostics.
+
+    Returns:
+      {
+        "status": str,
+        "mac": str,
+        "ipv4": str,
+        "error_code": str|None,
+        "detail": str|None,
+      }
+    """
+    result = {
+        "status": "Offline",
+        "mac": "-",
+        "ipv4": "-",
+        "error_code": None,
+        "detail": None,
+    }
+
+    iface = None
+    try:
+        out = subprocess.check_output(["ip", "route", "show", "default"], text=True, timeout=1.0)
+        m = re.search(r"\bdev\s+(\S+)", out)
+        if m:
+            iface = m.group(1)
+    except Exception as e:
+        logging.debug(f"Failed to get primary interface via 'ip route': {e}")
+        result["error_code"] = "ip_route_failed"
+        result["detail"] = str(e)
+
+    if not iface:
+        try:
+            ifaces = [n for n in os.listdir("/sys/class/net") if n != "lo"]
+            if ifaces:
+                iface = sorted(ifaces)[0]
+        except Exception as e:
+            logging.debug(f"Failed to list network interfaces: {e}")
+            result["error_code"] = "list_interfaces_failed"
+            result["detail"] = str(e)
+
+    if not iface:
+        if result["error_code"] is None:
+            result["error_code"] = "no_interface"
+            result["detail"] = "No primary network interface found"
+        return result
+
+    mac = "-"
+    ip4 = "-"
+    oper = "unknown"
+
+    try:
+        with open(f"/sys/class/net/{iface}/address", "r", encoding="utf-8") as f:
+            mac = f.read().strip() or "-"
+    except Exception as e:
+        logging.debug(f"Failed to read MAC for {iface}: {e}")
+        if result["error_code"] is None:
+            result["error_code"] = "read_mac_failed"
+            result["detail"] = str(e)
+
+    try:
+        with open(f"/sys/class/net/{iface}/operstate", "r", encoding="utf-8") as f:
+            oper = (f.read().strip() or "unknown").lower()
+    except Exception as e:
+        logging.debug(f"Failed to read operstate for {iface}: {e}")
+        if result["error_code"] is None:
+            result["error_code"] = "read_operstate_failed"
+            result["detail"] = str(e)
+
+    try:
+        out = subprocess.check_output(["ip", "-4", "addr", "show", "dev", iface], text=True, timeout=1.0)
+        m = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)\/", out)
+        if m:
+            ip4 = m.group(1)
+    except Exception as e:
+        logging.debug(f"Failed to get IPv4 address for {iface}: {e}")
+        if result["error_code"] is None:
+            result["error_code"] = "read_ipv4_failed"
+            result["detail"] = str(e)
+
+    online = (oper == "up") and (ip4 != "-")
+    result["status"] = f"{'Online' if online else 'Offline'} ({iface})"
+    result["mac"] = mac
+    result["ipv4"] = ip4
+    if not online and result["error_code"] is None:
+        result["error_code"] = "interface_not_online"
+        result["detail"] = f"operstate={oper}, ipv4={ip4}"
+    return result
+
+
+def get_primary_network_info() -> tuple[str, str, str]:
+    """Query primary network interface info. Returns (status, mac, ipv4)."""
+    details = get_primary_network_info_detailed()
+    return details["status"], details["mac"], details["ipv4"]
+
+
+def get_thermal_info_detailed(limit: int = 6) -> dict:
+    """Read thermal zones with structured diagnostics.
+
+    Returns:
+      {
+        "temps": list[tuple[str, float]],
+        "error_code": str|None,
+        "detail": str|None,
+      }
+    """
+    result = {
+        "temps": [],
+        "error_code": None,
+        "detail": None,
+    }
+    base = "/sys/class/thermal"
+    try:
+        entries = sorted(name for name in os.listdir(base) if name.startswith("thermal_zone"))
+    except Exception as e:
+        result["error_code"] = "list_thermal_failed"
+        result["detail"] = str(e)
+        return result
+
+    if not entries:
+        result["error_code"] = "no_thermal_zones"
+        result["detail"] = "No thermal_zone entries found"
+        return result
+
+    read_errors = []
+    temps = []
+    for name in entries:
+        t_path = os.path.join(base, name, "temp")
+        ty_path = os.path.join(base, name, "type")
+        try:
+            with open(t_path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+            with open(ty_path, "r", encoding="utf-8") as f:
+                tname = f.read().strip()
+            temp_c = float(raw) / 1000.0
+            if -100.0 <= temp_c <= 250.0:
+                temps.append((tname or name, temp_c))
+        except Exception as e:
+            read_errors.append(f"{name}: {e}")
+            continue
+
+        if len(temps) >= limit:
+            break
+
+    result["temps"] = temps
+    if not temps:
+        result["error_code"] = "thermal_read_failed"
+        result["detail"] = "; ".join(read_errors) if read_errors else "No valid thermal readings"
+    elif read_errors:
+        result["error_code"] = "thermal_partial"
+        result["detail"] = "; ".join(read_errors)
+    return result
+
+
+def get_docker_status() -> dict:
+    """Query docker engine and compose service status."""
+    result = {
+        "engine_status": "unavailable",
+        "services_summary": "0/0",
+        "last_refresh": datetime.now().strftime("%H:%M:%S"),
+    }
+
+    try:
+        subprocess.run(
+            ["docker", "ps", "-q"],
+            capture_output=True, text=True, timeout=5,
+        )
+        result["engine_status"] = "running"
+    except Exception as e:
+        logging.debug(f"Docker query failed: {e}")
+        return result
+
+    try:
+        compose_output = subprocess.run(
+            ["docker", "compose", "-f", "/opt/radiohound/docker/docker-compose.yaml", "ps", "--format=json"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if compose_output.returncode == 0:
+            try:
+                services = json.loads(compose_output.stdout) if compose_output.stdout.strip() else []
+                running = sum(1 for s in services if isinstance(s, dict) and s.get("State") == "running")
+                total = len(services)
+                result["services_summary"] = f"{running}/{total}"
+            except Exception:
+                result["services_summary"] = "?/?"
+    except Exception as e:
+        logging.debug(f"Docker compose query failed: {e}")
+
+    return result
+
+
+def get_jetson_power_mode() -> Optional[tuple[str, str]]:
+    """Query Jetson nvpmodel power mode. Returns (mode_id, mode_name) or None."""
+    try:
+        out = subprocess.check_output(
+            ["nvpmodel", "-q"],
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+            text=True,
+        )
+    except Exception as e:
+        logging.debug(f"Failed to query nvpmodel: {e}")
+        return None
+
+    mode_name = None
+    mode_id = None
+    for line in out.splitlines():
+        s = line.strip()
+        m = re.search(r"NV\s*Power\s*Mode\s*:\s*(.+)$", s, re.IGNORECASE)
+        if m:
+            mode_name = m.group(1).strip()
+            continue
+        m = re.search(r"Power\s*Mode\s*:\s*(.+)$", s, re.IGNORECASE)
+        if m:
+            mode_name = m.group(1).strip()
+            continue
+        if s.isdigit():
+            mode_id = s
+
+    return (mode_id, mode_name) if mode_id or mode_name else None
+
+
+def set_jetson_power_mode(mode_id: str) -> bool:
+    """Set Jetson nvpmodel power mode. Returns True if successful."""
+    result = set_jetson_power_mode_detailed(mode_id)
+    if result.get("ok"):
+        return True
+
+    logging.error(
+        "Failed to set Jetson power mode %s (%s): %s",
+        mode_id,
+        result.get("error_code") or "unknown",
+        result.get("detail") or "no detail",
+    )
+    return False
+
+
+def set_jetson_power_mode_detailed(mode_id: str) -> dict:
+    """Set Jetson nvpmodel mode with structured diagnostics.
+
+    Returns a dict:
+      {"ok": bool, "mode_id": str, "error_code": str|None, "detail": str|None}
+    """
+    result = {
+        "ok": False,
+        "mode_id": str(mode_id),
+        "error_code": None,
+        "detail": None,
+    }
+
+    try:
+        cmd = ["nvpmodel", "-m", str(mode_id)]
+        cmd_prefix = []
+
+        if os.geteuid() != 0:
+            try:
+                check = subprocess.run(
+                    ["sudo", "-n", "true"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=2.0,
+                )
+            except subprocess.TimeoutExpired:
+                result["error_code"] = "sudo_check_timeout"
+                result["detail"] = "sudo availability check timed out"
+                return result
+
+            if check.returncode != 0:
+                result["error_code"] = "sudo_not_available"
+                result["detail"] = (check.stderr or check.stdout or "passwordless sudo unavailable").strip()
+                return result
+
+            cmd_prefix = ["sudo", "-n"]
+            cmd = [*cmd_prefix, *cmd]
+
+        try:
+            probe = subprocess.run(
+                [*cmd_prefix, "nvpmodel", "-q"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=8.0,
+            )
+        except subprocess.TimeoutExpired:
+            result["error_code"] = "probe_timeout"
+            result["detail"] = "nvpmodel probe timed out"
+            return result
+
+        if probe.returncode != 0:
+            result["error_code"] = "probe_failed"
+            result["detail"] = (probe.stderr or probe.stdout or "nvpmodel -q failed").strip()
+            return result
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                input="YES\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15.0,
+            )
+        except subprocess.TimeoutExpired:
+            result["error_code"] = "apply_timeout"
+            result["detail"] = "nvpmodel apply timed out"
+            return result
+
+        if proc.returncode != 0:
+            result["error_code"] = "apply_failed"
+            result["detail"] = (proc.stderr or proc.stdout or "nvpmodel -m failed").strip()
+            return result
+
+        result["ok"] = True
+        output = ((proc.stdout or "") + " " + (proc.stderr or "")).strip()
+        result["detail"] = output or "nvpmodel accepted mode"
+        logging.info(f"Jetson power mode set to {mode_id}")
+        return result
+    except FileNotFoundError:
+        result["error_code"] = "nvpmodel_not_found"
+        result["detail"] = "nvpmodel command not found"
+        return result
+    except Exception as e:
+        result["error_code"] = "exception"
+        result["detail"] = str(e)
+        return result
+
+
+# ===== MEP BUS ===== #
+
+class MEPBus:
+    """Always-on MQTT connection, listener registry, and thin command publishers.
+
+    Created at startup (GUI or CLI). Subscribes to all topics (#) so callers
+    can register listeners for any status/data feed. Never None once constructed.
+
+    Thin publishers: rfsoc_reset(), tuner_*, recorder_*, afe_* — fire-and-forget
+    MQTT commands. No sweep state, no sync waits, no subprocess calls.
+    """
+
+    def __init__(self, broker: str = MQTT_BROKER, port: int = MQTT_PORT):
+        self._broker = broker
+        self._port = port
+
+        # ---- Listener registry ----
+        self._listeners: dict[str, list[Callable]] = {}
+        self._global_listeners: list[Callable] = []
+        self._pattern_listeners: list[tuple[str, Callable]] = []
+        self._connection_listeners: list[Callable[[dict], None]] = []
+        self._status_cache: dict[str, dict] = {}
+        self._cache_lock = threading.Lock()
+
+        # ---- MQTT connection state ----
+        self._connected = False
+        self._last_error: Optional[str] = None
+        self._loop_started = False
+
+        # ---- AFE announce (retained — full service schema + capabilities) ----
+        self.afe_announce: Optional[dict] = None
+
+        # ---- SPEC topic (pattern for radiohound client spectrum streams) ----
+        self.spec_topic = SPEC_TOPIC_PATTERN
+
+        # ---- MQTT client ----
+        self._client = mqtt_lib.Client(
+            callback_api_version=mqtt_lib.CallbackAPIVersion.VERSION1,
+            client_id=f"mep_bus_{int(time.time())}",
+        )
+        self._client.on_connect = self._on_connect
+        self._client.on_message = self._on_message
         self._client.on_disconnect = self._on_disconnect
 
         logging.info(f"Connecting to MQTT broker {broker}:{port}")
-        self._client.connect(broker, port, keepalive=60)
-        self._client.loop_start()
-        time.sleep(0.5)
+        try:
+            self._client.connect(broker, port, keepalive=60)
+            self._client.loop_start()
+            self._loop_started = True
+            time.sleep(0.5)
+        except OSError as e:
+            self._last_error = str(e)
+            self._connected = False
+            logging.warning(
+                "MQTT offline: could not connect to %s:%s (%s). Running in offline mode.",
+                broker,
+                port,
+                e,
+            )
 
-        # Initialize tuner once for this controller lifecycle.
-        if self.tuner is not None:
-            self._ensure_tuner_initialized(force=False)
+    # ------------------------------------------------------------------ #
+    #  Listener registry                                                   #
+    # ------------------------------------------------------------------ #
+
+    def on_status(self, topic: str, callback: Callable[[dict], None]):
+        """Register callback(data: dict) for JSON messages on a specific topic."""
+        self._listeners.setdefault(topic, []).append(callback)
+
+    def on_message(self, callback: Callable[[str, bytes], None]):
+        """Register callback(topic, payload_bytes) for ALL MQTT messages."""
+        self._global_listeners.append(callback)
+
+    def on_status_pattern(self, pattern: str, callback: Callable[[str, dict], None]):
+        """Register callback(topic, data) for JSON messages matching MQTT wildcard pattern.
+        
+        Supports MQTT wildcards:
+        - '+' matches exactly one level between slashes
+        - '#' matches zero or more levels at end (must be last character)
+        
+        Example: on_status_pattern("radiohound/clients/data/+", handler)
+        """
+        self._pattern_listeners.append((pattern, callback))
+
+    def on_connection_state(self, callback: Callable[[dict], None], emit_initial: bool = True):
+        """Register callback(status_dict) for MQTT connection state changes."""
+        self._connection_listeners.append(callback)
+        if emit_initial:
+            try:
+                callback(self.get_connection_status())
+            except Exception as e:
+                logging.warning(f"Connection listener failed during initial emit: {e}")
+
+    def remove_connection_listener(self, callback: Callable[[dict], None]):
+        """Unregister a previously registered connection state listener."""
+        listeners = self._connection_listeners
+        if callback in listeners:
+            listeners.remove(callback)
+
+    def remove_listener(self, topic: str, callback: Callable):
+        """Unregister a previously registered topic listener."""
+        listeners = self._listeners.get(topic, [])
+        if callback in listeners:
+            listeners.remove(callback)
+
+    def get_cached_status(self, topic: str) -> Optional[dict]:
+        """Return last seen JSON message on topic, or None."""
+        with self._cache_lock:
+            return self._status_cache.get(topic)
+
+    def get_tuner_status_normalized(self) -> Optional[dict]:
+        """Return normalized tuner status from cached MQTT payload, or None."""
+        return self.normalize_tuner_status(self.get_cached_status(TUNER_STATUS_TOPIC))
+
+    def is_connected(self) -> bool:
+        """Return True when MQTT client is currently connected to the broker."""
+        return self._connected
+
+    def get_connection_status(self) -> dict:
+        """Return current MQTT connection state for UI/CLI display."""
+        return {
+            "connected": self._connected,
+            "broker": self._broker,
+            "port": self._port,
+            "last_error": self._last_error,
+        }
+
+    def reconnect(self) -> bool:
+        """Attempt one MQTT reconnect cycle. Returns True on success."""
+        try:
+            self._client.reconnect()
+            if not self._loop_started:
+                self._client.loop_start()
+                self._loop_started = True
+            return True
+        except OSError as e:
+            self._last_error = str(e)
+            self._connected = False
+            logging.warning(
+                "MQTT reconnect failed for %s:%s (%s)",
+                self._broker,
+                self._port,
+                e,
+            )
+            self._emit_connection_state()
+            return False
+
+    def _emit_connection_state(self):
+        """Notify registered listeners of current MQTT connection state."""
+        status = self.get_connection_status()
+        for cb in list(self._connection_listeners):
+            try:
+                cb(status)
+            except Exception as e:
+                logging.warning(f"Connection listener failed: {e}")
 
     # ------------------------------------------------------------------ #
     #  MQTT internals                                                      #
     # ------------------------------------------------------------------ #
 
-    def _on_connect(self, client, userdata, flags, reason_code, properties):
-        rc_value = getattr(reason_code, "value", reason_code)
-        try:
-            rc_num = int(rc_value)
-        except (TypeError, ValueError):
-            rc_num = None
-        is_failure = getattr(reason_code, "is_failure", None)
-        connected = (not is_failure) if isinstance(is_failure, bool) else (rc_num == 0)
-
-        if connected:
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self._connected = True
+            self._last_error = None
             logging.info("MQTT connected")
-            for topic in STATUS_TOPICS:
-                client.subscribe(topic)
-                logging.debug(f"Subscribed to {topic}")
+            self._emit_connection_state()
+            client.subscribe("#")
         else:
-            logging.error(f"MQTT connect failed: rc={rc_num} ({reason_code})")
+            self._connected = False
+            self._last_error = f"rc={rc}"
+            logging.error(f"MQTT connect failed: rc={rc}")
+            self._emit_connection_state()
 
     def _on_message(self, client, userdata, msg):
+        # Fire global listeners (raw bytes — for MQTT log tab)
+        for cb in self._global_listeners:
+            cb(msg.topic, msg.payload)
+
+        # Parse JSON
         try:
             data = json.loads(msg.payload.decode())
-        except Exception as e:
-            logging.warning(f"Failed to parse message on {msg.topic}: {e}")
+        except Exception:
             return
 
-        if msg.topic == RFSOC_STATUS_TOPIC:
-            with self._tlm_lock:
-                self._tlm = data
-            self._tlm_event.set()
+        # Update status cache
+        if isinstance(data, dict):
+            with self._cache_lock:
+                self._status_cache[msg.topic] = data
 
-        if msg.topic in STATUS_TOPICS:
-            with self._status_lock:
-                self._status[msg.topic] = data
-            self._status_events[msg.topic].set()
-            logging.debug(f"[{msg.topic}] {data}")
+        # Intercept afe/announce (retained) — cache full schema
+        if msg.topic == AFE_ANNOUNCE_TOPIC and isinstance(data, dict):
+            self.afe_announce = data
+            logging.info(f"AFE announce received: v{data.get('version', '?')}")
 
-    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
-        rc_value = getattr(reason_code, "value", reason_code)
-        try:
-            rc_num = int(rc_value)
-        except (TypeError, ValueError):
-            rc_num = None
-        is_failure = getattr(reason_code, "is_failure", None)
-        unexpected = bool(is_failure) if isinstance(is_failure, bool) else (rc_num != 0)
+        # Fire exact-match topic-specific listeners
+        for cb in self._listeners.get(msg.topic, []):
+            cb(data)
+        
+        # Fire pattern-match listeners
+        if isinstance(data, dict):
+            for pattern, cb in self._pattern_listeners:
+                if self._mqtt_topic_matches(msg.topic, pattern):
+                    cb(msg.topic, data)
 
-        if unexpected:
-            logging.warning(f"MQTT unexpectedly disconnected: rc={rc_num} ({reason_code})")
+    def _on_disconnect(self, client, userdata, rc):
+        self._connected = False
+        if rc != 0:
+            self._last_error = f"disconnect rc={rc}"
+            logging.warning(f"MQTT unexpectedly disconnected: rc={rc}")
+        self._emit_connection_state()
 
-    def _publish(self, topic: str, payload: dict, sleep_s: float = 0.1):
-        self._client.publish(topic, json.dumps(payload))
+    def _mqtt_topic_matches(self, topic: str, pattern: str) -> bool:
+        """Check if topic matches MQTT wildcard pattern.
+        
+        '+' matches exactly one level between slashes
+        '#' matches zero or more levels at end
+        """
+        topic_parts = topic.split('/')
+        pattern_parts = pattern.split('/')
+        
+        # Quick exit: pattern longer than topic (unless ends with #)
+        if len(pattern_parts) > len(topic_parts) and pattern_parts[-1] != '#':
+            return False
+        
+        for i, p_part in enumerate(pattern_parts):
+            if p_part == '#':
+                # Multi-level wildcard matches rest of topic
+                return True
+            if i >= len(topic_parts):
+                return False
+            if p_part == '+':
+                # Single-level wildcard matches this level
+                continue
+            if p_part != topic_parts[i]:
+                # Exact match required, failed
+                return False
+        
+        # All pattern parts matched; topic must be same length
+        return len(topic_parts) == len(pattern_parts)
+
+    def publish_command(self, topic: str, payload: dict, sleep_s: float = 0.1):
+        """Publish a JSON command to a topic. Used by CaptureController and thin publishers."""
+        if not self._connected:
+            logging.warning(
+                "MQTT offline: command not sent to %s payload=%s",
+                topic,
+                payload,
+            )
+            return False
+
+        info = self._client.publish(topic, json.dumps(payload))
+        if info.rc != mqtt_lib.MQTT_ERR_SUCCESS:
+            self._last_error = f"publish rc={info.rc}"
+            logging.warning("MQTT publish failed: topic=%s rc=%s", topic, info.rc)
+            return False
+
         if sleep_s:
             time.sleep(sleep_s)
+        return True
 
-    def _get_tlm(self, timeout_s: float = 2.0):
-        """Request and return the latest RFSoC telemetry, or None on timeout."""
-        with self._tlm_lock:
-            self._tlm = None
-        self._tlm_event.clear()
-        self._client.publish(RFSOC_CMD_TOPIC, json.dumps({"task_name": "get", "arguments": ["tlm"]}))
-        if self._tlm_event.wait(timeout=timeout_s):
-            with self._tlm_lock:
-                return self._tlm
-        return None
+    def publish(self, topic: str, payload_str: str):
+        """Publish a raw string payload to a topic. For debug/manual use."""
+        if not self._connected:
+            logging.warning("MQTT offline: publish not sent to %s", topic)
+            return False
 
-    def _wait_for_status(self, topic: str, timeout_s: float = 2.0):
-        """Wait for a status message on the given topic, return payload or None.
+        info = self._client.publish(topic, payload_str)
+        if info.rc != mqtt_lib.MQTT_ERR_SUCCESS:
+            self._last_error = f"publish rc={info.rc}"
+            logging.warning("MQTT publish failed: topic=%s rc=%s", topic, info.rc)
+            return False
+        return True
 
-        Clears the event before waiting so that the next message arriving after
-        this call is captured, not a stale one from before.
-        """
-        if topic not in self._status_events:
-            raise ValueError(f"Unknown status topic: {topic!r}")
-        self._status_events[topic].clear()
-        with self._status_lock:
-            self._status[topic] = None
-        if self._status_events[topic].wait(timeout=timeout_s):
-            with self._status_lock:
-                return self._status[topic]
-        logging.warning(f"No status response from {topic} within {timeout_s}s — service may not be running")
-        return None
+    def disconnect(self):
+        if self._loop_started:
+            self._client.loop_stop()
+            self._loop_started = False
+        self._client.disconnect()
+
+    # ------------------------------------------------------------------ #
+    #  RFSoC                                                               #
+    # ------------------------------------------------------------------ #
+
+    def rfsoc_reset(self):
+        """Send reset command to RFSoC."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "reset"})
+
+    def rfsoc_get_tlm(self):
+        """Request RFSoC telemetry publish on rfsoc/status."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "get", "arguments": ["tlm"]}, sleep_s=0)
+
+    def rfsoc_capture_next_pps(self):
+        """Arm capture on next PPS edge."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "capture_next_pps"})
+
+    def rfsoc_set_if(self, if_mhz: float):
+        """Set RFSoC IF frequency in MHz."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {if_mhz}"})
+
+    # ------------------------------------------------------------------ #
+    #  Tuner                                                               #
+    # ------------------------------------------------------------------ #
+
+    def tuner_init(self, force_tuner: str = None):
+        """Send init_tuner command."""
+        args = {"force_tuner": force_tuner} if force_tuner else {}
+        self.publish_command(TUNER_CMD_TOPIC, {"task_name": "init_tuner", "arguments": args})
+
+    def tuner_set_freq(self, freq_mhz: float):
+        self.publish_command(TUNER_CMD_TOPIC, {"task_name": "set_freq", "arguments": {"freq_mhz": freq_mhz}})
+
+    def tuner_get_freq(self):
+        self.publish_command(TUNER_CMD_TOPIC, {"task_name": "get_freq", "arguments": {}})
+
+    def tuner_set_power(self, pwr_dbm: float):
+        self.publish_command(TUNER_CMD_TOPIC, {"task_name": "set_power", "arguments": {"pwr_dbm": pwr_dbm}})
+
+    def tuner_get_power(self):
+        self.publish_command(TUNER_CMD_TOPIC, {"task_name": "get_power", "arguments": {}})
+
+    def tuner_check_lock(self):
+        self.publish_command(TUNER_CMD_TOPIC, {"task_name": "get_lock_status", "arguments": {}})
+
+    def tuner_restart(self):
+        self.publish_command(TUNER_CMD_TOPIC, {"task_name": "restart_tuner", "arguments": {}})
+
+    def tuner_status(self):
+        self.publish_command(TUNER_CMD_TOPIC, {"task_name": "status", "arguments": {}})
+
+    # ------------------------------------------------------------------ #
+    #  Recorder                                                            #
+    # ------------------------------------------------------------------ #
+
+    def recorder_config_set(self, key: str, value):
+        """Send a config.set command to the recorder."""
+        self.publish_command(RECORDER_CMD_TOPIC, {
+            "task_name": "config.set",
+            "arguments": {"key": key, "value": value},
+        })
+
+    def recorder_config_load(self, config_name: str):
+        """Send a config.load command to the recorder."""
+        self.publish_command(RECORDER_CMD_TOPIC, {
+            "task_name": "config.load",
+            "arguments": {"name": config_name},
+        })
+
+    def recorder_enable(self):
+        self.publish_command(RECORDER_CMD_TOPIC, {"task_name": "enable"})
+
+    def recorder_disable(self):
+        self.publish_command(RECORDER_CMD_TOPIC, {"task_name": "disable"})
+
+    # ------------------------------------------------------------------ #
+    #  AFE (MQTT-based service)                                            #
+    # ------------------------------------------------------------------ #
+
+    def afe_set_register(self, device: str, register: str, value: int):
+        """Set a single AFE register by name."""
+        self.publish_command(f"{AFE_CMD_TOPIC}/registers", {
+            "task_name": "set_register",
+            "arguments": {"device": device, "register": register, "value": value},
+        })
+
+    def afe_set_registers(self, device: str, registers: dict):
+        """Bulk set multiple registers for a device."""
+        args = {"device": device}
+        args.update(registers)
+        self.publish_command(f"{AFE_CMD_TOPIC}/registers", {
+            "task_name": "set_registers",
+            "arguments": args,
+        })
+
+    def afe_set_attenuation(self, device: str, db: int):
+        """Set RX attenuation 0-31 dB."""
+        if not (0 <= db <= 31):
+            raise ValueError(f"Attenuation must be 0-31 dB, got {db}")
+        self.publish_command(f"{AFE_CMD_TOPIC}/registers", {
+            "task_name": "set_attenuation_db",
+            "arguments": {"device": device, "db": db},
+        })
+
+    def afe_get_registers(self, device: str = "all"):
+        """Query register state from AFE firmware."""
+        self.publish_command(f"{AFE_CMD_TOPIC}/registers", {
+            "task_name": "get_registers",
+            "arguments": {"device": device},
+        })
+
+    def afe_status(self):
+        """Request AFE service status."""
+        self.publish_command(AFE_CMD_TOPIC, {"task_name": "status", "arguments": {}})
+
+    def afe_describe(self):
+        """Request AFE service capabilities and available commands."""
+        self.publish_command(AFE_CMD_TOPIC, {"task_name": "describe", "arguments": {}})
+
+    def afe_telem_dump(self):
+        """Request one-shot telemetry dump from AFE service."""
+        self.publish_command(AFE_CMD_TOPIC, {"task_name": "telem_dump", "arguments": {}})
+
+    # ---- IMU ----
+
+    def afe_set_acc_odr(self, odr: str):
+        self.publish_command(f"{AFE_CMD_TOPIC}/imu", {
+            "task_name": "set_acc_odr",
+            "arguments": {"odr": odr},
+        })
+
+    def afe_set_gyr_odr(self, odr: str):
+        self.publish_command(f"{AFE_CMD_TOPIC}/imu", {
+            "task_name": "set_gyr_odr",
+            "arguments": {"odr": odr},
+        })
+
+    def afe_set_imu_config(self, acc_odr: str = None, gyr_odr: str = None,
+                           ahiperf: int = None, aulp: int = None, glp: int = None):
+        args = {}
+        if acc_odr is not None:
+            args["acc_odr"] = acc_odr
+        if gyr_odr is not None:
+            args["gyr_odr"] = gyr_odr
+        if ahiperf is not None:
+            args["ahiperf"] = ahiperf
+        if aulp is not None:
+            args["aulp"] = aulp
+        if glp is not None:
+            args["glp"] = glp
+        self.publish_command(f"{AFE_CMD_TOPIC}/imu", {
+            "task_name": "set_imu",
+            "arguments": args,
+        })
+
+    def afe_get_imu_params(self):
+        self.publish_command(f"{AFE_CMD_TOPIC}/imu", {
+            "task_name": "get_imu_params",
+            "arguments": {},
+        })
+
+    # ---- Magnetometer ----
+
+    def afe_set_mag_cycle_count(self, ccr: int):
+        self.publish_command(f"{AFE_CMD_TOPIC}/mag", {
+            "task_name": "set_cycle_count",
+            "arguments": {"ccr": ccr},
+        })
+
+    def afe_set_mag_update_rate(self, updr: int):
+        self.publish_command(f"{AFE_CMD_TOPIC}/mag", {
+            "task_name": "set_update_rate",
+            "arguments": {"updr": updr},
+        })
+
+    def afe_set_mag_config(self, ccr: int = None, updr: int = None):
+        args = {}
+        if ccr is not None:
+            args["ccr"] = ccr
+        if updr is not None:
+            args["updr"] = updr
+        self.publish_command(f"{AFE_CMD_TOPIC}/mag", {
+            "task_name": "set_mag",
+            "arguments": args,
+        })
+
+    def afe_get_mag_params(self):
+        self.publish_command(f"{AFE_CMD_TOPIC}/mag", {
+            "task_name": "get_mag_params",
+            "arguments": {},
+        })
+
+    def afe_get_hk_rate(self):
+        self.publish_command(f"{AFE_CMD_TOPIC}/hk", {
+            "task_name": "get_rate",
+            "arguments": {},
+        })
+
+    # ---- Telemetry polling interval (mode-13 compatible) ----
+
+    def afe_set_polling_interval(self, n: int):
+        self.publish_command(f"{AFE_CMD_TOPIC}/polling", {
+            "task_name": "set_interval",
+            "arguments": {"n": n},
+        })
+
+    def afe_get_polling_interval(self):
+        self.publish_command(f"{AFE_CMD_TOPIC}/polling", {
+            "task_name": "get_interval",
+            "arguments": {},
+        })
+
+    # ---- Rates (per-subsystem set_rate with interval in seconds) ----
+
+    def afe_set_hk_rate(self, n: int):
+        self.publish_command(f"{AFE_CMD_TOPIC}/hk", {
+            "task_name": "set_rate",
+            "arguments": {"n": n},
+        })
+
+    def afe_set_mag_rate(self, n: int):
+        self.publish_command(f"{AFE_CMD_TOPIC}/mag", {
+            "task_name": "set_rate",
+            "arguments": {"n": n},
+        })
+
+    def afe_set_imu_rate(self, n: int):
+        self.publish_command(f"{AFE_CMD_TOPIC}/imu", {
+            "task_name": "set_rate",
+            "arguments": {"n": n},
+        })
+
+    # ---- Time ----
+
+    def afe_set_time_source_gnss(self):
+        self.publish_command(f"{AFE_CMD_TOPIC}/time", {
+            "task_name": "set_source_gnss",
+            "arguments": {},
+        })
+
+    def afe_set_time_source_external(self):
+        self.publish_command(f"{AFE_CMD_TOPIC}/time", {
+            "task_name": "set_source_external",
+            "arguments": {},
+        })
+
+    def afe_set_time_epoch_pps(self, ts: int):
+        self.publish_command(f"{AFE_CMD_TOPIC}/time", {
+            "task_name": "set_epoch_pps",
+            "arguments": {"ts": ts},
+        })
+
+    def afe_set_time_epoch_nmea(self):
+        self.publish_command(f"{AFE_CMD_TOPIC}/time", {
+            "task_name": "set_epoch_nmea",
+            "arguments": {},
+        })
+
+    def afe_set_time_epoch_immediate(self, ts: int):
+        self.publish_command(f"{AFE_CMD_TOPIC}/time", {
+            "task_name": "set_epoch_immediate",
+            "arguments": {"ts": ts},
+        })
+
+    def afe_get_time_params(self):
+        self.publish_command(f"{AFE_CMD_TOPIC}/time", {
+            "task_name": "get_time_params",
+            "arguments": {},
+        })
+
+    # ---- Logging ----
+
+    def afe_enable_logging(self):
+        self.publish_command(f"{AFE_CMD_TOPIC}/logging", {
+            "task_name": "enable_logging",
+            "arguments": {},
+        })
+
+    def afe_disable_logging(self):
+        self.publish_command(f"{AFE_CMD_TOPIC}/logging", {
+            "task_name": "disable_logging",
+            "arguments": {},
+        })
+
+    def afe_get_log_status(self):
+        self.publish_command(f"{AFE_CMD_TOPIC}/logging", {
+            "task_name": "get_log_status",
+            "arguments": {},
+        })
+
+    def afe_set_log_path(self, path: str):
+        self.publish_command(f"{AFE_CMD_TOPIC}/logging", {
+            "task_name": "set_log_path",
+            "arguments": {"path": path},
+        })
+
+    def afe_set_log_rate(self, n: int):
+        self.publish_command(f"{AFE_CMD_TOPIC}/logging", {
+            "task_name": "set_log_rate_sec",
+            "arguments": {"n": n},
+        })
+
+    def afe_set_service_log_mode(self, mode: str):
+        if mode not in ("normal", "debug"):
+            raise ValueError(f"Mode must be 'normal' or 'debug', got {mode}")
+        self.publish_command(f"{AFE_CMD_TOPIC}/logging", {
+            "task_name": "set_service_log_mode",
+            "arguments": {"mode": mode},
+        })
+
+    def afe_get_service_log_mode(self):
+        self.publish_command(f"{AFE_CMD_TOPIC}/logging", {
+            "task_name": "get_service_log_mode",
+            "arguments": {},
+        })
+
+    # ------------------------------------------------------------------ #
+    #  Static helpers                                                      #
+    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _extract_tuner_name(status_payload: dict) -> Optional[str]:
@@ -259,7 +1221,7 @@ class MEPController:
 
         def _normalize(value):
             if isinstance(value, str):
-                token = tuner_to_canonical_name(value)
+                token = value.strip().upper()
                 if token in TUNER_INJECTION_SIDE:
                     return token
             return None
@@ -278,62 +1240,248 @@ class MEPController:
                         return resolved
         return None
 
-    def _ensure_tuner_initialized(self, force: bool = False) -> str:
-        """Initialize tuner once, or re-initialize when force=True."""
-        self.tuner = tuner_to_canonical_name(self.tuner)
+    @staticmethod
+    def normalize_tuner_status(status_payload: Optional[dict]) -> Optional[dict]:
+        """Normalize tuner status payload into a stable shape for GUI/CLI.
 
-        if self.tuner in (None, "NONE"):
-            self._tuner_initialized = False
-            self._resolved_tuner = None
-            return "NONE"
+        Returns:
+          {
+            "state": str,
+            "name": str,
+            "lo_mhz": float|None,
+            "pwr_dbm": float|None,
+            "raw": dict,
+          }
+        """
+        if not isinstance(status_payload, dict):
+            return None
 
-        if self._tuner_initialized and not force:
-            return self._resolved_tuner or "AUTO"
+        candidates = [status_payload]
+        for key in ("tuner", "status", "result", "data", "arguments"):
+            nested = status_payload.get(key)
+            if isinstance(nested, dict):
+                candidates.append(nested)
 
-        if self.tuner == "AUTO":
-            logging.info("Initializing tuner (auto)")
-            self._publish(TUNER_CMD_TOPIC, {"task_name": "init_tuner", "arguments": {}})
-            init_status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
-            resolved_tuner = self._extract_tuner_name(init_status) or "AUTO"
-            logging.info(f"Auto tuner resolved to: {resolved_tuner}")
+        def _first_nonempty(*keys):
+            for blob in candidates:
+                for key in keys:
+                    value = blob.get(key)
+                    if value not in (None, ""):
+                        return value
+            return None
+
+        def _first_float(*keys):
+            value = _first_nonempty(*keys)
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        state = _first_nonempty("state", "service_state")
+        if state is None:
+            state = "unknown"
+        state = str(state).strip().lower() or "unknown"
+
+        name = (
+            MEPBus._extract_tuner_name(status_payload)
+            or _first_nonempty("name", "tuner_name", "active_tuner", "tuner_type", "model", "device")
+            or "—"
+        )
+
+        lo_mhz = _first_float("freq_mhz", "lo_mhz")
+        pwr_dbm = _first_float("pwr_dbm", "power_dbm", "power")
+
+        return {
+            "state": state,
+            "name": str(name),
+            "lo_mhz": lo_mhz,
+            "pwr_dbm": pwr_dbm,
+            "raw": status_payload,
+        }
+
+    @staticmethod
+    def _tlm_to_str(tlm) -> str:
+        if tlm is None:
+            return "<no tlm>"
+        return (
+            f"state={tlm.get('state')} "
+            f"f_c={float(tlm.get('f_c_hz', 0)) / 1e6:.2f} MHz "
+            f"f_if={float(tlm.get('f_if_hz', 0)) / 1e6:.2f} MHz "
+            f"f_s={float(tlm.get('f_s', 0)) / 1e6:.2f} MHz "
+            f"pps={tlm.get('pps_count')} "
+            f"ch={tlm.get('channels')}"
+        )
+
+
+# ===== CAPTURE CONTROLLER ===== #
+
+class CaptureController:
+    """On-demand sweep/record orchestrator — owns sync-wait infra and recipes.
+
+    Created when the user clicks Start (or from CLI). Takes a MEPBus reference
+    for all MQTT communication. Owns transient session state: sweep config,
+    tuner session tracking, recorder state, stop flag, synchronous wait.
+    """
+
+    def __init__(self, bus: MEPBus):
+        self.bus = bus
+
+        # ---- Sweep config (set via configure_sweep) ----
+        self.channel: Optional[str] = None
+        self.sample_rate_mhz: Optional[int] = None
+        self.tuner: Optional[str] = None
+        self.adc_if_mhz: Optional[float] = None
+        self.injection: Optional[str] = None
+        self.capture_name: Optional[str] = None
+        self._tuner_initialized_for: Optional[str] = None
+        self._last_tuner_session_id: Optional[str] = None
+        self._tuner_session_counter = 0
+
+        # ---- Recorder "what changed" state ----
+        self._active_channel = None
+        self._active_sample_rate = None
+        self._recorder_running = False
+
+        # ---- Stop flag for sweeps ----
+        self._stop_flag = threading.Event()
+
+        # ---- Synchronous wait infrastructure (for sweep orchestration) ----
+        self._tlm = None
+        self._tlm_lock = threading.Lock()
+        self._tlm_event = threading.Event()
+
+        self._status = {t: None for t in _SYNC_STATUS_TOPICS}
+        self._status_lock = threading.Lock()
+        self._status_events = {t: threading.Event() for t in _SYNC_STATUS_TOPICS}
+
+        # ---- Register sync-wait listeners on bus ----
+        self._sync_cbs = {}
+
+        def _make_rfsoc_cb():
+            def _cb(data):
+                with self._tlm_lock:
+                    self._tlm = data
+                self._tlm_event.set()
+            return _cb
+
+        self._sync_cbs[RFSOC_STATUS_TOPIC] = _make_rfsoc_cb()
+        self.bus.on_status(RFSOC_STATUS_TOPIC, self._sync_cbs[RFSOC_STATUS_TOPIC])
+
+        for topic in _SYNC_STATUS_TOPICS:
+            def _make_status_cb(t):
+                def _cb(data):
+                    with self._status_lock:
+                        self._status[t] = data
+                    self._status_events[t].set()
+                return _cb
+            self._sync_cbs[topic] = _make_status_cb(topic)
+            self.bus.on_status(topic, self._sync_cbs[topic])
+
+        # ---- Check for already-initialized tuner ----
+        self._query_and_cache_tuner_state()
+
+    def _require_mqtt(self, action: str) -> bool:
+        """Return False and log once when broker is offline for a control action."""
+        if self.bus.is_connected():
+            return True
+        status = self.bus.get_connection_status()
+        logging.error(
+            "Cannot %s while MQTT is offline (%s:%s). Last error: %s",
+            action,
+            status.get("broker"),
+            status.get("port"),
+            status.get("last_error") or "none",
+        )
+        return False
+
+    def close(self):
+        """Remove sync-wait listeners from bus and stop recorder (best-effort)."""
+        for topic, cb in self._sync_cbs.items():
+            self.bus.remove_listener(topic, cb)
+        self._sync_cbs.clear()
+        if self._recorder_running:
+            try:
+                self.stop_recorder()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+    #  Sweep configuration                                                 #
+    # ------------------------------------------------------------------ #
+
+    def configure_sweep(
+        self,
+        channel: str,
+        sample_rate_mhz: int,
+        tuner: str = None,
+        adc_if_mhz: float = None,
+        injection: str = None,
+        capture_name: str = None,
+    ):
+        """Set parameters used by run_sweep / run_single / start_recorder."""
+        self.channel = channel.upper()
+        self.sample_rate_mhz = sample_rate_mhz
+        self.tuner = tuner
+        self.adc_if_mhz = adc_if_mhz
+        self.capture_name = capture_name
+
+        if tuner is None:
+            self.injection = None
         else:
-            resolved_tuner = self.tuner
-            service_tuner = tuner_to_service_name(self.tuner)
-            if not service_tuner:
-                raise ValueError(f"No service tuner mapping for {self.tuner!r}")
-            logging.info(f"Initializing tuner ({resolved_tuner})")
-            self._publish(TUNER_CMD_TOPIC, {
-                "task_name": "init_tuner",
-                "arguments": {"force_tuner": service_tuner},
-            })
-            _ = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
-
-        self._resolved_tuner = resolved_tuner
-        self._tuner_initialized = True
-        return resolved_tuner
-
-    def reinit_tuner(self) -> str:
-        """Explicitly re-initialize tuner; intended for manual TUN-tab action."""
-        return self._ensure_tuner_initialized(force=True)
-
-    def disconnect(self):
-        self._client.loop_stop()
-        self._client.disconnect()
+            self.injection = resolve_injection(tuner, injection)
+            self._initialize_tuner_if_needed()
 
     # ------------------------------------------------------------------ #
-    #  Startup                                                             #
+    #  Synchronous wait helpers (used during sweep orchestration)          #
     # ------------------------------------------------------------------ #
+
+    def get_tlm(self, timeout_s: float = 2.0):
+        """Request and return the latest RFSoC telemetry, or None on timeout."""
+        if not self.bus.is_connected():
+            return None
+        with self._tlm_lock:
+            self._tlm = None
+        self._tlm_event.clear()
+        self.bus.publish_command(
+            RFSOC_CMD_TOPIC,
+            {"task_name": "get", "arguments": ["tlm"]},
+            sleep_s=0,
+        )
+        if self._tlm_event.wait(timeout=timeout_s):
+            with self._tlm_lock:
+                return self._tlm
+        return None
+
+    def _wait_for_status(self, topic: str, timeout_s: float = 2.0):
+        """Block until a status message arrives on topic, return payload or None."""
+        if topic not in self._status_events:
+            raise ValueError(f"Unknown sync status topic: {topic!r}")
+        if not self.bus.is_connected():
+            logging.warning(f"Cannot wait for {topic}: MQTT offline")
+            return None
+        self._status_events[topic].clear()
+        with self._status_lock:
+            self._status[topic] = None
+        if self._status_events[topic].wait(timeout=timeout_s):
+            with self._status_lock:
+                return self._status[topic]
+        logging.warning(f"No status from {topic} within {timeout_s}s — service may not be running")
+        return None
 
     def wait_for_firmware_ready(self, max_wait_s: int = 30) -> bool:
         """Poll rfsoc/status until f_s is a valid non-NaN positive number."""
+        if not self._require_mqtt("wait for RFSoC firmware"):
+            return False
         logging.info("Waiting for RFSoC firmware to be ready...")
         deadline = time.time() + max_wait_s
         while time.time() < deadline:
-            tlm = self._get_tlm(timeout_s=2.0)
+            tlm = self.get_tlm(timeout_s=2.0)
             if tlm is not None:
                 f_s = tlm.get("f_s")
                 if isinstance(f_s, (int, float)) and f_s == f_s and f_s > 0:
-                    logging.info(f"RFSoC firmware ready: f_s={f_s/1e6:.2f} MHz")
+                    logging.info(f"RFSoC firmware ready: f_s={f_s / 1e6:.2f} MHz")
                     return True
             logging.debug("RFSoC not ready yet, waiting...")
             time.sleep(1)
@@ -341,135 +1489,207 @@ class MEPController:
         return False
 
     # ------------------------------------------------------------------ #
-    #  Recorder recipe                                                     #
+    #  Tuner session management                                            #
+    # ------------------------------------------------------------------ #
+
+    def _generate_tuner_session_id(self) -> str:
+        self._tuner_session_counter += 1
+        return f"mep-tuner-{self._tuner_session_counter}"
+
+    def _query_and_cache_tuner_state(self):
+        """Query tuner status at startup; cache what tuner (if any) is already initialized."""
+        if not self.bus.is_connected():
+            logging.debug("Skipping tuner startup query: MQTT offline")
+            return
+
+        session_id = self._generate_tuner_session_id()
+        self._last_tuner_session_id = session_id
+        self.bus.publish_command(TUNER_CMD_TOPIC, {
+            "task_name": "status",
+            "arguments": {},
+            "session_id": session_id,
+        })
+        status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
+
+        if not isinstance(status, dict):
+            logging.debug("No tuner status response at startup")
+            return
+
+        if not self._is_status_fresh(status, expected_session_id=session_id):
+            logging.debug("Startup tuner status is stale or session mismatch")
+            return
+
+        if status.get("state") != "online":
+            logging.debug(f"Tuner service not online (state={status.get('state')})")
+            return
+
+        tuner_name = MEPBus._extract_tuner_name(status)
+        if tuner_name:
+            self._tuner_initialized_for = tuner_name.upper()
+            logging.info(f"Tuner already initialized at startup: {tuner_name}")
+
+    def _is_status_fresh(self, status: dict, max_age_s: float = 5.0, expected_session_id: str = None) -> bool:
+        if not isinstance(status, dict):
+            return False
+
+        if expected_session_id is not None and "session_id" in status:
+            if status.get("session_id") == expected_session_id:
+                logging.debug(f"Tuner status validated via session_id: {expected_session_id}")
+                return True
+            else:
+                logging.warning(
+                    f"Tuner status session_id mismatch: expected {expected_session_id!r}, got {status.get('session_id')!r}"
+                )
+                return False
+
+        msg_timestamp = status.get("timestamp")
+        if msg_timestamp is None:
+            logging.debug("Tuner status has no timestamp or session_id; assuming fresh")
+            return True
+
+        current_time = time.time()
+        age_s = current_time - msg_timestamp
+
+        if age_s > max_age_s:
+            logging.warning(f"Tuner status is stale ({age_s:.1f}s old)")
+            return False
+
+        return True
+
+    def _initialize_tuner_if_needed(self):
+        """Initialize tuner once if not already initialized for current config."""
+        if not self._require_mqtt("initialize tuner"):
+            return
+
+        if self.tuner == self._tuner_initialized_for:
+            logging.debug(f"Tuner already initialized for {self.tuner}, skipping re-init")
+            return
+
+        logging.info(f"Initializing tuner: {self.tuner}")
+
+        if self.tuner.lower() == "auto":
+            session_id = self._generate_tuner_session_id()
+            self._last_tuner_session_id = session_id
+            self.bus.publish_command(TUNER_CMD_TOPIC, {
+                "task_name": "init_tuner",
+                "arguments": {},
+                "session_id": session_id,
+            })
+            init_status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
+            if self._is_status_fresh(init_status, expected_session_id=session_id):
+                resolved_tuner = MEPBus._extract_tuner_name(init_status) or "AUTO"
+                logging.info(f"Auto tuner resolved to: {resolved_tuner}")
+                self._tuner_initialized_for = resolved_tuner
+            else:
+                logging.warning("Auto tuner init status stale or missing")
+        else:
+            session_id = self._generate_tuner_session_id()
+            self._last_tuner_session_id = session_id
+            self.bus.publish_command(TUNER_CMD_TOPIC, {
+                "task_name": "init_tuner",
+                "arguments": {"force_tuner": self.tuner},
+                "session_id": session_id,
+            })
+            self._tuner_initialized_for = self.tuner
+
+        time.sleep(0.1)
+
+    # ------------------------------------------------------------------ #
+    #  Recorder recipe (sweep orchestration)                               #
     # ------------------------------------------------------------------ #
 
     def start_recorder(self, freq_idx_offset: float = 0.0):
-        """Configure and enable the DigitalRF recorder.
+        """Configure and enable the DigitalRF recorder."""
+        if not self._require_mqtt("start recorder"):
+            return False
 
-        Uses self.channel, self.sample_rate, and self.injection.
-        Always stops any active recording first.
-        """
         if self.channel not in RECORDER_CHANNEL_PORTS:
             raise ValueError(f"channel must be one of {list(RECORDER_CHANNEL_PORTS.keys())}")
 
-        dst_port    = RECORDER_CHANNEL_PORTS[self.channel]
-        config_name = f"sr{self.sample_rate}MHz"
+        dst_port = RECORDER_CHANNEL_PORTS[self.channel]
+        config_name = f"sr{self.sample_rate_mhz}MHz"
 
         logging.info(
-            f"Starting recorder: channel={self.channel}, config={config_name}, "
-            f"port={dst_port}"
+            f"Starting recorder: channel={self.channel}, config={config_name}, port={dst_port}"
         )
 
-        self._publish(RECORDER_CMD_TOPIC, {"task_name": "disable"})
+        self.bus.recorder_disable()
 
-        self._publish(RECORDER_CMD_TOPIC, {
+        self.bus.publish_command(RECORDER_CMD_TOPIC, {
             "task_name": "config.load",
             "arguments": {"name": config_name},
             "response_topic": "recorder/config/response",
         })
 
-        self._publish(RECORDER_CMD_TOPIC, {
-            "task_name": "config.set",
-            "arguments": {"key": "packet.freq_idx_offset", "value": str(freq_idx_offset)},
-            "response_topic": "recorder/config/response",
-        })
+        self.bus.recorder_config_set("packet.freq_idx_offset", str(freq_idx_offset))
 
         if self.capture_name:
             channel_dir = f"{self.capture_name}/{config_name}/ch{self.channel}"
         else:
             channel_dir = f"ringbuffer/{config_name}/ch{self.channel}"
 
-        self._publish(RECORDER_CMD_TOPIC, {
-            "task_name": "config.set",
-            "arguments": {"key": "drf_sink.channel_dir", "value": channel_dir},
-            "response_topic": "recorder/config/response",
-        })
+        self.bus.recorder_config_set("drf_sink.channel_dir", channel_dir)
+        self.bus.recorder_config_set("basic_network.dst_port", str(dst_port))
 
-        self._publish(RECORDER_CMD_TOPIC, {
-            "task_name": "config.set",
-            "arguments": {"key": "basic_network.dst_port", "value": str(dst_port)},
-            "response_topic": "recorder/config/response",
-        })
-
-        self._publish(RECORDER_CMD_TOPIC, {"task_name": "enable"})
+        self.bus.recorder_enable()
         status = self._wait_for_status(RECORDER_STATUS_TOPIC, timeout_s=3.0)
         if status is not None:
             logging.info(f"Recorder enabled — status: {status}")
         else:
             logging.warning("Recorder enable sent but no status response received")
 
-        self._active_channel     = self.channel
-        self._active_sample_rate = self.sample_rate
-        self._recorder_running   = True
+        self._active_channel = self.channel
+        self._active_sample_rate = self.sample_rate_mhz
+        self._recorder_running = True
+        return True
 
     def stop_recorder(self):
         """Disable the DigitalRF recorder."""
         logging.info("Stopping recorder")
-        self._publish(RECORDER_CMD_TOPIC, {"task_name": "disable"})
+        self.bus.recorder_disable()
         self._recorder_running = False
 
     # ------------------------------------------------------------------ #
-    #  Tune and Arm recipe  (from "Tune and Capture" flowchart)           #
+    #  Tune and Arm recipe (from "Tune and Capture" flowchart)             #
     # ------------------------------------------------------------------ #
 
     def tune_and_arm(self, f_hz: float) -> bool:
-        """
-        Full tune + capture-arm sequence for one frequency step.
+        """Full tune + capture-arm sequence for one frequency step."""
+        if not self._require_mqtt("tune and arm"):
+            return False
 
-        TUNER_NO:   Reset → set NCO to f_hz → metadata → channel → capture
-        TUNER_YES:  Reset → set fixed IF →
-                    compute LO (low/high side) → set LO → PLL check →
-                    metadata → channel → capture → TLM
-        """
         f_mhz = f_hz / 1e6
 
-        # Reset RFSoC
-        self._publish(RFSOC_CMD_TOPIC, {"task_name": "reset"})
+        self.bus.rfsoc_reset()
 
-        if self.tuner in (None, "NONE"):
-            # ---- TUNER_NO: NCO sweeps to target frequency ----
+        if self.tuner is None:
             logging.info(f"[TUNER_NO] RFSoC NCO → {GREEN}{f_mhz:.2f} MHz{RESET}")
-            self._publish(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {f_mhz}"})
+            self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {f_mhz}"})
             time.sleep(0.1)
-
         else:
-            # ---- TUNER_YES: RFSoC IF is fixed, external tuner sweeps ----
-            if self.adc_if is None:
-                raise ValueError("adc_if is required when a tuner is specified")
+            if self.adc_if_mhz is None:
+                raise ValueError("adc_if_mhz is required when a tuner is specified")
 
-            resolved_tuner = self._ensure_tuner_initialized(force=False)
+            resolved_tuner = self.tuner.upper()
 
-            # Set fixed IF
-            self._publish(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {self.adc_if}"})
+            self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {self.adc_if_mhz}"})
             time.sleep(0.1)
 
-            # LO calculation depends on injection side
-            if self.injection == "high":
-                lo_mhz = f_mhz + self.adc_if   # LO > RF
-            else:
-                lo_mhz = f_mhz - self.adc_if   # LO < RF
+            lo_mhz = (f_mhz + self.adc_if_mhz) if self.injection == "high" else (f_mhz - self.adc_if_mhz)
 
             logging.info(
                 f"[TUNER_YES/{self.injection}-side] RF → {GREEN}{f_mhz:.2f} MHz{RESET}  "
-                f"LO={lo_mhz:.2f} MHz  IF={self.adc_if:.2f} MHz"
+                f"LO={lo_mhz:.2f} MHz  IF={self.adc_if_mhz:.2f} MHz"
             )
 
-            # Spectrum flip: conjugate required when LO is above RF (high-side injection)
-            # to correct the mirrored spectrum that results from downconversion.
             apply_conjugate = (self.injection == "high")
-            self._publish(RECORDER_CMD_TOPIC, {
-                "task_name": "config.set",
-                "arguments": {"key": "packet.apply_conjugate", "value": str(apply_conjugate).lower()},
-            })
+            self.bus.recorder_config_set("packet.apply_conjugate", str(apply_conjugate).lower())
 
-            # Set tuner LO frequency
-            self._publish(TUNER_CMD_TOPIC, {"task_name": "set_freq", "arguments": {"freq_mhz": lo_mhz}})
+            self.bus.tuner_set_freq(lo_mhz)
             time.sleep(0.1)
 
-            # PLL lock check: Valon supports get_lock_status; other tuners do not
             if resolved_tuner == "VALON":
-                self._publish(TUNER_CMD_TOPIC, {"task_name": "get_lock_status", "arguments": {}})
+                self.bus.tuner_check_lock()
                 lock_status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
                 if lock_status is not None:
                     logging.info(f"Tuner lock status: {lock_status}")
@@ -477,63 +1697,64 @@ class MEPController:
                     logging.warning("No tuner lock status response received")
 
         # Common tail: metadata → channel → capture → TLM
-        self._publish(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_metadata {f_hz}"})
-        self._publish(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"channel {self.channel}"})
-        self._publish(RFSOC_CMD_TOPIC, {"task_name": "capture_next_pps"})
+        self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_metadata {f_hz}"})
+        self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"channel {self.channel}"})
+        self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "capture_next_pps"})
 
-        tlm = self._get_tlm()
+        tlm = self.get_tlm()
         if not tlm or tlm.get("state") != "active":
-            logging.error(f"RFSoC capture failed or inactive: {self._tlm_to_str(tlm)}")
+            logging.error(f"RFSoC capture failed or inactive: {MEPBus._tlm_to_str(tlm)}")
             return False
-        logging.info(f"Armed — {self._tlm_to_str(tlm)}")
+        logging.info(f"Armed — {MEPBus._tlm_to_str(tlm)}")
         return True
 
     # ------------------------------------------------------------------ #
-    #  Scan recipes  (from "Start Scan" flowchart)                        #
+    #  Scan recipes (from "Start Scan" flowchart)                          #
     # ------------------------------------------------------------------ #
 
     def run_single(self, f_hz: float, dwell_s: float = None):
-        """
-        Single-frequency capture with 'what changed' recorder logic.
+        """Single-frequency capture with optional dwell-based auto-stop."""
+        if not self._require_mqtt("run single capture"):
+            return False
 
-        Sample rate or channel changed → stop recorder, tune_and_arm, restart recorder
-        Frequency only (or first run)  → tune_and_arm; start recorder if not running
-
-        If dwell_s is given (and > 0), blocks for that duration then stops the recorder.
-        Without dwell_s the recorder keeps running until stopped explicitly.
-        """
-        sample_rate_changed = (self.sample_rate != self._active_sample_rate)
-        channel_changed     = (self.channel     != self._active_channel)
+        sample_rate_changed = (self.sample_rate_mhz != self._active_sample_rate)
+        channel_changed = (self.channel != self._active_channel)
 
         if self._recorder_running and (sample_rate_changed or channel_changed):
             logging.info(
                 "Sample rate or channel changed — restarting recorder "
-                f"(sr: {self._active_sample_rate}→{self.sample_rate}, "
+                f"(sr: {self._active_sample_rate}→{self.sample_rate_mhz}, "
                 f"ch: {self._active_channel}→{self.channel})"
             )
             self.stop_recorder()
-            self.tune_and_arm(f_hz)
-            self.start_recorder()
+            if not self.tune_and_arm(f_hz):
+                return False
+            if not self.start_recorder():
+                return False
         else:
-            self.tune_and_arm(f_hz)
+            if not self.tune_and_arm(f_hz):
+                return False
             if not self._recorder_running:
-                self.start_recorder()
+                if not self.start_recorder():
+                    return False
 
         if dwell_s is not None and dwell_s > 0:
             self._dwell(dwell_s)
             self.stop_recorder()
+        return True
 
     def run_sweep(self, freqs_hz, dwell_s: float, restart_interval: int = None):
-        """
-        Sweep recipe: start recorder once, tune_and_arm + dwell per step.
-        Optionally force-restarts the recorder every restart_interval seconds.
-        """
+        """Sweep: start recorder once, tune_and_arm + dwell per step."""
+        if not self._require_mqtt("run sweep"):
+            return False
+
         logging.info(
             f"Sweep: {len(freqs_hz)} steps, dwell={dwell_s}s, "
             f"restart_interval={restart_interval}s"
         )
 
-        self.start_recorder()
+        if not self.start_recorder():
+            return False
         last_restart = time.time()
 
         try:
@@ -542,29 +1763,32 @@ class MEPController:
                     logging.info("Sweep interrupted by stop flag")
                     break
 
-                if restart_interval is not None and time.time() - last_restart >= restart_interval:
+                if restart_interval and time.time() - last_restart >= restart_interval:
                     logging.info("Restart interval reached — restarting recorder")
-                    self.start_recorder()
+                    if not self.start_recorder():
+                        return False
                     last_restart = time.time()
 
-                self.tune_and_arm(f_hz)
+                if not self.tune_and_arm(f_hz):
+                    return False
                 self._dwell(dwell_s)
         finally:
             self.stop_recorder()
+        return True
 
     # ------------------------------------------------------------------ #
     #  Utilities                                                           #
     # ------------------------------------------------------------------ #
 
     def _dwell(self, dwell_s: float):
-        """Sleep for dwell_s, logging TLM each second. Exits early if _stop_flag is set."""
+        """Sleep for dwell_s, logging TLM each second. Exits early on stop flag."""
         start = time.time()
         while (time.time() - start) < dwell_s:
             if self._stop_flag.is_set():
                 logging.info("Dwell interrupted by stop flag")
                 return
-            tlm = self._get_tlm(timeout_s=1.5)
-            logging.debug(self._tlm_to_str(tlm))
+            tlm = self.get_tlm(timeout_s=1.5)
+            logging.debug(MEPBus._tlm_to_str(tlm))
             time.sleep(1)
 
     def request_stop(self):
@@ -572,43 +1796,349 @@ class MEPController:
         logging.info("Stop requested")
         self._stop_flag.set()
 
-    @staticmethod
-    def _tlm_to_str(tlm) -> str:
-        if tlm is None:
-            return "<no tlm>"
-        return (
-            f"state={tlm.get('state')} "
-            f"f_c={float(tlm.get('f_c_hz', 0))/1e6:.2f} MHz "
-            f"f_if={float(tlm.get('f_if_hz', 0))/1e6:.2f} MHz "
-            f"f_s={float(tlm.get('f_s', 0))/1e6:.2f} MHz "
-            f"pps={tlm.get('pps_count')} "
-            f"ch={tlm.get('channels')}"
+
+# ===== DOCKER MANAGER ===== #
+class DockerManager:
+    """Manage docker compose services: status queries, action execution, log streaming.
+
+    Pure system-level orchestrator — no GUI dependencies.
+    Used by MEPGui for the DOC tab, and available for CLI/scripting.
+    """
+
+    def __init__(self, compose_dir: str = DOCKER_COMPOSE_DIR):
+        self.compose_dir = compose_dir
+        self._services: dict = {}
+        self._service_names: list[str] = []
+        self._log_messages: deque = deque(maxlen=2000)
+        self._log_lock = threading.Lock()
+        self._log_rendered_count: int = 0
+        self._log_paused: bool = False
+        self._log_proc = None
+        self._log_busy: bool = False
+        self._log_scope = None
+        self._action_busy: bool = False
+        self._compose_cmd_cache = None
+        self._refresh_busy: bool = False
+
+    # -- Properties --------------------------------------------------------
+
+    @property
+    def services(self) -> dict:
+        return self._services
+
+    @property
+    def service_names(self) -> list[str]:
+        return self._service_names
+
+    @property
+    def action_busy(self) -> bool:
+        return self._action_busy
+
+    @action_busy.setter
+    def action_busy(self, value: bool):
+        self._action_busy = value
+
+    @property
+    def log_busy(self) -> bool:
+        return self._log_busy
+
+    @property
+    def log_paused(self) -> bool:
+        return self._log_paused
+
+    @log_paused.setter
+    def log_paused(self, value: bool):
+        self._log_paused = value
+
+    @property
+    def log_scope(self):
+        return self._log_scope
+
+    @property
+    def refresh_busy(self) -> bool:
+        return self._refresh_busy
+
+    @refresh_busy.setter
+    def refresh_busy(self, value: bool):
+        self._refresh_busy = value
+
+    # -- Command execution -------------------------------------------------
+
+    def run_cmd(self, cmd: list[str], *, cwd: str | None = None,
+                timeout: float = 10.0) -> tuple[int, str, str]:
+        """Run a command and return (returncode, stdout, stderr)."""
+        try:
+            proc = subprocess.run(
+                cmd, cwd=cwd,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=timeout,
+            )
+            return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+        except subprocess.TimeoutExpired as e:
+            out = (e.stdout or "") if isinstance(e.stdout, str) else ""
+            err = (e.stderr or "") if isinstance(e.stderr, str) else ""
+            return 124, out.strip(), (err or "command timed out").strip()
+        except Exception as e:
+            return 125, "", str(e)
+
+    def get_compose_cmd(self) -> tuple | list:
+        """Detect and cache the docker compose command (v2 plugin or legacy v1)."""
+        if self._compose_cmd_cache is not None:
+            return self._compose_cmd_cache
+        for cmd in (["docker", "compose"], ["docker-compose"]):
+            rc, _, _ = self.run_cmd([*cmd, "version"], timeout=3.0)
+            if rc == 0:
+                self._compose_cmd_cache = cmd
+                return cmd
+        self._compose_cmd_cache = ()
+        return ()
+
+    def parse_ps_json(self, text: str) -> dict:
+        """Parse ``docker compose ps --format=json`` output into {service: info_dict}."""
+        if not text.strip():
+            return {}
+
+        rows = None
+        try:
+            rows = json.loads(text)
+        except Exception:
+            parsed = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed.append(json.loads(line))
+                except Exception:
+                    continue
+            rows = parsed
+
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            return {}
+
+        services = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            service = str(item.get("Service") or item.get("Name") or "").strip()
+            if not service:
+                continue
+
+            command = str(item.get("Command") or item.get("command") or "—")
+            publishers = item.get("Publishers")
+            ports = item.get("Ports")
+            port_items = []
+            if isinstance(publishers, list):
+                for p in publishers:
+                    if not isinstance(p, dict):
+                        continue
+                    host = str(p.get("URL") or p.get("HostIP") or "")
+                    pub = p.get("PublishedPort")
+                    tgt = p.get("TargetPort")
+                    proto = str(p.get("Protocol") or "tcp")
+                    if pub is not None and tgt is not None:
+                        left = f"{host}:{pub}" if host else str(pub)
+                        port_items.append(f"{left}->{tgt}/{proto}")
+                    elif tgt is not None:
+                        port_items.append(f"{tgt}/{proto}")
+            elif isinstance(ports, str) and ports.strip():
+                port_items.append(ports.strip())
+            elif isinstance(ports, list):
+                for p in ports:
+                    if p is not None:
+                        port_items.append(str(p))
+
+            services[service] = {
+                "container": str(item.get("Name") or "—"),
+                "state": str(item.get("State") or "—"),
+                "command": command,
+                "ports": ", ".join(port_items) if port_items else "—",
+                "status": str(item.get("Status") or "—"),
+            }
+        return services
+
+    # -- Service status ----------------------------------------------------
+
+    def refresh_status(self) -> tuple[str, dict, str]:
+        """Query docker engine and compose services.
+
+        Returns (engine_status, services_dict, detail_message).
+        Updates internal services cache.  Synchronous — run in a thread if needed.
+        """
+        engine_status = "Unavailable"
+        services = {}
+        detail = ""
+
+        rc, _, err = self.run_cmd(["docker", "info"], timeout=5.0)
+        if rc == 0:
+            engine_status = "Reachable"
+        else:
+            return engine_status, services, (err or "docker daemon not reachable")
+
+        compose_cmd = self.get_compose_cmd()
+        if not compose_cmd:
+            return engine_status, services, "docker compose command not found"
+
+        rc, out, err = self.run_cmd(
+            [*compose_cmd, "ps", "-a", "--format", "json", "--no-trunc"],
+            cwd=self.compose_dir, timeout=8.0,
         )
+        if rc != 0 and ("unknown flag" in (err or "").lower()):
+            rc, out, err = self.run_cmd(
+                [*compose_cmd, "ps", "-a", "--format", "json"],
+                cwd=self.compose_dir, timeout=8.0,
+            )
+        if rc == 0:
+            services = self.parse_ps_json(out)
+        else:
+            detail = err or f"compose ps failed ({rc})"
 
+        self._services = dict(services)
+        self._service_names = sorted(services.keys())
+        return engine_status, services, detail
 
-# ===== HELPERS ===== #
+    # -- Compose actions ---------------------------------------------------
 
-def get_frequency_list(start_mhz: float, end_mhz: float, step_mhz: float):
-    start_hz = int(start_mhz * 1e6)
-    step_hz  = int(step_mhz  * 1e6)
-    if math.isnan(end_mhz):
-        return [start_hz]
-    end_hz = int(end_mhz * 1e6)
-    return range(start_hz, end_hz + step_hz, step_hz)
+    def run_compose_action(self, action: str, *,
+                           services: list[str] | None = None,
+                           extra_args: list[str] | None = None) -> tuple[int, str, str]:
+        """Run a compose action (start/stop/restart/up/down).
 
+        Returns (rc, stdout, stderr).  Synchronous — run in a thread if needed.
+        Caller manages the ``action_busy`` flag.
+        """
+        compose_cmd = self.get_compose_cmd()
+        if not compose_cmd:
+            return 1, "", "docker compose command not found"
 
-def tuner_type_arg(x: str):
-    """argparse type handler — allows None/none/auto or a known tuner name."""
-    canonical = tuner_to_canonical_name(x)
-    if canonical == "NONE":
-        return None
-    if canonical == "AUTO":
-        return "auto"
-    if canonical not in TUNER_INJECTION_SIDE:
-        raise argparse.ArgumentTypeError(
-            f"Invalid tuner '{x}'. Valid: {list(TUNER_INJECTION_SIDE.keys())}, auto, None"
-        )
-    return canonical
+        cmd = [*compose_cmd, action]
+        if extra_args:
+            cmd.extend(extra_args)
+        if services:
+            cmd.extend(services)
+        return self.run_cmd(cmd, cwd=self.compose_dir, timeout=40.0)
+
+    def preview_command(self, action: str, *,
+                        services: list[str] | None = None,
+                        extra_args: list[str] | None = None) -> str:
+        """Build the compose command string for display (no execution)."""
+        compose_cmd = self.get_compose_cmd()
+        compose_text = " ".join(compose_cmd) if compose_cmd else "docker compose"
+        parts = [compose_text, action]
+        if extra_args:
+            parts.extend(extra_args)
+        if services:
+            parts.extend(services)
+        return " ".join(parts)
+
+    # -- Log streaming -----------------------------------------------------
+
+    def stream_start(self, *, service: str | None = None, tail: str = "30",
+                     on_line: Optional[Callable] = None,
+                     on_exit: Optional[Callable] = None):
+        """Start streaming docker compose logs.
+
+        Args:
+            service: Service name, or None for all services.
+            tail:    Number of historical lines to fetch.
+            on_line: Called (from reader thread) for each log line.
+            on_exit: Called (from reader thread) with return code when the
+                     stream ends — only if this stream is still the current one.
+        """
+        compose_cmd = self.get_compose_cmd()
+        if not compose_cmd:
+            logging.error("DOCKER: docker compose command not found")
+            return
+
+        self.stream_stop()
+        self._log_paused = False
+
+        cmd = [*compose_cmd, "logs", "-f", "--tail", tail]
+        if service:
+            cmd.append(service)
+
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=self.compose_dir,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+        except Exception as e:
+            logging.error("DOCKER: log stream failed to start: %s", e)
+            return
+
+        self._log_proc = proc
+        self._log_busy = True
+        self._log_scope = service or "all"
+        scope_label = service or "all services"
+        logging.info("DOCKER: streaming logs (%s)", scope_label)
+
+        def _reader():
+            try:
+                if proc.stdout is None:
+                    return
+                for line in proc.stdout:
+                    self.log_append(line)
+                    if on_line:
+                        on_line(line)
+            finally:
+                rc = proc.poll()
+                same_proc = (self._log_proc is proc)
+                if same_proc:
+                    self._log_proc = None
+                    self._log_busy = False
+                if on_exit and same_proc:
+                    on_exit(rc)
+
+        threading.Thread(target=_reader, daemon=True, name="docker_logs").start()
+
+    def stream_stop(self):
+        """Stop the current log stream."""
+        proc = self._log_proc
+        self._log_proc = None
+        self._log_busy = False
+        self._log_scope = None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def stream_pause(self):
+        self._log_paused = True
+
+    def stream_resume(self):
+        self._log_paused = False
+
+    # -- Log buffer --------------------------------------------------------
+
+    def log_append(self, line: str):
+        """Append a timestamped log line to the internal buffer."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        with self._log_lock:
+            self._log_messages.append((ts, line.rstrip("\n")))
+
+    def get_new_log_entries(self) -> list[tuple[str, str]]:
+        """Return log entries not yet rendered and advance the render counter."""
+        with self._log_lock:
+            entries = list(self._log_messages)
+            start = min(self._log_rendered_count, len(entries))
+            tail = entries[start:]
+        self._log_rendered_count = len(entries)
+        return tail
+
+    def clear_log(self):
+        """Clear the log buffer and reset the render counter."""
+        with self._log_lock:
+            self._log_messages.clear()
+        self._log_rendered_count = 0
 
 
 # ===== ENTRY POINT ===== #
@@ -623,7 +2153,7 @@ if __name__ == "__main__":
                         help="End frequency in MHz (omit for single-frequency capture)")
     parser.add_argument("--channel",    "-c",  type=str,   default="A",
                         help="RFSoC channel (A, B, C, or D)")
-    parser.add_argument("--sample-rate","-r",  type=int,   default=None,
+    parser.add_argument("--sample-rate-mhz", "-r", type=int, default=None,
                         help="Recording sample rate in MHz (default: step size)")
     parser.add_argument("--step",       "-s",  type=float, default=10,
                         help="Sweep step size in MHz")
@@ -631,7 +2161,7 @@ if __name__ == "__main__":
                         help="Dwell time per step in seconds")
     parser.add_argument("--tuner",      "-t",  type=tuner_type_arg, default=None,
                         help="Tuner: VALON, LMX2820, TEST, auto, or None")
-    parser.add_argument("--adc_if",            type=float, default=None,
+    parser.add_argument("--adc_if_mhz",       type=float, default=None,
                         help="Fixed RFSoC IF in MHz (required if tuner is used)")
     parser.add_argument("--injection",         type=str,   default=None,
                         choices=["high", "low"],
@@ -642,21 +2172,21 @@ if __name__ == "__main__":
                         help="Skip NTP sync step")
     parser.add_argument("--restart_interval",  type=int,   default=None,
                         help="Force recorder restart every N seconds (sweep only)")
-    parser.add_argument("--capture_name",       type=str,   default=None,
+    parser.add_argument("--capture_name",      type=str,   default=None,
                         help="Save data under captures/{name}/... (default: ringbuffer)")
     args = parser.parse_args()
     args.channel = args.channel.upper()
 
-    if args.tuner is not None and args.adc_if is None:
-        parser.error("--adc_if is required when --tuner is set")
+    if args.tuner is not None and args.adc_if_mhz is None:
+        parser.error("--adc_if_mhz is required when --tuner is set")
 
-    if args.sample_rate is None:
-        args.sample_rate = int(args.step)
+    if args.sample_rate_mhz is None:
+        args.sample_rate_mhz = int(args.step)
 
     # === Logging === #
     os.makedirs(LOG_DIR, exist_ok=True)
     timestamp = datetime.now().isoformat().replace(":", "-").replace(".", "-")
-    log_path  = os.path.join(LOG_DIR, f"capture_sweep_{timestamp}.log")
+    log_path = os.path.join(LOG_DIR, f"capture_sweep_{timestamp}.log")
     logging.basicConfig(
         level=args.log_level,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -668,22 +2198,26 @@ if __name__ == "__main__":
     # === NTP sync === #
     if not args.skip_ntp:
         logging.info("Updating NTP on RFSoC")
-        os.system(os.path.join(os.getcwd(), "rfsoc_update_ntp.bash"))
+        sync_ntp_on_rfsoc(os.getcwd())
 
     # === Build controller === #
-    mep = MEPController(
-        channel      = args.channel,
-        sample_rate  = args.sample_rate,
-        tuner        = args.tuner,
-        adc_if       = args.adc_if,
-        injection    = args.injection,
-        capture_name = args.capture_name,
+    bus = MEPBus()
+    capture = CaptureController(bus)
+
+    capture.configure_sweep(
+        channel=args.channel,
+        sample_rate_mhz=args.sample_rate_mhz,
+        tuner=args.tuner,
+        adc_if_mhz=args.adc_if_mhz,
+        injection=args.injection,
+        capture_name=args.capture_name,
     )
 
     # === Wait for RFSoC firmware === #
-    if not mep.wait_for_firmware_ready(max_wait_s=30):
+    if not capture.wait_for_firmware_ready(max_wait_s=30):
         logging.error("RFSoC firmware not ready — aborting")
-        mep.disconnect()
+        capture.close()
+        bus.disconnect()
         exit(1)
 
     # === Run === #
@@ -692,10 +2226,11 @@ if __name__ == "__main__":
 
     try:
         if is_sweep:
-            mep.run_sweep(freqs_hz, dwell_s=args.dwell, restart_interval=args.restart_interval)
+            capture.run_sweep(freqs_hz, dwell_s=args.dwell, restart_interval=args.restart_interval)
         else:
-            mep.run_single(freqs_hz[0])
+            capture.run_single(freqs_hz[0])
     finally:
         logging.info("Stopping recorder")
-        mep.stop_recorder()
-        mep.disconnect()
+        capture.stop_recorder()
+        capture.close()
+        bus.disconnect()
