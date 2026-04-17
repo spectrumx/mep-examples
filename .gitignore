@@ -10,3 +10,10 @@ user_guide.md
 scripts/gnss.py
 scripts/test_eval.py
 scripts/test_ubx.py
+/scripts/external
+.vscode/settings.json
+/scripts/ignore
+/scripts/backup_do_not_delete
+scripts/announce.json
+restore_tabs.py
+documentation/AFE_ANNOUNCE_CAPABILITIES.md

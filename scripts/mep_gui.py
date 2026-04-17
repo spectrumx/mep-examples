@@ -77,6 +77,8 @@ from start_mep_rx import (
 LEFT_PANEL_WIDTH = 450
 ADV_PANEL_WIDTH = 475
 DEFAULT_WIN_HEIGHT = 750
+MQTT_LOG_BUFFER_MAX_MESSAGES = 500
+MQTT_LOG_WIDGET_MAX_LINES = 10000
 
 
 # ===== TEXT LOGGING HANDLER ===== #
@@ -148,7 +150,9 @@ class MEPGui:
         self._jetson_health_state = {}
         
         # MQTT streaming
-        self._mqtt_messages = deque(maxlen=2000)
+        self._mqtt_buffer_max_messages = MQTT_LOG_BUFFER_MAX_MESSAGES
+        self._mqtt_widget_max_lines = MQTT_LOG_WIDGET_MAX_LINES
+        self._mqtt_messages = deque(maxlen=self._mqtt_buffer_max_messages)
         self._mqtt_lock = threading.Lock()
         self._mqtt_rendered_count = 0
         self._mqtt_paused = False
@@ -187,6 +191,7 @@ class MEPGui:
         self._mainloop_started = False
 
         self._vars = {}
+        self._init_shared_vars()
         print("  Building UI widget tree...", flush=True)
         self._build_ui()
         self._setup_logging()
@@ -229,6 +234,15 @@ class MEPGui:
         self.root.after(3000, self._afe_refresh)
         self.root.after(20, self._pump_gui_queue)
         self.root.after(50, self._pump_text_log)
+
+    def _init_shared_vars(self):
+        """Initialize cross-tab state once, independent of lazy tab construction."""
+        self._vars["time_source"] = tk.StringVar(value="")
+        self._vars["epoch_mode"] = tk.StringVar(value="")
+        self._vars["poll_interval_s"] = tk.IntVar(value=1)
+        self._vars["log_enabled"] = tk.StringVar(value="enabled")
+        self._vars["log_path"] = tk.StringVar(value=AFE_DEFAULT_LOG_PATH)
+        self._vars["log_rate"] = tk.IntVar(value=AFE_DEFAULT_LOG_RATE_S)
 
     # ------------------------------------------------------------------ #
     #  MQTT listener callbacks (called from MQTT thread → schedule to GUI)
@@ -1187,13 +1201,65 @@ class MEPGui:
                    command=self._mqtt_clear_buffer_and_widget).grid(
             row=1, column=2, padx=5, pady=(0, 2), sticky="ew")
 
-        # ---- Logging options ---- #
+        # ---- Suppress filters ---- #
+        suppress_f = ttk.LabelFrame(log_ctl_f, text="Suppress")
+        suppress_f.grid(row=2, column=0, columnspan=3, sticky="ew", padx=5, pady=(0, 4))
+        suppress_f.columnconfigure(0, weight=1)
+        suppress_f.columnconfigure(1, weight=1)
+        suppress_f.columnconfigure(2, weight=1)
+
         self._vars["mqtt_suppress_announce"] = tk.BooleanVar(value=True)
-        ttk.Checkbutton(log_ctl_f, text="Suppress announce topics",
+        ttk.Checkbutton(suppress_f, text="Announce",
                         variable=self._vars["mqtt_suppress_announce"]).grid(
-            row=2, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
+            row=0, column=0, sticky="w", padx=5, pady=(2, 4))
         self._vars["mqtt_suppress_announce"].trace_add(
             "write", lambda *_: self._mqtt_render_from_buffer())
+
+        self._vars["mqtt_suppress_data"] = tk.BooleanVar(value=True)
+        ttk.Checkbutton(suppress_f, text="+/data/+",
+                        variable=self._vars["mqtt_suppress_data"]).grid(
+            row=0, column=1, sticky="w", padx=5, pady=(2, 4))
+        self._vars["mqtt_suppress_data"].trace_add(
+            "write", lambda *_: self._mqtt_render_from_buffer())
+
+        self._vars["mqtt_suppress_status"] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(suppress_f, text="Status",
+                        variable=self._vars["mqtt_suppress_status"]).grid(
+            row=0, column=2, sticky="w", padx=5, pady=(2, 4))
+        self._vars["mqtt_suppress_status"].trace_add(
+            "write", lambda *_: self._mqtt_render_from_buffer())
+
+        retention_f = ttk.Frame(log_ctl_f)
+        retention_f.grid(row=3, column=0, columnspan=3, sticky="ew", padx=5, pady=(0, 4))
+        retention_f.columnconfigure(1, weight=1)
+        retention_f.columnconfigure(3, weight=1)
+
+        self._vars["mqtt_buffer_max_messages"] = tk.IntVar(value=self._mqtt_buffer_max_messages)
+        self._vars["mqtt_widget_max_lines"] = tk.IntVar(value=self._mqtt_widget_max_lines)
+
+        ttk.Label(retention_f, text="Buffer Msgs").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        ttk.Spinbox(
+            retention_f,
+            from_=100,
+            to=200000,
+            increment=100,
+            textvariable=self._vars["mqtt_buffer_max_messages"],
+            width=10,
+        ).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(retention_f, text="Max Lines").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        ttk.Spinbox(
+            retention_f,
+            from_=100,
+            to=50000,
+            increment=100,
+            textvariable=self._vars["mqtt_widget_max_lines"],
+            width=10,
+        ).grid(row=0, column=3, sticky="w")
+
+        ttk.Button(retention_f, text="Apply Retention",
+                   command=self._mqtt_apply_retention_settings).grid(
+            row=0, column=4, padx=(12, 0), sticky="e")
 
         # ---- Message log (shorter to leave room for publish panel) ---- #
         self._mqtt_text = scrolledtext.ScrolledText(
@@ -1722,6 +1788,62 @@ class MEPGui:
         with self._mqtt_lock:
             self._mqtt_messages.append((ts, topic, payload))
 
+    def _mqtt_apply_retention_settings(self):
+        try:
+            buffer_max = int(self._vars["mqtt_buffer_max_messages"].get())
+            widget_max = int(self._vars["mqtt_widget_max_lines"].get())
+        except (KeyError, tk.TclError, ValueError):
+            logging.error("MQTT: retention settings must be integers")
+            return
+
+        if buffer_max < 100 or widget_max < 100:
+            logging.error("MQTT: retention settings must be at least 100")
+            return
+
+        with self._mqtt_lock:
+            entries = list(self._mqtt_messages)
+            self._mqtt_buffer_max_messages = buffer_max
+            self._mqtt_messages = deque(entries[-buffer_max:], maxlen=buffer_max)
+
+        self._mqtt_widget_max_lines = widget_max
+        self._mqtt_rendered_count = 0
+        if hasattr(self, "_mqtt_text"):
+            self._mqtt_render_from_buffer()
+
+        logging.info(
+            "MQTT: retention updated (buffer=%s messages, widget=%s lines)",
+            buffer_max,
+            widget_max,
+        )
+
+    def _mqtt_topic_is_suppressed(self, topic: str) -> bool:
+        topic_lower = (topic or "").lower()
+
+        suppress_announce = bool(
+            self._vars.get("mqtt_suppress_announce", tk.BooleanVar(value=False)).get()
+        )
+        if suppress_announce and "announce" in topic_lower:
+            return True
+
+        suppress_data = bool(
+            self._vars.get("mqtt_suppress_data", tk.BooleanVar(value=False)).get()
+        )
+        if suppress_data:
+            parts = [p for p in topic_lower.split("/") if p]
+            # Match MQTT shape +/data/+ (three levels with middle level "data").
+            if len(parts) == 3 and parts[1] == "data":
+                return True
+
+        suppress_status = bool(
+            self._vars.get("mqtt_suppress_status", tk.BooleanVar(value=False)).get()
+        )
+        if suppress_status:
+            parts = [p for p in topic_lower.split("/") if p]
+            if "status" in parts:
+                return True
+
+        return False
+
     def _mqtt_flush_buffer_to_widget(self):
         if not hasattr(self, "_mqtt_text"):
             return
@@ -1731,7 +1853,6 @@ class MEPGui:
         if self._mqtt_paused:
             return
 
-        suppress = bool(self._vars.get("mqtt_suppress_announce", tk.BooleanVar()).get())
         with self._mqtt_lock:
             entries = list(self._mqtt_messages)
             start = min(self._mqtt_rendered_count, len(entries))
@@ -1742,7 +1863,7 @@ class MEPGui:
 
         lines = []
         for ts, topic, payload in tail:
-            if suppress and "announce" in topic.lower():
+            if self._mqtt_topic_is_suppressed(topic):
                 continue
             lines.append(self._mqtt_format_entry(ts, topic, payload))
 
@@ -1753,9 +1874,11 @@ class MEPGui:
         self._mqtt_rendered_count = len(entries)
         self._mqtt_trim_widget_lines()
 
-    def _mqtt_trim_widget_lines(self, max_lines: int = 500):
+    def _mqtt_trim_widget_lines(self, max_lines: int = None):
         if not hasattr(self, "_mqtt_text"):
             return
+        if max_lines is None:
+            max_lines = self._mqtt_widget_max_lines
         lines = int(self._mqtt_text.index("end-1c").split(".")[0])
         if lines > max_lines:
             self._mqtt_text.delete("1.0", f"{lines - max_lines}.0")
@@ -2703,14 +2826,12 @@ class MEPGui:
         
         ttk.Label(right_f, text="Time Source", font=("TkDefaultFont", 9, "bold")).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
-        self._vars["time_source"] = tk.StringVar(value="")
         self._time_source_frame = ttk.Frame(right_f)
         self._time_source_frame.grid(row=1, column=0, columnspan=2, sticky="w")
         # Radio buttons created dynamically by _apply_afe_announce
         
         ttk.Label(right_f, text="Epoch", font=("TkDefaultFont", 9, "bold")).grid(
             row=2, column=0, columnspan=2, sticky="w", pady=(4, 2))
-        self._vars["epoch_mode"] = tk.StringVar(value="")
         self._epoch_combo = ttk.Combobox(right_f, textvariable=self._vars["epoch_mode"],
                      values=[], state="readonly",
                      width=10)
@@ -2806,7 +2927,6 @@ class MEPGui:
         poll_f.grid(row=4, column=0, padx=4, pady=(2, 2), sticky="ew")
         poll_f.columnconfigure(1, weight=1)
         ttk.Label(poll_f, text="Interval (s)").grid(row=0, column=0, sticky="w", padx=5, pady=4)
-        self._vars["poll_interval_s"] = tk.IntVar(value=1)
         self._poll_interval_spin = ttk.Spinbox(
             poll_f, from_=1, to=3600, increment=1, textvariable=self._vars["poll_interval_s"], width=8
         )
@@ -2823,20 +2943,17 @@ class MEPGui:
         log_f.grid(row=5, column=0, padx=4, pady=(2, 4), sticky="ew")
         log_f.columnconfigure(1, weight=1)
 
-        self._vars["log_enabled"] = tk.StringVar(value="enabled")
         rb_f = ttk.Frame(log_f)
         rb_f.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
         ttk.Radiobutton(rb_f, text="Enable", variable=self._vars["log_enabled"], value="enabled").pack(side="left", padx=(0, 8))
         ttk.Radiobutton(rb_f, text="Disable", variable=self._vars["log_enabled"], value="disabled").pack(side="left")
 
         ttk.Label(log_f, text="Log Path").grid(row=1, column=0, sticky="w", padx=5, pady=2)
-        self._vars["log_path"] = tk.StringVar(value=AFE_DEFAULT_LOG_PATH)
         self._tlm_log_path_entry = ttk.Entry(log_f, textvariable=self._vars["log_path"])
         self._tlm_log_path_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
         self._bind_copy_menu(self._tlm_log_path_entry, self._vars["log_path"], allow_paste=True)
 
         ttk.Label(log_f, text="Log Interval (s)").grid(row=2, column=0, sticky="w", padx=5, pady=2)
-        self._vars["log_rate"] = tk.IntVar(value=AFE_DEFAULT_LOG_RATE_S)
         self._tlm_log_rate_spin = ttk.Spinbox(
             log_f,
             from_=AFE_DEFAULT_LOG_RATE_RANGE[0],
@@ -2861,15 +2978,14 @@ class MEPGui:
         logging_f.columnconfigure(1, weight=1)
 
         # Enable/Disable
-        self._vars["log_enabled"] = tk.BooleanVar(value=False)
+        self._vars["config_log_enabled_ui"] = tk.BooleanVar(value=False)
         ttk.Checkbutton(logging_f, text="Enable Logging",
-                        variable=self._vars["log_enabled"]).grid(
+                        variable=self._vars["config_log_enabled_ui"]).grid(
             row=0, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
         # Log path
         ttk.Label(logging_f, text="Log Path").grid(
             row=1, column=0, sticky="w", padx=5, pady=3)
-        self._vars["log_path"] = tk.StringVar(value=AFE_DEFAULT_LOG_PATH)
         self._config_log_path_entry = ttk.Entry(logging_f, textvariable=self._vars["log_path"])
         self._config_log_path_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=3)
         self._bind_copy_menu(self._config_log_path_entry, self._vars["log_path"], allow_paste=True)
@@ -2877,7 +2993,6 @@ class MEPGui:
         # Log rate (interval in seconds)
         ttk.Label(logging_f, text="Log Rate (s)").grid(
             row=2, column=0, sticky="w", padx=5, pady=3)
-        self._vars["log_rate"] = tk.IntVar(value=AFE_DEFAULT_LOG_RATE_S)
         self._log_rate_spin = ttk.Spinbox(logging_f,
                     from_=AFE_DEFAULT_LOG_RATE_RANGE[0],
                     to=AFE_DEFAULT_LOG_RATE_RANGE[1],
@@ -4543,7 +4658,7 @@ def main():
     root = tk.Tk()
     print("Loading MEP Control App...", flush=True)
     app  = MEPGui(root)
-    print("MEP GUI: initialization complete — starting event loop.", flush=True)
+    print("  Initialization complete — starting event loop.", flush=True)
 
     def _on_close():
         logging.info("Window closed — cleaning up")
