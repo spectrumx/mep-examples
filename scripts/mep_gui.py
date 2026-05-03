@@ -2729,8 +2729,8 @@ class MEPGui:
         ttk.Button(ctrl_f, text="Set", command=self._tx_set_amplitude).grid(row=2, column=2, padx=5, pady=3, sticky="ew")
 
         ttk.Label(ctrl_f, text="Channel").grid(row=3, column=0, sticky="w", padx=5, pady=3)
-        self._vars["tx_channel"] = tk.StringVar(value="A")
-        ttk.Combobox(ctrl_f, textvariable=self._vars["tx_channel"], values=["A", "B", "A,B"], width=10, state="readonly").grid(row=3, column=1, sticky="ew", padx=5, pady=3)
+        self._vars["tx_channel"] = tk.StringVar(value="None")
+        ttk.Combobox(ctrl_f, textvariable=self._vars["tx_channel"], values=["None", "A", "B", "A,B"], width=10, state="readonly").grid(row=3, column=1, sticky="ew", padx=5, pady=3)
         ttk.Button(ctrl_f, text="Set", command=self._tx_set_channel).grid(row=3, column=2, padx=5, pady=3, sticky="ew")
 
         ttk.Label(
