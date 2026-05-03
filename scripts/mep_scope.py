@@ -8,7 +8,7 @@ This GUI is read-only. It does not send MQTT commands and does not control
 RFSoC, recorder, tuner, AFE, or Xilinx tools.
 
 Usage:
-    python3 scripts/mep_scope.py --root /data/tmp-ringbuffer --name <buffer-name> --sample-rate-mhz 10 --channel B
+    python3 scripts/mep_scope.py --root /data/tmp-ringbuffer --name <buffer-name> --sample-rate-mhz 10 --channel A
 """
 
 import argparse
@@ -47,7 +47,7 @@ else:
 DEFAULT_ROOT = "/data/tmp-ringbuffer"
 DEFAULT_NAME = ""
 DEFAULT_SAMPLE_RATE_MHZ = "10"
-DEFAULT_CHANNEL = "B"
+DEFAULT_CHANNEL = "A"
 DEFAULT_WIDTH_MS = 1.0
 DEFAULT_UNITS_PER_DIV = 0.25
 DEFAULT_REFRESH_MS = 200
@@ -424,7 +424,7 @@ class MEPScopeGui:
             "refresh_ms": tk.StringVar(value=str(args.refresh_ms)),
             "lag_ms": tk.StringVar(value=f"{args.lag_ms:g}"),
             "center_frequency": tk.StringVar(value="DRF Fc: -"),
-            "pk_pk": tk.StringVar(value="Pk-Pk: -"),
+            "pk_pk": tk.StringVar(value="Pk-Pk:  -"),
             "state": tk.StringVar(value="paused"),
             "status": tk.StringVar(value="Paused"),
             "cursor": tk.StringVar(value="Cursor: -"),
@@ -529,9 +529,9 @@ class MEPScopeGui:
         ttk.Entry(horizontal_f, textvariable=self._vars["refresh_ms"], width=10).grid(
             row=2, column=1, sticky="ew", padx=5, pady=4
         )
-        ttk.Label(horizontal_f, text="Read Lag (ms)").grid(row=2, column=2, sticky="e", padx=5, pady=4)
+        ttk.Label(horizontal_f, text="Read Lag (ms)").grid(row=3, column=0, sticky="w", padx=5, pady=4)
         ttk.Entry(horizontal_f, textvariable=self._vars["lag_ms"], width=10).grid(
-            row=2, column=3, sticky="ew", padx=(0, 5), pady=4
+            row=3, column=1, sticky="ew", padx=5, pady=4
         )
 
         trigger_f = ttk.LabelFrame(display_f, text="Trigger")
@@ -714,7 +714,7 @@ class MEPScopeGui:
             self._vars["center_frequency"].set(
                 f"DRF Fc: {self._fmt_frequency(latest.center_frequency_hz)}"
             )
-            self._vars["pk_pk"].set(f"Pk-Pk: {self._fmt_number(self._pk_pk(latest))}")
+            self._vars["pk_pk"].set(f"Pk-Pk:  {self._fmt_number(self._pk_pk(latest))}")
             self._render_latest()
         elif isinstance(latest, ReaderStatus):
             self._vars["status"].set(latest.message)
