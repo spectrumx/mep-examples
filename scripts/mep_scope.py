@@ -54,7 +54,7 @@ DEFAULT_REFRESH_MS = 200
 DEFAULT_LAG_MS = 100.0
 CHANNEL_OPTIONS = ("A", "B", "C", "D")
 SR_DIR_RE = re.compile(r"^sr(\d+(?:\.\d+)?)MHz$")
-TRIGGER_OPTIONS = ("Free Run", "I Rising", "I Falling", "Q Rising", "Q Falling")
+TRIGGER_OPTIONS = ("Free Run", "I Rising", "I Falling", "Q Rising", "Q Falling", "Mag Rising", "Mag Falling")
 
 
 @dataclass(frozen=True)
@@ -98,6 +98,7 @@ class ScopeConfig:
 class TraceSnapshot:
     i_values: object
     q_values: object
+    mag_values: object
     start_index: int
     end_index: int
     bounds_start: int
@@ -150,19 +151,23 @@ def _to_iq_arrays(samples):
     if np is not None:
         arr = np.asarray(samples)
         if arr.size == 0:
-            return [], []
-        return np.real(arr), np.imag(arr)
+            return [], [], []
+        return np.real(arr), np.imag(arr), np.abs(arr)
 
     i_vals = []
     q_vals = []
+    mag_vals = []
     for sample in samples:
         try:
-            i_vals.append(float(sample.real))
-            q_vals.append(float(sample.imag))
+            i_val = float(sample.real)
+            q_val = float(sample.imag)
         except AttributeError:
-            i_vals.append(float(sample))
-            q_vals.append(0.0)
-    return i_vals, q_vals
+            i_val = float(sample)
+            q_val = 0.0
+        i_vals.append(i_val)
+        q_vals.append(q_val)
+        mag_vals.append(math.hypot(i_val, q_val))
+    return i_vals, q_vals, mag_vals
 
 
 def _scalar_or_first(value):
@@ -232,11 +237,19 @@ def _find_trigger_index(i_values, q_values, cfg: ScopeConfig):
     if mode == "Free Run":
         return None
 
-    values = q_values if mode.startswith("Q ") else i_values
+    if mode.startswith("Q "):
+        values = q_values
+    elif mode.startswith("Mag "):
+        if np is not None:
+            values = np.hypot(np.asarray(i_values), np.asarray(q_values))
+        else:
+            values = [math.hypot(float(i), float(q)) for i, q in zip(i_values, q_values)]
+    else:
+        values = i_values
     rising = mode.endswith("Rising")
     level = cfg.trigger_level
     n = len(values)
-    if n < 6:
+    if n < 2:
         return None
 
     finite_vals = []
@@ -248,13 +261,46 @@ def _find_trigger_index(i_values, q_values, cfg: ScopeConfig):
         if math.isfinite(v):
             finite_vals.append(v)
     if finite_vals:
-        hysteresis = max((max(finite_vals) - min(finite_vals)) * 0.02, 1e-12)
+        hysteresis = max((max(finite_vals) - min(finite_vals)) * 0.005, 1e-12)
     else:
         hysteresis = 1e-12
 
-    pre_count = 3
-    post_count = 3
-    for idx in range(n - post_count - 1, pre_count, -1):
+    last_trigger = None
+    if rising:
+        armed = False
+        for idx in range(n):
+            try:
+                value = float(values[idx])
+            except Exception:
+                continue
+            if not math.isfinite(value):
+                continue
+            if value <= level - hysteresis:
+                armed = True
+            elif armed and value >= level + hysteresis:
+                last_trigger = idx
+                armed = False
+    else:
+        armed = False
+        for idx in range(n):
+            try:
+                value = float(values[idx])
+            except Exception:
+                continue
+            if not math.isfinite(value):
+                continue
+            if value >= level + hysteresis:
+                armed = True
+            elif armed and value <= level - hysteresis:
+                last_trigger = idx
+                armed = False
+
+    if last_trigger is not None:
+        return last_trigger
+
+    # Fallback for very small windows or very small signals where hysteresis
+    # never arms. Keep the selected edge direction explicit.
+    for idx in range(n - 1, 0, -1):
         try:
             prev_v = float(values[idx - 1])
             cur_v = float(values[idx])
@@ -262,34 +308,9 @@ def _find_trigger_index(i_values, q_values, cfg: ScopeConfig):
             continue
         if not (math.isfinite(prev_v) and math.isfinite(cur_v)):
             continue
-
-        try:
-            pre_vals = [float(values[idx - k]) for k in range(1, pre_count + 1)]
-            post_vals = [float(values[idx + k]) for k in range(0, post_count)]
-        except Exception:
-            continue
-        if not all(math.isfinite(v) for v in pre_vals + post_vals):
-            continue
-
-        pre_mean = sum(pre_vals) / len(pre_vals)
-        post_mean = sum(post_vals) / len(post_vals)
-        slope = post_mean - pre_mean
-
-        if (
-            rising
-            and prev_v < level <= cur_v
-            and pre_mean < level - hysteresis
-            and post_mean > level + hysteresis
-            and slope > 0.0
-        ):
+        if rising and prev_v < level <= cur_v and cur_v > prev_v:
             return idx
-        if (
-            (not rising)
-            and prev_v > level >= cur_v
-            and pre_mean > level + hysteresis
-            and post_mean < level - hysteresis
-            and slope < 0.0
-        ):
+        if (not rising) and prev_v > level >= cur_v and cur_v < prev_v:
             return idx
     return None
 
@@ -388,7 +409,7 @@ class DigitalRFScopeReader(threading.Thread):
             return
 
         samples = self._reader.read_vector(read_start, read_len, cfg.drf_channel)
-        i_values, q_values = _to_iq_arrays(samples)
+        i_values, q_values, mag_values = _to_iq_arrays(samples)
 
         triggered = False
         if cfg.trigger_mode != "Free Run":
@@ -401,7 +422,7 @@ class DigitalRFScopeReader(threading.Thread):
                 display_start = max(bounds_start, display_end - cfg.window_samples)
                 if display_end > display_start:
                     samples = self._reader.read_vector(display_start, display_end - display_start, cfg.drf_channel)
-                    i_values, q_values = _to_iq_arrays(samples)
+                    i_values, q_values, mag_values = _to_iq_arrays(samples)
                     read_start = display_start
                     read_end = display_end
                     triggered = True
@@ -412,7 +433,7 @@ class DigitalRFScopeReader(threading.Thread):
             display_start = max(bounds_start, display_end - cfg.window_samples)
             if display_start != read_start or display_end != read_end:
                 samples = self._reader.read_vector(display_start, display_end - display_start, cfg.drf_channel)
-                i_values, q_values = _to_iq_arrays(samples)
+                i_values, q_values, mag_values = _to_iq_arrays(samples)
                 read_start = display_start
                 read_end = display_end
 
@@ -429,6 +450,7 @@ class DigitalRFScopeReader(threading.Thread):
             TraceSnapshot(
                 i_values=i_values,
                 q_values=q_values,
+                mag_values=mag_values,
                 start_index=read_start,
                 end_index=read_end,
                 bounds_start=bounds_start,
@@ -466,6 +488,9 @@ class MEPScopeGui:
             "center_frequency": tk.StringVar(value="DRF Fc: -"),
             "dominant_frequency": tk.StringVar(value="Freq: -"),
             "pk_pk": tk.StringVar(value="Pk-Pk:  -"),
+            "show_i": tk.BooleanVar(value=True),
+            "show_q": tk.BooleanVar(value=True),
+            "show_mag": tk.BooleanVar(value=False),
             "state": tk.StringVar(value="paused"),
             "status": tk.StringVar(value="Paused"),
             "cursor": tk.StringVar(value="Cursor: -"),
@@ -526,6 +551,18 @@ class MEPScopeGui:
             width=8,
             state="readonly",
         ).grid(row=1, column=5, sticky="ew", padx=5, pady=4)
+
+        trace_f = ttk.Frame(cfg_f)
+        trace_f.grid(row=2, column=0, columnspan=3, sticky="w", padx=5, pady=4)
+        ttk.Checkbutton(trace_f, text="I", variable=self._vars["show_i"], command=self._render_latest).grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        ttk.Checkbutton(trace_f, text="Q", variable=self._vars["show_q"], command=self._render_latest).grid(
+            row=0, column=1, sticky="w", padx=(0, 8)
+        )
+        ttk.Checkbutton(trace_f, text="Mag", variable=self._vars["show_mag"], command=self._render_latest).grid(
+            row=0, column=2, sticky="w"
+        )
 
         ttk.Button(cfg_f, text="Run", command=self._run).grid(row=2, column=4, sticky="ew", padx=5, pady=4)
         ttk.Button(cfg_f, text="Stop", command=self._pause).grid(row=2, column=5, sticky="ew", padx=5, pady=4)
@@ -780,9 +817,8 @@ class MEPScopeGui:
         plot_w = max(1, w - pad_l - pad_r)
         plot_h = max(1, h - pad_t - pad_b)
 
-        i_vals = snap.i_values
-        q_vals = snap.q_values
-        n = len(i_vals)
+        traces = self._selected_traces(snap)
+        n = max((len(values) for _label, _color, values in traces), default=0)
         if n <= 1:
             self._vars["status"].set("Not enough samples to render")
             return
@@ -790,9 +826,9 @@ class MEPScopeGui:
         try:
             units_per_div = abs(float(self._vars["units_per_div"].get()))
         except ValueError:
-            units_per_div = self._default_units_per_div(i_vals, q_vals)
+            units_per_div = self._default_units_per_div_for_traces(traces)
         if units_per_div <= 0.0:
-            units_per_div = self._default_units_per_div(i_vals, q_vals)
+            units_per_div = self._default_units_per_div_for_traces(traces)
 
         vertical_divs = 8.0
         span = units_per_div * vertical_divs
@@ -800,13 +836,14 @@ class MEPScopeGui:
         ymax = span / 2.0
 
         self._draw_grid(w, h, pad_l, pad_r, pad_t, pad_b, ymin, ymax)
-        self._draw_trace(i_vals, "#6ad7ff", pad_l, pad_t, plot_w, plot_h, ymin, ymax)
-        self._draw_trace(q_vals, "#ffcc66", pad_l, pad_t, plot_w, plot_h, ymin, ymax)
+        for _label, color, values in traces:
+            self._draw_trace(values, color, pad_l, pad_t, plot_w, plot_h, ymin, ymax)
 
         duration_ms = (snap.end_index - snap.start_index) / snap.sample_rate_hz * 1000.0
-        self._canvas.create_text(8, 6, anchor="nw", fill="#cccccc", text="I", font=("TkDefaultFont", 9, "bold"))
-        self._canvas.create_text(28, 6, anchor="nw", fill="#6ad7ff", text="I", font=("TkDefaultFont", 9, "bold"))
-        self._canvas.create_text(48, 6, anchor="nw", fill="#ffcc66", text="Q", font=("TkDefaultFont", 9, "bold"))
+        x_label = 8
+        for label, color, _values in traces:
+            self._canvas.create_text(x_label, 6, anchor="nw", fill=color, text=label, font=("TkDefaultFont", 9, "bold"))
+            x_label += 34
         self._canvas.create_text(w - 8, 6, anchor="ne", fill="#aaaaaa", text=f"{duration_ms:.3f} ms")
         self._canvas.create_text(pad_l, h - 18, anchor="sw", fill="#aaaaaa", text="0")
         self._canvas.create_text(w - pad_r, h - 18, anchor="se", fill="#aaaaaa", text=f"{duration_ms:.3f} ms")
@@ -815,6 +852,24 @@ class MEPScopeGui:
             f"{snap.top_level_dir}/{snap.channel}  bounds=[{snap.bounds_start}, {snap.bounds_end})  "
             f"display=[{snap.start_index}, {snap.end_index})  samples={n}"
         )
+
+    def _selected_traces(self, snap: TraceSnapshot):
+        traces = []
+        if self._vars["show_i"].get():
+            traces.append(("I", "#6ad7ff", snap.i_values))
+        if self._vars["show_q"].get():
+            traces.append(("Q", "#ffcc66", snap.q_values))
+        if self._vars["show_mag"].get():
+            traces.append(("Mag", "#a7f36b", snap.mag_values))
+        if not traces:
+            traces.append(("I", "#6ad7ff", snap.i_values))
+        return traces
+
+    def _default_units_per_div_for_traces(self, traces):
+        values = []
+        for _label, _color, trace_values in traces:
+            values.extend(list(trace_values))
+        return self._default_units_per_div(values, [])
 
     def _default_units_per_div(self, i_vals, q_vals):
         if np is not None:
