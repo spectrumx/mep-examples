@@ -652,11 +652,11 @@ class MEPScopeGui:
         status_f = ttk.Frame(self.root)
         status_f.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
         status_f.columnconfigure(0, weight=1)
-        ttk.Label(status_f, textvariable=self._vars["status"], foreground="grey", width=1).grid(
-            row=0, column=0, sticky="w"
+        ttk.Entry(status_f, textvariable=self._vars["status"], state="readonly", width=1).grid(
+            row=0, column=0, sticky="ew"
         )
-        ttk.Label(status_f, textvariable=self._vars["cursor"], foreground="grey", width=1).grid(
-            row=1, column=0, sticky="w"
+        ttk.Entry(status_f, textvariable=self._vars["cursor"], state="readonly", width=1).grid(
+            row=1, column=0, sticky="ew"
         )
         ttk.Label(status_f, textvariable=self._vars["state"], foreground="grey").grid(
             row=0, column=1, rowspan=2, sticky="e"
