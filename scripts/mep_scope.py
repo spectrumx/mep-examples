@@ -423,7 +423,8 @@ class MEPScopeGui:
             "trigger_level": tk.StringVar(value=f"{args.trigger_level:g}"),
             "refresh_ms": tk.StringVar(value=str(args.refresh_ms)),
             "lag_ms": tk.StringVar(value=f"{args.lag_ms:g}"),
-            "center_frequency": tk.StringVar(value="Center: -"),
+            "center_frequency": tk.StringVar(value="DRF Fc: -"),
+            "pk_pk": tk.StringVar(value="Pk-Pk: -"),
             "state": tk.StringVar(value="paused"),
             "status": tk.StringVar(value="Paused"),
             "cursor": tk.StringVar(value="Cursor: -"),
@@ -491,7 +492,7 @@ class MEPScopeGui:
         display_f = ttk.Frame(self.root)
         display_f.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 4))
         for col in (0, 1, 2, 3):
-            display_f.columnconfigure(col, weight=1)
+            display_f.columnconfigure(col, weight=1, uniform="control_groups")
 
         vertical_f = ttk.LabelFrame(display_f, text="Vertical Controls")
         vertical_f.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=0)
@@ -500,10 +501,10 @@ class MEPScopeGui:
         ttk.Entry(vertical_f, textvariable=self._vars["units_per_div"], width=10).grid(
             row=0, column=1, sticky="ew", padx=5, pady=4
         )
-        ttk.Button(vertical_f, text="▲", width=3, command=lambda: self._nudge_numeric_var("units_per_div", 0.05)).grid(
+        ttk.Button(vertical_f, text="+", width=3, command=lambda: self._nudge_numeric_var("units_per_div", 0.05)).grid(
             row=0, column=2, sticky="ew", padx=(0, 2), pady=4
         )
-        ttk.Button(vertical_f, text="▼", width=3, command=lambda: self._nudge_numeric_var("units_per_div", -0.05, minimum=0.05)).grid(
+        ttk.Button(vertical_f, text="-", width=3, command=lambda: self._nudge_numeric_var("units_per_div", -0.05, minimum=0.05)).grid(
             row=0, column=3, sticky="ew", padx=(0, 5), pady=4
         )
 
@@ -514,10 +515,10 @@ class MEPScopeGui:
         ttk.Entry(horizontal_f, textvariable=self._vars["width_ms"], width=10).grid(
             row=0, column=1, sticky="ew", padx=5, pady=4
         )
-        ttk.Button(horizontal_f, text="▲", width=3, command=lambda: self._nudge_numeric_var("width_ms", 0.01)).grid(
+        ttk.Button(horizontal_f, text="+", width=3, command=lambda: self._nudge_numeric_var("width_ms", 0.01)).grid(
             row=0, column=2, sticky="ew", padx=(0, 2), pady=4
         )
-        ttk.Button(horizontal_f, text="▼", width=3, command=lambda: self._nudge_numeric_var("width_ms", -0.01, minimum=0.01)).grid(
+        ttk.Button(horizontal_f, text="-", width=3, command=lambda: self._nudge_numeric_var("width_ms", -0.01, minimum=0.01)).grid(
             row=0, column=3, sticky="ew", padx=(0, 5), pady=4
         )
         ttk.Label(horizontal_f, text="Position (ms)").grid(row=1, column=0, sticky="w", padx=5, pady=4)
@@ -556,6 +557,9 @@ class MEPScopeGui:
         measure_f.columnconfigure(0, weight=1)
         ttk.Label(measure_f, textvariable=self._vars["center_frequency"], width=1).grid(
             row=0, column=0, sticky="ew", padx=5, pady=4
+        )
+        ttk.Label(measure_f, textvariable=self._vars["pk_pk"], width=1).grid(
+            row=1, column=0, sticky="ew", padx=5, pady=4
         )
 
         self._canvas = tk.Canvas(self.root, background="#101010", highlightthickness=1, highlightbackground="#333333")
@@ -708,8 +712,9 @@ class MEPScopeGui:
         if isinstance(latest, TraceSnapshot):
             self._latest_snapshot = latest
             self._vars["center_frequency"].set(
-                f"Center: {self._fmt_frequency(latest.center_frequency_hz)}"
+                f"DRF Fc: {self._fmt_frequency(latest.center_frequency_hz)}"
             )
+            self._vars["pk_pk"].set(f"Pk-Pk: {self._fmt_number(self._pk_pk(latest))}")
             self._render_latest()
         elif isinstance(latest, ReaderStatus):
             self._vars["status"].set(latest.message)
@@ -798,6 +803,35 @@ class MEPScopeGui:
         if abs(hz) >= 1e3:
             return f"{hz / 1e3:.6f} kHz"
         return f"{hz:.6f} Hz"
+
+    def _pk_pk(self, snap: TraceSnapshot) -> Optional[float]:
+        if np is not None:
+            combined = np.concatenate((np.asarray(snap.i_values).ravel(), np.asarray(snap.q_values).ravel()))
+            finite = combined[np.isfinite(combined)]
+            if finite.size:
+                return float(np.max(finite) - np.min(finite))
+            return None
+
+        vals = []
+        for value in list(snap.i_values) + list(snap.q_values):
+            try:
+                v = float(value)
+            except Exception:
+                continue
+            if math.isfinite(v):
+                vals.append(v)
+        if vals:
+            return max(vals) - min(vals)
+        return None
+
+    def _fmt_number(self, value: Optional[float]) -> str:
+        if value is None:
+            return "-"
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return "-"
+        return f"{value:.6g}"
 
     def _draw_grid(self, w, h, pad_l, pad_r, pad_t, pad_b, ymin, ymax):
         plot_w = w - pad_l - pad_r
