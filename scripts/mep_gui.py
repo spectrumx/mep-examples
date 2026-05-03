@@ -949,6 +949,7 @@ class MEPGui:
             "SPEC": self._build_spec_tab,
             "TUN":  self._build_tun_tab,
             "MQTT": self._build_mqtt_tab,
+            "TX":   self._build_tx_tab,
         }
         self._tab_frames = {}
         self._tabs_built: set[str] = set()
@@ -2683,6 +2684,65 @@ class MEPGui:
         self.bus.on_status(RFSOC_STATUS_TOPIC,
                           lambda data: self._gui_call(self._soc_apply, data))
 
+    # ---- TX tab ---- #
+
+    def _build_tx_tab(self, frame: ttk.Frame):
+        frame.columnconfigure(0, weight=1)
+
+        def _ro_row(parent, row, label, key, unit=""):
+            sv = tk.StringVar(value="—")
+            self._vars[key] = sv
+            ttk.Label(parent, text=label).grid(
+                row=row, column=0, sticky="w", padx=5, pady=2)
+            e = ttk.Entry(parent, textvariable=sv, state="readonly", width=18)
+            e.grid(row=row, column=1, sticky="ew", padx=5, pady=2)
+            self._bind_copy_menu(e, sv)
+            if unit:
+                ttk.Label(parent, text=unit, foreground="grey").grid(
+                    row=row, column=2, sticky="w")
+
+        st_f = ttk.LabelFrame(frame, text="TX Status")
+        st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
+        st_f.columnconfigure(1, weight=1)
+        _ro_row(st_f, 0, "TX Channels", "tx_st_channels")
+        _ro_row(st_f, 1, "Center Frequency", "tx_st_center_freq", "MHz")
+        _ro_row(st_f, 2, "Offset Frequency", "tx_st_offset_freq", "MHz")
+        _ro_row(st_f, 3, "Amplitude", "tx_st_amplitude", "bins")
+
+        ctrl_f = ttk.LabelFrame(frame, text="Manual Control")
+        ctrl_f.grid(row=1, column=0, padx=4, pady=(2, 4), sticky="ew")
+        ctrl_f.columnconfigure(1, weight=1)
+
+        ttk.Label(ctrl_f, text="Center Freq (MHz)").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["tx_center_freq"] = tk.StringVar(value="")
+        ttk.Entry(ctrl_f, textvariable=self._vars["tx_center_freq"], width=12).grid(row=0, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Button(ctrl_f, text="Set", command=self._tx_set_center_freq).grid(row=0, column=2, padx=5, pady=3, sticky="ew")
+
+        ttk.Label(ctrl_f, text="Offset Freq (MHz)").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        self._vars["tx_offset_freq"] = tk.StringVar(value="")
+        ttk.Entry(ctrl_f, textvariable=self._vars["tx_offset_freq"], width=12).grid(row=1, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Button(ctrl_f, text="Set", command=self._tx_set_offset_freq).grid(row=1, column=2, padx=5, pady=3, sticky="ew")
+
+        ttk.Label(ctrl_f, text="Amplitude (bins)").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        self._vars["tx_amplitude_bins"] = tk.IntVar(value=0)
+        ttk.Spinbox(ctrl_f, from_=0, to=8191, increment=1, textvariable=self._vars["tx_amplitude_bins"], width=10).grid(row=2, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Button(ctrl_f, text="Set", command=self._tx_set_amplitude).grid(row=2, column=2, padx=5, pady=3, sticky="ew")
+
+        ttk.Label(ctrl_f, text="Channel").grid(row=3, column=0, sticky="w", padx=5, pady=3)
+        self._vars["tx_channel"] = tk.StringVar(value="None")
+        ttk.Combobox(ctrl_f, textvariable=self._vars["tx_channel"], values=["None", "A", "B", "A,B"], width=10, state="readonly").grid(row=3, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Button(ctrl_f, text="Set", command=self._tx_set_channel).grid(row=3, column=2, padx=5, pady=3, sticky="ew")
+
+        ttk.Label(
+            ctrl_f,
+            text="tx_offset_freq magnitude must be less than 32 MHz.",
+            foreground="grey",
+            font=("TkDefaultFont", 8),
+        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 3))
+
+        self.bus.on_status(RFSOC_STATUS_TOPIC,
+                           lambda data: self._gui_call(self._tx_apply, data))
+
     # ---- TUN tab ---- #
 
     def _build_tun_tab(self, frame: ttk.Frame):
@@ -4215,6 +4275,64 @@ class MEPGui:
 
         self.bus.rfsoc_set_if(if_mhz)
         logging.info(f"SOC: set freq_IF {if_mhz:.3f} MHz sent")
+
+    # ------------------------------------------------------------------ #
+    #  TX helpers
+    # ------------------------------------------------------------------ #
+
+    def _tx_apply(self, tlm: dict):
+        ch = tlm.get("tx_channels", [])
+        self._vars["tx_st_channels"].set(str(ch) if ch else "—")
+
+        cf = tlm.get("tx_center_freq")
+        self._vars["tx_st_center_freq"].set(f"{cf:.3f}" if cf is not None else "—")
+
+        of = tlm.get("tx_offset_freq")
+        self._vars["tx_st_offset_freq"].set(f"{of:.3f}" if of is not None else "—")
+
+        amp = tlm.get("tx_amplitude_bins")
+        self._vars["tx_st_amplitude"].set(str(amp) if amp is not None else "—")
+
+    def _tx_set_center_freq(self):
+        try:
+            freq_mhz = float(self._vars["tx_center_freq"].get().strip())
+        except ValueError:
+            logging.error("TX: invalid center frequency value")
+            return
+        self.bus.rfsoc_set_tx_center_freq(freq_mhz)
+        logging.info(f"TX: set tx_center_freq {freq_mhz:.3f} MHz sent")
+
+    def _tx_set_offset_freq(self):
+        try:
+            freq_mhz = float(self._vars["tx_offset_freq"].get().strip())
+        except ValueError:
+            logging.error("TX: invalid offset frequency value")
+            return
+        if abs(freq_mhz) >= 32:
+            logging.error(f"TX: offset frequency magnitude {abs(freq_mhz):.1f} MHz exceeds 32 MHz limit")
+            return
+        self.bus.rfsoc_set_tx_offset_freq(freq_mhz)
+        logging.info(f"TX: set tx_offset_freq {freq_mhz:.3f} MHz sent")
+
+    def _tx_set_amplitude(self):
+        try:
+            amp = int(self._vars["tx_amplitude_bins"].get())
+        except (ValueError, tk.TclError):
+            logging.error("TX: invalid amplitude value")
+            return
+        if amp < 0 or amp > 8191:
+            logging.error(f"TX: amplitude {amp} out of range (0..8191)")
+            return
+        self.bus.rfsoc_set_tx_amplitude(amp)
+        logging.info(f"TX: set tx_amplitude {amp} bins sent")
+
+    def _tx_set_channel(self):
+        ch = self._vars["tx_channel"].get().strip()
+        if not ch:
+            logging.error("TX: channel is empty")
+            return
+        self.bus.rfsoc_set_tx_channel(ch)
+        logging.info(f"TX: set tx_channel {ch} sent")
 
     # ------------------------------------------------------------------ #
     #  TUN helpers

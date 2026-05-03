@@ -1420,6 +1420,22 @@ class MEPBus:
         """Set RFSoC IF frequency in MHz."""
         self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {if_mhz}"})
 
+    def rfsoc_set_tx_center_freq(self, freq_mhz: float):
+        """Set TX DAC RFDC mixer/NCO center frequency on all TX channels."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"tx_center_freq {freq_mhz}"})
+
+    def rfsoc_set_tx_offset_freq(self, freq_mhz: float):
+        """Set TX function-generator baseband offset frequency."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"tx_offset_freq {freq_mhz}"})
+
+    def rfsoc_set_tx_amplitude(self, amplitude_bins: int):
+        """Set TX waveform peak amplitude in DAC bins (0..8191)."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"tx_amplitude {amplitude_bins}"})
+
+    def rfsoc_set_tx_channel(self, channel_list: str):
+        """Set TX DAC channel(s): A, B, or A,B."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"tx_channel {channel_list}"})
+
     # ------------------------------------------------------------------ #
     #  Tuner                                                               #
     # ------------------------------------------------------------------ #
