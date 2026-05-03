@@ -236,10 +236,25 @@ def _find_trigger_index(i_values, q_values, cfg: ScopeConfig):
     rising = mode.endswith("Rising")
     level = cfg.trigger_level
     n = len(values)
-    if n < 2:
+    if n < 6:
         return None
 
-    for idx in range(n - 1, 0, -1):
+    finite_vals = []
+    for value in values:
+        try:
+            v = float(value)
+        except Exception:
+            continue
+        if math.isfinite(v):
+            finite_vals.append(v)
+    if finite_vals:
+        hysteresis = max((max(finite_vals) - min(finite_vals)) * 0.02, 1e-12)
+    else:
+        hysteresis = 1e-12
+
+    pre_count = 3
+    post_count = 3
+    for idx in range(n - post_count - 1, pre_count, -1):
         try:
             prev_v = float(values[idx - 1])
             cur_v = float(values[idx])
@@ -247,9 +262,34 @@ def _find_trigger_index(i_values, q_values, cfg: ScopeConfig):
             continue
         if not (math.isfinite(prev_v) and math.isfinite(cur_v)):
             continue
-        if rising and prev_v < level <= cur_v:
+
+        try:
+            pre_vals = [float(values[idx - k]) for k in range(1, pre_count + 1)]
+            post_vals = [float(values[idx + k]) for k in range(0, post_count)]
+        except Exception:
+            continue
+        if not all(math.isfinite(v) for v in pre_vals + post_vals):
+            continue
+
+        pre_mean = sum(pre_vals) / len(pre_vals)
+        post_mean = sum(post_vals) / len(post_vals)
+        slope = post_mean - pre_mean
+
+        if (
+            rising
+            and prev_v < level <= cur_v
+            and pre_mean < level - hysteresis
+            and post_mean > level + hysteresis
+            and slope > 0.0
+        ):
             return idx
-        if (not rising) and prev_v > level >= cur_v:
+        if (
+            (not rising)
+            and prev_v > level >= cur_v
+            and pre_mean > level + hysteresis
+            and post_mean < level - hysteresis
+            and slope < 0.0
+        ):
             return idx
     return None
 
@@ -424,6 +464,7 @@ class MEPScopeGui:
             "refresh_ms": tk.StringVar(value=str(args.refresh_ms)),
             "lag_ms": tk.StringVar(value=f"{args.lag_ms:g}"),
             "center_frequency": tk.StringVar(value="DRF Fc: -"),
+            "dominant_frequency": tk.StringVar(value="Freq: -"),
             "pk_pk": tk.StringVar(value="Pk-Pk:  -"),
             "state": tk.StringVar(value="paused"),
             "status": tk.StringVar(value="Paused"),
@@ -487,7 +528,7 @@ class MEPScopeGui:
         ).grid(row=1, column=5, sticky="ew", padx=5, pady=4)
 
         ttk.Button(cfg_f, text="Run", command=self._run).grid(row=2, column=4, sticky="ew", padx=5, pady=4)
-        ttk.Button(cfg_f, text="Pause", command=self._pause).grid(row=2, column=5, sticky="ew", padx=5, pady=4)
+        ttk.Button(cfg_f, text="Stop", command=self._pause).grid(row=2, column=5, sticky="ew", padx=5, pady=4)
 
         display_f = ttk.Frame(self.root)
         display_f.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 4))
@@ -560,6 +601,9 @@ class MEPScopeGui:
         )
         ttk.Label(measure_f, textvariable=self._vars["pk_pk"], width=1).grid(
             row=1, column=0, sticky="ew", padx=5, pady=4
+        )
+        ttk.Label(measure_f, textvariable=self._vars["dominant_frequency"], width=1).grid(
+            row=2, column=0, sticky="ew", padx=5, pady=4
         )
 
         self._canvas = tk.Canvas(self.root, background="#101010", highlightthickness=1, highlightbackground="#333333")
@@ -715,6 +759,9 @@ class MEPScopeGui:
                 f"DRF Fc: {self._fmt_frequency(latest.center_frequency_hz)}"
             )
             self._vars["pk_pk"].set(f"Pk-Pk:  {self._fmt_number(self._pk_pk(latest))}")
+            self._vars["dominant_frequency"].set(
+                f"Freq: {self._fmt_frequency(self._dominant_frequency_hz(latest))}"
+            )
             self._render_latest()
         elif isinstance(latest, ReaderStatus):
             self._vars["status"].set(latest.message)
@@ -832,6 +879,27 @@ class MEPScopeGui:
         except (TypeError, ValueError):
             return "-"
         return f"{value:.6g}"
+
+    def _dominant_frequency_hz(self, snap: TraceSnapshot) -> Optional[float]:
+        if np is None:
+            return None
+        iq = np.asarray(snap.i_values).ravel() + 1j * np.asarray(snap.q_values).ravel()
+        finite = np.isfinite(iq.real) & np.isfinite(iq.imag)
+        iq = iq[finite]
+        if iq.size < 4:
+            return None
+        iq = iq - np.mean(iq)
+        spectrum = np.fft.fftshift(np.fft.fft(iq))
+        freqs = np.fft.fftshift(np.fft.fftfreq(iq.size, d=1.0 / snap.sample_rate_hz))
+        power = np.abs(spectrum)
+        if power.size < 3:
+            return None
+        dc_idx = int(np.argmin(np.abs(freqs)))
+        power[dc_idx] = 0.0
+        idx = int(np.argmax(power))
+        if power[idx] <= 0.0:
+            return None
+        return float(freqs[idx])
 
     def _draw_grid(self, w, h, pad_l, pad_r, pad_t, pad_b, ymin, ymax):
         plot_w = w - pad_l - pad_r
