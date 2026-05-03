@@ -31,6 +31,11 @@ except Exception:  # pragma: no cover - target systems should have numpy, but ke
     np = None
 
 try:
+    import h5py
+except Exception:  # pragma: no cover - metadata display is optional.
+    h5py = None
+
+try:
     from digital_rf import DigitalRFReader
 except Exception as exc:  # pragma: no cover - handled at runtime in the GUI.
     DigitalRFReader = None
@@ -100,6 +105,7 @@ class TraceSnapshot:
     sample_rate_hz: float
     top_level_dir: str
     channel: str
+    center_frequency_hz: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +163,68 @@ def _to_iq_arrays(samples):
             i_vals.append(float(sample))
             q_vals.append(0.0)
     return i_vals, q_vals
+
+
+def _scalar_or_first(value):
+    if np is not None:
+        arr = np.asarray(value)
+        if arr.shape == ():
+            return arr.item()
+        if arr.size:
+            return arr.flat[0].item() if hasattr(arr.flat[0], "item") else arr.flat[0]
+        return None
+    try:
+        return value[0]
+    except Exception:
+        return value
+
+
+def _metadata_center_frequency_hz(top_level_dir: str, channel: str, sample_index: int) -> Optional[float]:
+    if h5py is None:
+        return None
+
+    metadata_dir = Path(top_level_dir) / channel / "metadata"
+    try:
+        paths = sorted(metadata_dir.rglob("metadata@*.h5"), reverse=True)
+    except OSError:
+        return None
+
+    best_index = None
+    best_value = None
+    for path in paths[:32]:
+        try:
+            with h5py.File(path, "r") as h5:
+                for key in h5.keys():
+                    try:
+                        idx = int(key)
+                    except ValueError:
+                        continue
+                    if idx > sample_index:
+                        continue
+                    if best_index is not None and idx <= best_index:
+                        continue
+
+                    data = h5[key]
+                    value = None
+                    if "center_frequency" in data:
+                        value = _scalar_or_first(data["center_frequency"][()])
+                    elif "center_frequencies" in data:
+                        value = _scalar_or_first(data["center_frequencies"][()])
+                    elif "center_frequency" in data.attrs:
+                        value = _scalar_or_first(data.attrs["center_frequency"])
+                    elif "center_frequencies" in data.attrs:
+                        value = _scalar_or_first(data.attrs["center_frequencies"])
+
+                    if value is not None:
+                        try:
+                            best_value = float(value)
+                            best_index = idx
+                        except (TypeError, ValueError):
+                            pass
+        except Exception:
+            continue
+
+    return best_value
 
 
 def _find_trigger_index(i_values, q_values, cfg: ScopeConfig):
@@ -234,6 +302,8 @@ class DigitalRFScopeReader(threading.Thread):
         self._reader = None
         self._reader_key = None
         self._last_read_end = None
+        self._metadata_last_check = 0.0
+        self._metadata_center_frequency_hz = None
 
     def stop(self):
         self._stop_event.set()
@@ -267,6 +337,8 @@ class DigitalRFScopeReader(threading.Thread):
             self._reader = DigitalRFReader(cfg.top_level_dir)
             self._reader_key = reader_key
             self._last_read_end = None
+            self._metadata_last_check = 0.0
+            self._metadata_center_frequency_hz = None
 
         bounds_start, bounds_end, read_start, read_len = _latest_read_range(self._reader, cfg)
         read_end = read_start + read_len
@@ -305,6 +377,14 @@ class DigitalRFScopeReader(threading.Thread):
                 read_end = display_end
 
         self._last_read_end = read_end
+        now = time.monotonic()
+        if now - self._metadata_last_check >= 1.0 or reader_key != self._reader_key:
+            self._metadata_center_frequency_hz = _metadata_center_frequency_hz(
+                cfg.top_level_dir,
+                cfg.drf_channel,
+                read_start,
+            )
+            self._metadata_last_check = now
         self._out_queue.put(
             TraceSnapshot(
                 i_values=i_values,
@@ -316,6 +396,7 @@ class DigitalRFScopeReader(threading.Thread):
                 sample_rate_hz=cfg.sample_rate_hz,
                 top_level_dir=cfg.top_level_dir,
                 channel=cfg.drf_channel,
+                center_frequency_hz=self._metadata_center_frequency_hz,
             )
         )
         time.sleep(max(0.05, cfg.refresh_ms / 1000.0))
@@ -325,6 +406,7 @@ class MEPScopeGui:
     def __init__(self, root: tk.Tk, args):
         self.root = root
         self.root.title("MEP Scope")
+        self.root.geometry("900x620")
         self.root.minsize(760, 520)
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
@@ -337,11 +419,11 @@ class MEPScopeGui:
             "width_ms": tk.StringVar(value=f"{args.width_ms:g}"),
             "horizontal_position_ms": tk.StringVar(value=f"{args.horizontal_position_ms:g}"),
             "units_per_div": tk.StringVar(value=f"{args.units_per_div:g}"),
-            "vertical_position": tk.StringVar(value=f"{args.vertical_position:g}"),
             "trigger_mode": tk.StringVar(value=args.trigger),
             "trigger_level": tk.StringVar(value=f"{args.trigger_level:g}"),
             "refresh_ms": tk.StringVar(value=str(args.refresh_ms)),
             "lag_ms": tk.StringVar(value=f"{args.lag_ms:g}"),
+            "center_frequency": tk.StringVar(value="Center: -"),
             "state": tk.StringVar(value="paused"),
             "status": tk.StringVar(value="Paused"),
             "cursor": tk.StringVar(value="Cursor: -"),
@@ -406,61 +488,75 @@ class MEPScopeGui:
         ttk.Button(cfg_f, text="Run", command=self._run).grid(row=2, column=4, sticky="ew", padx=5, pady=4)
         ttk.Button(cfg_f, text="Pause", command=self._pause).grid(row=2, column=5, sticky="ew", padx=5, pady=4)
 
-        display_f = ttk.LabelFrame(self.root, text="Display")
+        display_f = ttk.Frame(self.root)
         display_f.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 4))
-        for col in (1, 3, 5):
+        for col in (0, 1, 2, 3):
             display_f.columnconfigure(col, weight=1)
 
-        ttk.Label(display_f, text="Vertical").grid(row=0, column=0, sticky="w", padx=5, pady=4)
-        ttk.Label(display_f, text="Units/Div").grid(row=0, column=1, sticky="e", padx=5, pady=4)
-        ttk.Entry(display_f, textvariable=self._vars["units_per_div"], width=10).grid(
-            row=0, column=2, sticky="ew", padx=5, pady=4
+        vertical_f = ttk.LabelFrame(display_f, text="Vertical Controls")
+        vertical_f.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=0)
+        vertical_f.columnconfigure(1, weight=1)
+        ttk.Label(vertical_f, text="Units/Div").grid(row=0, column=0, sticky="w", padx=5, pady=4)
+        ttk.Entry(vertical_f, textvariable=self._vars["units_per_div"], width=10).grid(
+            row=0, column=1, sticky="ew", padx=5, pady=4
         )
-        ttk.Label(display_f, text="Position").grid(row=0, column=3, sticky="e", padx=5, pady=4)
-        ttk.Entry(display_f, textvariable=self._vars["vertical_position"], width=10).grid(
-            row=0, column=4, sticky="ew", padx=5, pady=4
+        ttk.Button(vertical_f, text="▲", width=3, command=lambda: self._nudge_numeric_var("units_per_div", 0.05)).grid(
+            row=0, column=2, sticky="ew", padx=(0, 2), pady=4
         )
-
-        ttk.Label(display_f, text="Horizontal").grid(row=1, column=0, sticky="w", padx=5, pady=4)
-        ttk.Label(display_f, text="Width (ms)").grid(row=1, column=1, sticky="e", padx=5, pady=4)
-        ttk.Entry(display_f, textvariable=self._vars["width_ms"], width=10).grid(
-            row=1, column=2, sticky="ew", padx=5, pady=4
-        )
-        ttk.Label(display_f, text="Position (ms)").grid(row=1, column=3, sticky="e", padx=5, pady=4)
-        ttk.Entry(display_f, textvariable=self._vars["horizontal_position_ms"], width=10).grid(
-            row=1, column=4, sticky="ew", padx=5, pady=4
+        ttk.Button(vertical_f, text="▼", width=3, command=lambda: self._nudge_numeric_var("units_per_div", -0.05, minimum=0.05)).grid(
+            row=0, column=3, sticky="ew", padx=(0, 5), pady=4
         )
 
-        ttk.Label(display_f, text="Trigger").grid(row=2, column=0, sticky="w", padx=5, pady=4)
+        horizontal_f = ttk.LabelFrame(display_f, text="Horizontal Controls")
+        horizontal_f.grid(row=0, column=1, sticky="nsew", padx=4, pady=0)
+        horizontal_f.columnconfigure(1, weight=1)
+        ttk.Label(horizontal_f, text="Width (ms)").grid(row=0, column=0, sticky="w", padx=5, pady=4)
+        ttk.Entry(horizontal_f, textvariable=self._vars["width_ms"], width=10).grid(
+            row=0, column=1, sticky="ew", padx=5, pady=4
+        )
+        ttk.Button(horizontal_f, text="▲", width=3, command=lambda: self._nudge_numeric_var("width_ms", 0.01)).grid(
+            row=0, column=2, sticky="ew", padx=(0, 2), pady=4
+        )
+        ttk.Button(horizontal_f, text="▼", width=3, command=lambda: self._nudge_numeric_var("width_ms", -0.01, minimum=0.01)).grid(
+            row=0, column=3, sticky="ew", padx=(0, 5), pady=4
+        )
+        ttk.Label(horizontal_f, text="Position (ms)").grid(row=1, column=0, sticky="w", padx=5, pady=4)
+        ttk.Entry(horizontal_f, textvariable=self._vars["horizontal_position_ms"], width=10).grid(
+            row=1, column=1, sticky="ew", padx=5, pady=4
+        )
+        ttk.Label(horizontal_f, text="Refresh (ms)").grid(row=2, column=0, sticky="w", padx=5, pady=4)
+        ttk.Entry(horizontal_f, textvariable=self._vars["refresh_ms"], width=10).grid(
+            row=2, column=1, sticky="ew", padx=5, pady=4
+        )
+        ttk.Label(horizontal_f, text="Read Lag (ms)").grid(row=2, column=2, sticky="e", padx=5, pady=4)
+        ttk.Entry(horizontal_f, textvariable=self._vars["lag_ms"], width=10).grid(
+            row=2, column=3, sticky="ew", padx=(0, 5), pady=4
+        )
+
+        trigger_f = ttk.LabelFrame(display_f, text="Trigger")
+        trigger_f.grid(row=0, column=2, sticky="nsew", padx=4, pady=0)
+        trigger_f.columnconfigure(1, weight=1)
         ttk.Combobox(
-            display_f,
+            trigger_f,
             textvariable=self._vars["trigger_mode"],
             values=TRIGGER_OPTIONS,
             width=14,
             state="readonly",
-        ).grid(row=2, column=1, sticky="ew", padx=5, pady=4)
-        ttk.Label(display_f, text="Level").grid(row=2, column=2, sticky="e", padx=5, pady=4)
-        ttk.Entry(display_f, textvariable=self._vars["trigger_level"], width=10).grid(
-            row=2, column=3, sticky="ew", padx=5, pady=4
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=5, pady=4)
+        ttk.Label(trigger_f, text="Level").grid(row=1, column=0, sticky="w", padx=5, pady=4)
+        ttk.Entry(trigger_f, textvariable=self._vars["trigger_level"], width=10).grid(
+            row=1, column=1, sticky="ew", padx=5, pady=4
         )
-        ttk.Button(display_f, text="Apply", command=self._render_latest).grid(
-            row=2, column=4, sticky="ew", padx=5, pady=4
-        )
-
-        ttk.Label(display_f, text="Refresh (ms)").grid(row=3, column=0, sticky="w", padx=5, pady=4)
-        ttk.Entry(display_f, textvariable=self._vars["refresh_ms"], width=10).grid(
-            row=3, column=1, sticky="ew", padx=5, pady=4
-        )
-        ttk.Label(display_f, text="Read Lag (ms)").grid(row=3, column=2, sticky="e", padx=5, pady=4)
-        ttk.Entry(display_f, textvariable=self._vars["lag_ms"], width=10).grid(
-            row=3, column=3, sticky="ew", padx=5, pady=4
-        )
-        ttk.Button(display_f, text="Apply + Run", command=self._run).grid(
-            row=3, column=4, sticky="ew", padx=5, pady=4
+        ttk.Button(trigger_f, text="Apply", command=self._apply_live_settings).grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=4
         )
 
-        # Keep a stable sixth column so the layout aligns with the source controls.
-        ttk.Frame(display_f).grid(row=0, column=5, rowspan=4, sticky="ew")
+        measure_f = ttk.LabelFrame(display_f, text="Measure")
+        measure_f.grid(row=0, column=3, sticky="nsew", padx=(4, 0), pady=0)
+        measure_f.columnconfigure(0, weight=1)
+        ttk.Label(measure_f, textvariable=self._vars["center_frequency"], width=1).grid(
+            row=0, column=0, sticky="ew", padx=5, pady=4
+        )
 
         self._canvas = tk.Canvas(self.root, background="#101010", highlightthickness=1, highlightbackground="#333333")
         self._canvas.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
@@ -471,10 +567,10 @@ class MEPScopeGui:
         status_f = ttk.Frame(self.root)
         status_f.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
         status_f.columnconfigure(0, weight=1)
-        ttk.Label(status_f, textvariable=self._vars["status"], foreground="grey").grid(
+        ttk.Label(status_f, textvariable=self._vars["status"], foreground="grey", width=1).grid(
             row=0, column=0, sticky="w"
         )
-        ttk.Label(status_f, textvariable=self._vars["cursor"], foreground="grey").grid(
+        ttk.Label(status_f, textvariable=self._vars["cursor"], foreground="grey", width=1).grid(
             row=1, column=0, sticky="w"
         )
         ttk.Label(status_f, textvariable=self._vars["state"], foreground="grey").grid(
@@ -482,7 +578,7 @@ class MEPScopeGui:
         )
 
     def _bind_live_settings(self):
-        redraw_only = ("units_per_div", "vertical_position")
+        redraw_only = ("units_per_div",)
         restart_reader = (
             "root_path", "buffer_name", "sample_rate_mhz", "channel", "width_ms",
             "horizontal_position_ms", "trigger_mode", "trigger_level", "refresh_ms", "lag_ms",
@@ -522,6 +618,16 @@ class MEPScopeGui:
     def _on_buffer_name_selected(self, _event=None):
         self._refresh_sample_rate_options(select_current=True)
         self._schedule_settings_update()
+
+    def _nudge_numeric_var(self, key: str, delta: float, minimum: Optional[float] = None):
+        try:
+            value = float(self._vars[key].get())
+        except (KeyError, ValueError, tk.TclError):
+            value = 0.0
+        value += delta
+        if minimum is not None and value < minimum:
+            value = minimum
+        self._vars[key].set(f"{value:.6g}")
 
     def _scan_source(self):
         self._refresh_buffer_names(select_current=True)
@@ -601,6 +707,9 @@ class MEPScopeGui:
 
         if isinstance(latest, TraceSnapshot):
             self._latest_snapshot = latest
+            self._vars["center_frequency"].set(
+                f"Center: {self._fmt_frequency(latest.center_frequency_hz)}"
+            )
             self._render_latest()
         elif isinstance(latest, ReaderStatus):
             self._vars["status"].set(latest.message)
@@ -628,16 +737,15 @@ class MEPScopeGui:
 
         try:
             units_per_div = abs(float(self._vars["units_per_div"].get()))
-            vertical_position = float(self._vars["vertical_position"].get())
         except ValueError:
-            units_per_div, vertical_position = self._default_vertical_scale(i_vals, q_vals)
+            units_per_div = self._default_units_per_div(i_vals, q_vals)
         if units_per_div <= 0.0:
-            units_per_div, vertical_position = self._default_vertical_scale(i_vals, q_vals)
+            units_per_div = self._default_units_per_div(i_vals, q_vals)
 
         vertical_divs = 8.0
         span = units_per_div * vertical_divs
-        ymin = vertical_position - span / 2.0
-        ymax = vertical_position + span / 2.0
+        ymin = -span / 2.0
+        ymax = span / 2.0
 
         self._draw_grid(w, h, pad_l, pad_r, pad_t, pad_b, ymin, ymax)
         self._draw_trace(i_vals, "#6ad7ff", pad_l, pad_t, plot_w, plot_h, ymin, ymax)
@@ -656,7 +764,7 @@ class MEPScopeGui:
             f"display=[{snap.start_index}, {snap.end_index})  samples={n}"
         )
 
-    def _default_vertical_scale(self, i_vals, q_vals):
+    def _default_units_per_div(self, i_vals, q_vals):
         if np is not None:
             combined = np.concatenate((np.asarray(i_vals).ravel(), np.asarray(q_vals).ravel()))
             finite = combined[np.isfinite(combined)]
@@ -674,9 +782,22 @@ class MEPScopeGui:
             span = max(1.0, abs(ymax))
             ymin -= 0.5 * span
             ymax += 0.5 * span
-        center = (ymin + ymax) / 2.0
-        units_per_div = max((ymax - ymin) / 8.0, 1e-12)
-        return units_per_div, center
+        return max((ymax - ymin) / 8.0, 1e-12)
+
+    def _fmt_frequency(self, hz: Optional[float]) -> str:
+        if hz is None:
+            return "-"
+        try:
+            hz = float(hz)
+        except (TypeError, ValueError):
+            return "-"
+        if abs(hz) >= 1e9:
+            return f"{hz / 1e9:.6f} GHz"
+        if abs(hz) >= 1e6:
+            return f"{hz / 1e6:.6f} MHz"
+        if abs(hz) >= 1e3:
+            return f"{hz / 1e3:.6f} kHz"
+        return f"{hz:.6f} Hz"
 
     def _draw_grid(self, w, h, pad_l, pad_r, pad_t, pad_b, ymin, ymax):
         plot_w = w - pad_l - pad_r
@@ -759,7 +880,6 @@ def parse_args():
     parser.add_argument("--width-ms", default=DEFAULT_WIDTH_MS, type=float, help="Horizontal display width in ms.")
     parser.add_argument("--horizontal-position-ms", default=0.0, type=float, help="Time from left edge to trigger/latest reference.")
     parser.add_argument("--units-per-div", default=DEFAULT_UNITS_PER_DIV, type=float, help="Vertical units per division.")
-    parser.add_argument("--vertical-position", default=0.0, type=float, help="Vertical center position in sample units.")
     parser.add_argument("--trigger", default="Free Run", choices=TRIGGER_OPTIONS, help="Trigger mode.")
     parser.add_argument("--trigger-level", default=0.0, type=float, help="Trigger crossing level in sample units.")
     parser.add_argument("--refresh-ms", default=DEFAULT_REFRESH_MS, type=int, help="Reader refresh interval.")
