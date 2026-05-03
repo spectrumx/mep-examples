@@ -8,7 +8,7 @@ This GUI is read-only. It does not send MQTT commands and does not control
 RFSoC, recorder, tuner, AFE, or Xilinx tools.
 
 Usage:
-    python3 scripts/mep_scope.py --root /data/ringbuffer --sample-rate-mhz 10 --channel B
+    python3 scripts/mep_scope.py --root /data/tmp-ringbuffer --name <buffer-name> --sample-rate-mhz 10 --channel B
 """
 
 import argparse
@@ -39,22 +39,29 @@ else:
     DIGITAL_RF_IMPORT_ERROR = None
 
 
-DEFAULT_ROOT = "/data/ringbuffer"
+DEFAULT_ROOT = "/data/tmp-ringbuffer"
+DEFAULT_NAME = ""
 DEFAULT_SAMPLE_RATE_MHZ = "10"
 DEFAULT_CHANNEL = "B"
-DEFAULT_WINDOW_SAMPLES = 8192
+DEFAULT_WIDTH_MS = 1.0
+DEFAULT_UNITS_PER_DIV = 0.25
 DEFAULT_REFRESH_MS = 200
 DEFAULT_LAG_MS = 100.0
 CHANNEL_OPTIONS = ("A", "B", "C", "D")
 SR_DIR_RE = re.compile(r"^sr(\d+(?:\.\d+)?)MHz$")
+TRIGGER_OPTIONS = ("Free Run", "I Rising", "I Falling", "Q Rising", "Q Falling")
 
 
 @dataclass(frozen=True)
 class ScopeConfig:
     root: str
+    name: str
     sample_rate_mhz: float
     channel: str
-    window_samples: int
+    width_ms: float
+    horizontal_position_ms: float
+    trigger_mode: str
+    trigger_level: float
     refresh_ms: int
     lag_ms: float
 
@@ -63,8 +70,16 @@ class ScopeConfig:
         return self.sample_rate_mhz * 1e6
 
     @property
+    def window_samples(self) -> int:
+        return max(2, int(round(self.sample_rate_hz * self.width_ms / 1000.0)))
+
+    @property
+    def buffer_dir(self) -> str:
+        return os.path.join(self.root, self.name) if self.name else self.root
+
+    @property
     def top_level_dir(self) -> str:
-        return os.path.join(self.root, f"sr{self.sample_rate_mhz:g}MHz")
+        return os.path.join(self.buffer_dir, f"sr{self.sample_rate_mhz:g}MHz")
 
     @property
     def drf_channel(self) -> str:
@@ -93,11 +108,20 @@ class ReaderStatus:
     message: str
 
 
-def discover_sample_rates(root: str) -> list[str]:
+def discover_names(root: str) -> list[str]:
+    """Return named buffer directories under the root path."""
+    try:
+        entries = list(Path(root).iterdir())
+    except OSError:
+        return []
+    return sorted(entry.name for entry in entries if entry.is_dir() and not SR_DIR_RE.match(entry.name))
+
+
+def discover_sample_rates(buffer_dir: str) -> list[str]:
     """Return numeric sample-rate MHz strings from sr{N}MHz directories."""
     rates = []
     try:
-        entries = list(Path(root).iterdir())
+        entries = list(Path(buffer_dir).iterdir())
     except OSError:
         return []
 
@@ -135,16 +159,48 @@ def _to_iq_arrays(samples):
     return i_vals, q_vals
 
 
+def _find_trigger_index(i_values, q_values, cfg: ScopeConfig):
+    mode = cfg.trigger_mode
+    if mode == "Free Run":
+        return None
+
+    values = q_values if mode.startswith("Q ") else i_values
+    rising = mode.endswith("Rising")
+    level = cfg.trigger_level
+    n = len(values)
+    if n < 2:
+        return None
+
+    for idx in range(n - 1, 0, -1):
+        try:
+            prev_v = float(values[idx - 1])
+            cur_v = float(values[idx])
+        except Exception:
+            continue
+        if not (math.isfinite(prev_v) and math.isfinite(cur_v)):
+            continue
+        if rising and prev_v < level <= cur_v:
+            return idx
+        if (not rising) and prev_v > level >= cur_v:
+            return idx
+    return None
+
+
 def _latest_read_range(reader, cfg: ScopeConfig):
     bounds_start, bounds_end = reader.get_bounds(cfg.drf_channel)
     if bounds_end <= bounds_start:
         raise RuntimeError(f"No samples available in {cfg.drf_channel}")
 
-    lag_samples = max(0, int(cfg.sample_rate_hz * cfg.lag_ms / 1000.0))
+    lag_samples = max(0, int(round(cfg.sample_rate_hz * cfg.lag_ms / 1000.0)))
+    position_samples = int(round(cfg.sample_rate_hz * cfg.horizontal_position_ms / 1000.0))
     desired_end = max(bounds_start + 1, bounds_end - lag_samples)
-    desired_start = max(bounds_start, desired_end - cfg.window_samples)
+    desired_start = max(bounds_start, desired_end - cfg.window_samples - max(0, position_samples))
     if desired_end <= desired_start:
         raise RuntimeError("Not enough samples available after latest-read lag")
+
+    if cfg.trigger_mode != "Free Run":
+        search_samples = max(cfg.window_samples * 4, cfg.window_samples + abs(position_samples) + 2)
+        desired_start = max(bounds_start, desired_end - search_samples)
 
     blocks = reader.get_continuous_blocks(desired_start, desired_end - 1, cfg.drf_channel)
     if not blocks:
@@ -221,6 +277,33 @@ class DigitalRFScopeReader(threading.Thread):
 
         samples = self._reader.read_vector(read_start, read_len, cfg.drf_channel)
         i_values, q_values = _to_iq_arrays(samples)
+
+        triggered = False
+        if cfg.trigger_mode != "Free Run":
+            trigger_idx = _find_trigger_index(i_values, q_values, cfg)
+            if trigger_idx is not None:
+                trigger_abs = read_start + trigger_idx
+                position_samples = int(round(cfg.sample_rate_hz * cfg.horizontal_position_ms / 1000.0))
+                display_start = max(bounds_start, trigger_abs - position_samples)
+                display_end = min(bounds_end, display_start + cfg.window_samples)
+                display_start = max(bounds_start, display_end - cfg.window_samples)
+                if display_end > display_start:
+                    samples = self._reader.read_vector(display_start, display_end - display_start, cfg.drf_channel)
+                    i_values, q_values = _to_iq_arrays(samples)
+                    read_start = display_start
+                    read_end = display_end
+                    triggered = True
+
+        if cfg.trigger_mode == "Free Run" or not triggered:
+            position_samples = max(0, int(round(cfg.sample_rate_hz * cfg.horizontal_position_ms / 1000.0)))
+            display_end = max(bounds_start + 1, bounds_end - int(round(cfg.sample_rate_hz * cfg.lag_ms / 1000.0)) - position_samples)
+            display_start = max(bounds_start, display_end - cfg.window_samples)
+            if display_start != read_start or display_end != read_end:
+                samples = self._reader.read_vector(display_start, display_end - display_start, cfg.drf_channel)
+                i_values, q_values = _to_iq_arrays(samples)
+                read_start = display_start
+                read_end = display_end
+
         self._last_read_end = read_end
         self._out_queue.put(
             TraceSnapshot(
@@ -248,15 +331,18 @@ class MEPScopeGui:
 
         self._vars = {
             "root_path": tk.StringVar(value=args.root),
+            "buffer_name": tk.StringVar(value=args.name),
             "sample_rate_mhz": tk.StringVar(value=args.sample_rate_mhz),
             "channel": tk.StringVar(value=args.channel),
-            "window_samples": tk.StringVar(value=str(args.window_samples)),
+            "width_ms": tk.StringVar(value=f"{args.width_ms:g}"),
+            "horizontal_position_ms": tk.StringVar(value=f"{args.horizontal_position_ms:g}"),
+            "units_per_div": tk.StringVar(value=f"{args.units_per_div:g}"),
+            "vertical_position": tk.StringVar(value=f"{args.vertical_position:g}"),
+            "trigger_mode": tk.StringVar(value=args.trigger),
+            "trigger_level": tk.StringVar(value=f"{args.trigger_level:g}"),
             "refresh_ms": tk.StringVar(value=str(args.refresh_ms)),
             "lag_ms": tk.StringVar(value=f"{args.lag_ms:g}"),
             "state": tk.StringVar(value="paused"),
-            "autoscale": tk.BooleanVar(value=True),
-            "y_min": tk.StringVar(value="-1.0"),
-            "y_max": tk.StringVar(value="1.0"),
             "status": tk.StringVar(value="Paused"),
             "cursor": tk.StringVar(value="Cursor: -"),
         }
@@ -265,9 +351,13 @@ class MEPScopeGui:
         self._queue = queue.Queue(maxsize=4)
         self._reader = DigitalRFScopeReader(self._queue)
         self._reader.start()
+        self._settings_update_after = None
+        self._suppress_var_update = False
 
         self._build_ui()
+        self._refresh_buffer_names(select_current=True)
         self._refresh_sample_rate_options(select_current=True)
+        self._bind_live_settings()
         self.root.after(50, self._pump_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -281,66 +371,96 @@ class MEPScopeGui:
         ttk.Entry(cfg_f, textvariable=self._vars["root_path"], width=36).grid(
             row=0, column=1, columnspan=3, sticky="ew", padx=5, pady=4
         )
-        ttk.Button(cfg_f, text="Scan", command=self._refresh_sample_rate_options).grid(
+        ttk.Button(cfg_f, text="Scan", command=self._scan_source).grid(
             row=0, column=4, sticky="ew", padx=5, pady=4
         )
 
-        ttk.Label(cfg_f, text="Sample Rate (MHz)").grid(row=1, column=0, sticky="w", padx=5, pady=4)
+        ttk.Label(cfg_f, text="Name").grid(row=1, column=0, sticky="w", padx=5, pady=4)
+        self._buffer_name_combo = ttk.Combobox(
+            cfg_f,
+            textvariable=self._vars["buffer_name"],
+            width=18,
+            state="readonly",
+        )
+        self._buffer_name_combo.grid(row=1, column=1, sticky="ew", padx=5, pady=4)
+        self._buffer_name_combo.bind("<<ComboboxSelected>>", self._on_buffer_name_selected)
+
+        ttk.Label(cfg_f, text="Sample Rate (MHz)").grid(row=1, column=2, sticky="w", padx=5, pady=4)
         self._sample_rate_combo = ttk.Combobox(
             cfg_f,
             textvariable=self._vars["sample_rate_mhz"],
             width=12,
             state="readonly",
         )
-        self._sample_rate_combo.grid(row=1, column=1, sticky="ew", padx=5, pady=4)
+        self._sample_rate_combo.grid(row=1, column=3, sticky="ew", padx=5, pady=4)
 
-        ttk.Label(cfg_f, text="Channel").grid(row=1, column=2, sticky="w", padx=5, pady=4)
+        ttk.Label(cfg_f, text="Channel").grid(row=1, column=4, sticky="w", padx=5, pady=4)
         ttk.Combobox(
             cfg_f,
             textvariable=self._vars["channel"],
             values=CHANNEL_OPTIONS,
             width=8,
             state="readonly",
-        ).grid(row=1, column=3, sticky="ew", padx=5, pady=4)
+        ).grid(row=1, column=5, sticky="ew", padx=5, pady=4)
 
-        ttk.Button(cfg_f, text="Run", command=self._run).grid(row=1, column=4, sticky="ew", padx=5, pady=4)
-        ttk.Button(cfg_f, text="Pause", command=self._pause).grid(row=1, column=5, sticky="ew", padx=5, pady=4)
+        ttk.Button(cfg_f, text="Run", command=self._run).grid(row=2, column=4, sticky="ew", padx=5, pady=4)
+        ttk.Button(cfg_f, text="Pause", command=self._pause).grid(row=2, column=5, sticky="ew", padx=5, pady=4)
 
         display_f = ttk.LabelFrame(self.root, text="Display")
         display_f.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 4))
         for col in (1, 3, 5):
             display_f.columnconfigure(col, weight=1)
 
-        ttk.Label(display_f, text="Window Samples").grid(row=0, column=0, sticky="w", padx=5, pady=4)
-        ttk.Entry(display_f, textvariable=self._vars["window_samples"], width=10).grid(
-            row=0, column=1, sticky="ew", padx=5, pady=4
+        ttk.Label(display_f, text="Vertical").grid(row=0, column=0, sticky="w", padx=5, pady=4)
+        ttk.Label(display_f, text="Units/Div").grid(row=0, column=1, sticky="e", padx=5, pady=4)
+        ttk.Entry(display_f, textvariable=self._vars["units_per_div"], width=10).grid(
+            row=0, column=2, sticky="ew", padx=5, pady=4
         )
-        ttk.Label(display_f, text="Refresh (ms)").grid(row=0, column=2, sticky="w", padx=5, pady=4)
-        ttk.Entry(display_f, textvariable=self._vars["refresh_ms"], width=10).grid(
-            row=0, column=3, sticky="ew", padx=5, pady=4
-        )
-        ttk.Label(display_f, text="Read Lag (ms)").grid(row=0, column=4, sticky="w", padx=5, pady=4)
-        ttk.Entry(display_f, textvariable=self._vars["lag_ms"], width=10).grid(
-            row=0, column=5, sticky="ew", padx=5, pady=4
+        ttk.Label(display_f, text="Position").grid(row=0, column=3, sticky="e", padx=5, pady=4)
+        ttk.Entry(display_f, textvariable=self._vars["vertical_position"], width=10).grid(
+            row=0, column=4, sticky="ew", padx=5, pady=4
         )
 
-        ttk.Checkbutton(
-            display_f,
-            text="Autoscale",
-            variable=self._vars["autoscale"],
-            command=self._render_latest,
-        ).grid(row=1, column=0, sticky="w", padx=5, pady=4)
-        ttk.Label(display_f, text="Y Min").grid(row=1, column=1, sticky="e", padx=5, pady=4)
-        ttk.Entry(display_f, textvariable=self._vars["y_min"], width=10).grid(
+        ttk.Label(display_f, text="Horizontal").grid(row=1, column=0, sticky="w", padx=5, pady=4)
+        ttk.Label(display_f, text="Width (ms)").grid(row=1, column=1, sticky="e", padx=5, pady=4)
+        ttk.Entry(display_f, textvariable=self._vars["width_ms"], width=10).grid(
             row=1, column=2, sticky="ew", padx=5, pady=4
         )
-        ttk.Label(display_f, text="Y Max").grid(row=1, column=3, sticky="e", padx=5, pady=4)
-        ttk.Entry(display_f, textvariable=self._vars["y_max"], width=10).grid(
+        ttk.Label(display_f, text="Position (ms)").grid(row=1, column=3, sticky="e", padx=5, pady=4)
+        ttk.Entry(display_f, textvariable=self._vars["horizontal_position_ms"], width=10).grid(
             row=1, column=4, sticky="ew", padx=5, pady=4
         )
-        ttk.Button(display_f, text="Apply", command=self._render_latest).grid(
-            row=1, column=5, sticky="ew", padx=5, pady=4
+
+        ttk.Label(display_f, text="Trigger").grid(row=2, column=0, sticky="w", padx=5, pady=4)
+        ttk.Combobox(
+            display_f,
+            textvariable=self._vars["trigger_mode"],
+            values=TRIGGER_OPTIONS,
+            width=14,
+            state="readonly",
+        ).grid(row=2, column=1, sticky="ew", padx=5, pady=4)
+        ttk.Label(display_f, text="Level").grid(row=2, column=2, sticky="e", padx=5, pady=4)
+        ttk.Entry(display_f, textvariable=self._vars["trigger_level"], width=10).grid(
+            row=2, column=3, sticky="ew", padx=5, pady=4
         )
+        ttk.Button(display_f, text="Apply", command=self._render_latest).grid(
+            row=2, column=4, sticky="ew", padx=5, pady=4
+        )
+
+        ttk.Label(display_f, text="Refresh (ms)").grid(row=3, column=0, sticky="w", padx=5, pady=4)
+        ttk.Entry(display_f, textvariable=self._vars["refresh_ms"], width=10).grid(
+            row=3, column=1, sticky="ew", padx=5, pady=4
+        )
+        ttk.Label(display_f, text="Read Lag (ms)").grid(row=3, column=2, sticky="e", padx=5, pady=4)
+        ttk.Entry(display_f, textvariable=self._vars["lag_ms"], width=10).grid(
+            row=3, column=3, sticky="ew", padx=5, pady=4
+        )
+        ttk.Button(display_f, text="Apply + Run", command=self._run).grid(
+            row=3, column=4, sticky="ew", padx=5, pady=4
+        )
+
+        # Keep a stable sixth column so the layout aligns with the source controls.
+        ttk.Frame(display_f).grid(row=0, column=5, rowspan=4, sticky="ew")
 
         self._canvas = tk.Canvas(self.root, background="#101010", highlightthickness=1, highlightbackground="#333333")
         self._canvas.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
@@ -361,24 +481,91 @@ class MEPScopeGui:
             row=0, column=1, rowspan=2, sticky="e"
         )
 
+    def _bind_live_settings(self):
+        redraw_only = ("units_per_div", "vertical_position")
+        restart_reader = (
+            "root_path", "buffer_name", "sample_rate_mhz", "channel", "width_ms",
+            "horizontal_position_ms", "trigger_mode", "trigger_level", "refresh_ms", "lag_ms",
+        )
+
+        for key in redraw_only:
+            self._vars[key].trace_add("write", lambda *_args: self._schedule_render_latest())
+        for key in restart_reader:
+            self._vars[key].trace_add("write", lambda *_args: self._schedule_settings_update())
+
+    def _schedule_render_latest(self):
+        if self._suppress_var_update:
+            return
+        self.root.after_idle(self._render_latest)
+
+    def _schedule_settings_update(self):
+        if self._suppress_var_update:
+            return
+        if self._settings_update_after is not None:
+            try:
+                self.root.after_cancel(self._settings_update_after)
+            except tk.TclError:
+                pass
+        self._settings_update_after = self.root.after(250, self._apply_live_settings)
+
+    def _apply_live_settings(self):
+        self._settings_update_after = None
+        if self._vars["state"].get() != "running":
+            self._render_latest()
+            return
+        cfg = self._build_config()
+        if cfg is None:
+            return
+        self._vars["status"].set(f"Reading {cfg.top_level_dir}/{cfg.drf_channel}")
+        self._reader.set_config(cfg)
+
+    def _on_buffer_name_selected(self, _event=None):
+        self._refresh_sample_rate_options(select_current=True)
+        self._schedule_settings_update()
+
+    def _scan_source(self):
+        self._refresh_buffer_names(select_current=True)
+        self._refresh_sample_rate_options(select_current=True)
+
+    def _refresh_buffer_names(self, select_current=False):
+        names = discover_names(self._vars["root_path"].get().strip())
+        self._buffer_name_combo.configure(values=names)
+        current = self._vars["buffer_name"].get().strip()
+        if names and (select_current or current not in names):
+            self._vars["buffer_name"].set(current if current in names else names[0])
+        if names:
+            self._vars["status"].set(f"Found buffers under {self._vars['root_path'].get()}: {', '.join(names)}")
+        else:
+            self._vars["status"].set(f"No named buffer directories found under {self._vars['root_path'].get()}")
+
+    def _selected_buffer_dir(self) -> str:
+        root = self._vars["root_path"].get().strip()
+        name = self._vars["buffer_name"].get().strip()
+        return os.path.join(root, name) if name else root
+
     def _refresh_sample_rate_options(self, select_current=False):
-        rates = discover_sample_rates(self._vars["root_path"].get().strip())
+        buffer_dir = self._selected_buffer_dir()
+        rates = discover_sample_rates(buffer_dir)
         self._sample_rate_combo.configure(values=rates)
         current = self._vars["sample_rate_mhz"].get().strip()
         if rates and (select_current or current not in rates):
             self._vars["sample_rate_mhz"].set(current if current in rates else rates[0])
         if rates:
-            self._vars["status"].set(f"Found sample rates under {self._vars['root_path'].get()}: {', '.join(rates)} MHz")
+            self._vars["status"].set(f"Found sample rates under {buffer_dir}: {', '.join(rates)} MHz")
         else:
-            self._vars["status"].set(f"No sr{{N}}MHz directories found under {self._vars['root_path'].get()}")
+            self._vars["status"].set(f"No sr{{N}}MHz directories found under {buffer_dir}")
 
     def _build_config(self) -> Optional[ScopeConfig]:
         try:
             cfg = ScopeConfig(
                 root=self._vars["root_path"].get().strip() or DEFAULT_ROOT,
+                name=self._vars["buffer_name"].get().strip(),
                 sample_rate_mhz=float(self._vars["sample_rate_mhz"].get().strip()),
                 channel=self._vars["channel"].get().strip() or DEFAULT_CHANNEL,
-                window_samples=max(2, int(float(self._vars["window_samples"].get().strip()))),
+                width_ms=max(0.000001, float(self._vars["width_ms"].get().strip())),
+                horizontal_position_ms=max(0.0, float(self._vars["horizontal_position_ms"].get().strip())),
+                trigger_mode=self._vars["trigger_mode"].get().strip() or "Free Run",
+                trigger_level=float(self._vars["trigger_level"].get().strip()),
                 refresh_ms=max(20, int(float(self._vars["refresh_ms"].get().strip()))),
                 lag_ms=max(0.0, float(self._vars["lag_ms"].get().strip())),
             )
@@ -439,16 +626,18 @@ class MEPScopeGui:
             self._vars["status"].set("Not enough samples to render")
             return
 
-        if self._vars["autoscale"].get():
-            ymin, ymax = self._auto_limits(i_vals, q_vals)
-        else:
-            try:
-                ymin = float(self._vars["y_min"].get())
-                ymax = float(self._vars["y_max"].get())
-            except ValueError:
-                ymin, ymax = self._auto_limits(i_vals, q_vals)
-            if ymax <= ymin:
-                ymin, ymax = self._auto_limits(i_vals, q_vals)
+        try:
+            units_per_div = abs(float(self._vars["units_per_div"].get()))
+            vertical_position = float(self._vars["vertical_position"].get())
+        except ValueError:
+            units_per_div, vertical_position = self._default_vertical_scale(i_vals, q_vals)
+        if units_per_div <= 0.0:
+            units_per_div, vertical_position = self._default_vertical_scale(i_vals, q_vals)
+
+        vertical_divs = 8.0
+        span = units_per_div * vertical_divs
+        ymin = vertical_position - span / 2.0
+        ymax = vertical_position + span / 2.0
 
         self._draw_grid(w, h, pad_l, pad_r, pad_t, pad_b, ymin, ymax)
         self._draw_trace(i_vals, "#6ad7ff", pad_l, pad_t, plot_w, plot_h, ymin, ymax)
@@ -467,7 +656,7 @@ class MEPScopeGui:
             f"display=[{snap.start_index}, {snap.end_index})  samples={n}"
         )
 
-    def _auto_limits(self, i_vals, q_vals):
+    def _default_vertical_scale(self, i_vals, q_vals):
         if np is not None:
             combined = np.concatenate((np.asarray(i_vals).ravel(), np.asarray(q_vals).ravel()))
             finite = combined[np.isfinite(combined)]
@@ -485,8 +674,9 @@ class MEPScopeGui:
             span = max(1.0, abs(ymax))
             ymin -= 0.5 * span
             ymax += 0.5 * span
-        margin = 0.05 * (ymax - ymin)
-        return ymin - margin, ymax + margin
+        center = (ymin + ymax) / 2.0
+        units_per_div = max((ymax - ymin) / 8.0, 1e-12)
+        return units_per_div, center
 
     def _draw_grid(self, w, h, pad_l, pad_r, pad_t, pad_b, ymin, ymax):
         plot_w = w - pad_l - pad_r
@@ -562,10 +752,16 @@ class MEPScopeGui:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Read-only DigitalRF oscilloscope GUI for MEP ringbuffers.")
-    parser.add_argument("--root", default=DEFAULT_ROOT, help="Ringbuffer root containing sr{N}MHz directories.")
+    parser.add_argument("--root", default=DEFAULT_ROOT, help="Ringbuffer root containing named buffer directories.")
+    parser.add_argument("--name", default=DEFAULT_NAME, help="Initial named buffer directory under the root.")
     parser.add_argument("--sample-rate-mhz", default=DEFAULT_SAMPLE_RATE_MHZ, help="Initial sample rate in MHz.")
     parser.add_argument("--channel", default=DEFAULT_CHANNEL, choices=CHANNEL_OPTIONS, help="Initial channel.")
-    parser.add_argument("--window-samples", default=DEFAULT_WINDOW_SAMPLES, type=int, help="Samples to display.")
+    parser.add_argument("--width-ms", default=DEFAULT_WIDTH_MS, type=float, help="Horizontal display width in ms.")
+    parser.add_argument("--horizontal-position-ms", default=0.0, type=float, help="Time from left edge to trigger/latest reference.")
+    parser.add_argument("--units-per-div", default=DEFAULT_UNITS_PER_DIV, type=float, help="Vertical units per division.")
+    parser.add_argument("--vertical-position", default=0.0, type=float, help="Vertical center position in sample units.")
+    parser.add_argument("--trigger", default="Free Run", choices=TRIGGER_OPTIONS, help="Trigger mode.")
+    parser.add_argument("--trigger-level", default=0.0, type=float, help="Trigger crossing level in sample units.")
     parser.add_argument("--refresh-ms", default=DEFAULT_REFRESH_MS, type=int, help="Reader refresh interval.")
     parser.add_argument("--lag-ms", default=DEFAULT_LAG_MS, type=float, help="Read this far behind latest bound.")
     return parser.parse_args()
