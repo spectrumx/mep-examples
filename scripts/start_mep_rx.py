@@ -1978,16 +1978,21 @@ class CaptureController:
                 return self._tlm
         return None
 
-    def _wait_for_status(self, topic: str, timeout_s: float = 2.0):
-        """Block until a status message arrives on topic, return payload or None."""
+    def _wait_for_status(self, topic: str, timeout_s: float = 2.0, pre_armed: bool = False):
+        """Block until a status message arrives on topic, return payload or None.
+
+        Set pre_armed=True when the event has already been cleared before the
+        triggering command was sent (avoids missing a fast response).
+        """
         if topic not in self._status_events:
             raise ValueError(f"Unknown sync status topic: {topic!r}")
         if not self.bus.is_connected():
             logging.warning(f"Cannot wait for {topic}: MQTT offline")
             return None
-        self._status_events[topic].clear()
-        with self._status_lock:
-            self._status[topic] = None
+        if not pre_armed:
+            self._status_events[topic].clear()
+            with self._status_lock:
+                self._status[topic] = None
         if self._status_events[topic].wait(timeout=timeout_s):
             with self._status_lock:
                 return self._status[topic]
@@ -2155,8 +2160,12 @@ class CaptureController:
         self.bus.recorder_config_set("drf_sink.channel_dir", channel_dir)
         self.bus.recorder_config_set("basic_network.dst_port", str(dst_port))
 
+        # Arm the wait BEFORE sending enable to avoid missing a fast response
+        self._status_events[RECORDER_STATUS_TOPIC].clear()
+        with self._status_lock:
+            self._status[RECORDER_STATUS_TOPIC] = None
         self.bus.recorder_enable()
-        status = self._wait_for_status(RECORDER_STATUS_TOPIC, timeout_s=3.0)
+        status = self._wait_for_status(RECORDER_STATUS_TOPIC, timeout_s=3.0, pre_armed=True)
         if status is not None:
             logging.info(f"Recorder enabled — status: {status}")
         else:

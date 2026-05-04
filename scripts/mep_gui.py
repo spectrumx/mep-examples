@@ -760,12 +760,11 @@ class MEPGui:
                 level = "yellow"
             else:
                 level = "green"
-            rec_file = rec_status.get("file") or rec_status.get("filename") or rec_status.get("path") or "—"
             self._set_status_cell(
                 "recorder",
                 level,
                 rec_state,
-                detail=f"state={rec_state}, file={rec_file}",
+                detail=f"state={rec_state}",
             )
         else:
             sweep_active = self._sweep_thread and self._sweep_thread.is_alive()
@@ -3366,14 +3365,6 @@ class MEPGui:
         _se.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
         self._bind_copy_menu(_se, self._vars["rec_status"])
 
-        ttk.Label(status_frame, text="File").grid(
-            row=1, column=0, sticky="w", padx=5, pady=2)
-        self._vars["rec_status_file"] = tk.StringVar(value="—")
-        _fe = ttk.Entry(status_frame, textvariable=self._vars["rec_status_file"],
-                        state="readonly", width=18)
-        _fe.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
-        self._bind_copy_menu(_fe, self._vars["rec_status_file"])
-
         # Spectrograms
         sg_frame = ttk.LabelFrame(frame, text="Spectrograms")
         sg_frame.grid(row=1, column=0, padx=4, pady=6, sticky="ew")
@@ -4520,9 +4511,6 @@ class MEPGui:
     def _rec_status_ui_update(self, data: dict):
         """Update REC tab widgets from recorder status (only called after tab is built)."""
         self._vars["rec_status"].set(data.get("state", "—"))
-        fpath = (data.get("file") or data.get("filename") or
-                 data.get("path") or data.get("output_file") or "—")
-        self._vars["rec_status_file"].set(str(fpath))
 
     def _rec_reload_config(self):
         sr = self._vars["sample_rate_mhz"].get()
