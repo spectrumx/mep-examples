@@ -3162,6 +3162,13 @@ class MEPGui:
                    command=self._afe_reset_defaults).grid(
             row=0, column=1, padx=(2, 0), sticky="ew")
 
+    def _afe_reg_default(self, reg: dict):
+        if not isinstance(reg, dict):
+            return 0
+        if "service_default_override" in reg:
+            return reg.get("service_default_override")
+        return reg.get("default", 0)
+
     def _afe_populate_from_announce(self, announce: dict):
         """Build AFE register widgets from afe/announce describe data."""
         describe = announce.get("describe", {})
@@ -3205,13 +3212,14 @@ class MEPGui:
                     continue
 
                 label = reg.get("label", name.replace("_", " ").title())
+                reg_default = self._afe_reg_default(reg)
 
                 if name == "GNSS_ANT_SEL":
                     ant_f = ttk.Frame(self._afe_main_f)
                     ant_f.grid(row=row_i, column=0, sticky="w", padx=6, pady=(4, 2))
                     ttk.Label(ant_f, text=f"{label}:").grid(row=0, column=0, sticky="w")
                     self._vars["afe_misc_GNSS_ANT_SEL"] = tk.StringVar(
-                        value="external" if reg["default"] == 0 else "internal")
+                        value="external" if reg_default == 0 else "internal")
 
                     def _ant_cb(*_):
                         if self._afe_updating:
@@ -3230,7 +3238,7 @@ class MEPGui:
                     continue
 
                 key = f"afe_misc_{name}"
-                self._vars[key] = tk.BooleanVar(value=bool(reg["default"]))
+                self._vars[key] = tk.BooleanVar(value=bool(reg_default))
 
                 def _main_cb(name=name, key=key):
                     if self._afe_updating:
@@ -3270,7 +3278,7 @@ class MEPGui:
 
                     key = f"afe_{device}_{name}"
                     label = reg.get("label", name.replace("_", " ").title())
-                    self._vars[key] = tk.BooleanVar(value=bool(reg["default"]))
+                    self._vars[key] = tk.BooleanVar(value=bool(self._afe_reg_default(reg)))
 
                     def _rx_cb(device=device, name=name, key=key):
                         if self._afe_updating:
@@ -3331,7 +3339,7 @@ class MEPGui:
 
                     key = f"afe_{device}_{name}"
                     label = reg.get("label", name.replace("_", " ").title())
-                    self._vars[key] = tk.BooleanVar(value=bool(reg["default"]))
+                    self._vars[key] = tk.BooleanVar(value=bool(self._afe_reg_default(reg)))
 
                     def _tx_cb(device=device, name=name, key=key):
                         if self._afe_updating:
@@ -3546,12 +3554,13 @@ class MEPGui:
                 if name.startswith("NOT_USED") or name.startswith("ATTEN_"):
                     continue
                 key = f"afe_{device}_{name}"
+                reg_default = self._afe_reg_default(reg)
                 if name == "GNSS_ANT_SEL":
                     self._vars.get(f"afe_{device}_GNSS_ANT_SEL", tk.StringVar()).set(
-                        "internal" if reg["default"] == 1 else "external")
+                        "internal" if reg_default == 1 else "external")
                     continue
                 if key in self._vars:
-                    self._vars[key].set(bool(reg["default"]))
+                    self._vars[key].set(bool(reg_default))
             # Reset attenuation for RX devices
             atten_key = f"afe_{device}_atten"
             if atten_key in self._vars:
