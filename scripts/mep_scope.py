@@ -486,7 +486,7 @@ class MEPScopeGui:
             "refresh_ms": tk.StringVar(value=str(args.refresh_ms)),
             "lag_ms": tk.StringVar(value=f"{args.lag_ms:g}"),
             "center_frequency": tk.StringVar(value="DRF Fc: -"),
-            "dominant_frequency": tk.StringVar(value="Freq: -"),
+            "dominant_frequency": tk.StringVar(value="Freq:  -"),
             "pk_pk": tk.StringVar(value="Pk-Pk:  -"),
             "show_i": tk.BooleanVar(value=True),
             "show_q": tk.BooleanVar(value=True),
@@ -636,10 +636,10 @@ class MEPScopeGui:
         ttk.Label(measure_f, textvariable=self._vars["center_frequency"], width=1).grid(
             row=0, column=0, sticky="ew", padx=5, pady=4
         )
-        ttk.Label(measure_f, textvariable=self._vars["pk_pk"], width=1).grid(
+        ttk.Label(measure_f, textvariable=self._vars["dominant_frequency"], width=1).grid(
             row=1, column=0, sticky="ew", padx=5, pady=4
         )
-        ttk.Label(measure_f, textvariable=self._vars["dominant_frequency"], width=1).grid(
+        ttk.Label(measure_f, textvariable=self._vars["pk_pk"], width=1).grid(
             row=2, column=0, sticky="ew", padx=5, pady=4
         )
 
@@ -797,7 +797,7 @@ class MEPScopeGui:
             )
             self._vars["pk_pk"].set(f"Pk-Pk:  {self._fmt_number(self._pk_pk(latest))}")
             self._vars["dominant_frequency"].set(
-                f"Freq: {self._fmt_frequency(self._dominant_frequency_hz(latest))}"
+                f"Freq:  {self._fmt_frequency(self._dominant_frequency_hz(latest))}"
             )
             self._render_latest()
         elif isinstance(latest, ReaderStatus):
