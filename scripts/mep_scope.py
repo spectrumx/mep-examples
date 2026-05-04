@@ -797,7 +797,7 @@ class MEPScopeGui:
             )
             self._vars["pk_pk"].set(f"Pk-Pk:  {self._fmt_number(self._pk_pk(latest))}")
             self._vars["dominant_frequency"].set(
-                f"Freq:  {self._fmt_frequency(self._dominant_frequency_hz(latest))}"
+                f"Freq:   {self._fmt_frequency(self._dominant_frequency_hz(latest))}"
             )
             self._render_latest()
         elif isinstance(latest, ReaderStatus):
