@@ -141,6 +141,9 @@ class MEPGui:
 
         self._sweep_thread: threading.Thread = None
         self._afe_updating = False
+        self._afe_atten_pending = {}
+        self._afe_atten_initialized = set()
+        self._afe_atten_request_counter = 0
         
         # Jetson Health state
         self._jetson_nvpmodel_modes, self._jetson_nvpmodel_default_id = self._read_nvpmodel_config()
@@ -479,6 +482,101 @@ class MEPGui:
     def _set_var(self, key: str, val):
         if key in self._vars:
             self._vars[key].set(str(val) if val is not None else "—")
+
+    def _afe_next_session_id(self, prefix: str) -> str:
+        self._afe_atten_request_counter += 1
+        return f"{prefix}-{self._afe_atten_request_counter}"
+
+    def _afe_format_atten_value(self, value) -> str:
+        if value is None:
+            return "—"
+        try:
+            return f"{int(value)} dB"
+        except (TypeError, ValueError):
+            return "—"
+
+    def _afe_extract_confirmed_attenuation(self, data: dict, device: str):
+        atten_map = data.get("attenuation_db")
+        if isinstance(atten_map, dict) and device in atten_map:
+            value = atten_map.get(device)
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        regs_named = data.get("registers_named", {})
+        if isinstance(regs_named, dict):
+            dev_regs = regs_named.get(device, {})
+            if isinstance(dev_regs, dict) and "ATTENUATION_DB" in dev_regs:
+                value = dev_regs.get("ATTENUATION_DB")
+                if isinstance(value, dict):
+                    value = value.get("value")
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _afe_update_atten_ui_state(self, device: str, confirmed=None):
+        pending = self._afe_atten_pending.get(device)
+        confirmed_key = f"afe_{device}_atten_confirmed"
+        state_key = f"afe_{device}_atten_state"
+        if confirmed_key in self._vars:
+            self._vars[confirmed_key].set(self._afe_format_atten_value(confirmed))
+
+        if pending is None:
+            state_text = ""
+        elif pending.get("failed"):
+            detail = pending.get("error") or "failed"
+            state_text = f"failed: {detail}"
+        elif confirmed is not None and confirmed == pending.get("requested"):
+            state_text = ""
+        else:
+            requested = pending.get("requested")
+            state_text = f"pending -> {requested} dB"
+
+        if state_key in self._vars:
+            self._vars[state_key].set(state_text)
+
+    def _afe_clamp_attenuation_value(self, raw_value, lo: int, hi: int, fallback=None) -> int:
+        try:
+            value = int(str(raw_value).strip())
+        except (TypeError, ValueError):
+            if fallback is not None:
+                value = int(fallback)
+            else:
+                value = lo
+        return max(lo, min(hi, value))
+
+    def _afe_submit_attenuation(self, device: str):
+        bounds = getattr(self, "_afe_atten_range", [0, 31])
+        lo, hi = int(bounds[0]), int(bounds[1])
+        requested_key = f"afe_{device}_atten_requested"
+        confirmed = self._afe_extract_confirmed_attenuation(
+            self.bus.get_cached_status(AFE_REGISTERS_TOPIC) or {},
+            device,
+        )
+        value = self._afe_clamp_attenuation_value(
+            self._vars[requested_key].get() if requested_key in self._vars else None,
+            lo,
+            hi,
+            fallback=confirmed,
+        )
+        if requested_key in self._vars:
+            self._vars[requested_key].set(str(value))
+
+        session_id = self._afe_next_session_id(f"atten-{device}")
+        self._afe_atten_pending[device] = {
+            "session_id": session_id,
+            "requested": value,
+            "failed": False,
+            "error": None,
+        }
+        self.bus.afe_set_attenuation(device, value, session_id=session_id)
+        self._afe_update_atten_ui_state(device, confirmed=confirmed)
+        self.root.after(150, self._afe_refresh)
 
 
 
@@ -3292,28 +3390,41 @@ class MEPGui:
                         row=row_i, column=0, columnspan=2, sticky="w", pady=1)
                     row_i += 1
 
-                # Attenuation spinbox
+                # Attenuation controls
                 ttk.Separator(ch_f, orient="horizontal").grid(
-                    row=row_i, column=0, columnspan=2, sticky="ew", pady=4)
+                    row=row_i, column=0, columnspan=4, sticky="ew", pady=4)
                 row_i += 1
-                ttk.Label(ch_f, text="Attenuation (dB)").grid(
-                    row=row_i, column=0, sticky="w")
-                atten_key = f"afe_{device}_atten"
-                self._vars[atten_key] = tk.IntVar(value=0)
+                ttk.Label(ch_f, text="Attenuation:").grid(row=row_i, column=0, sticky="w")
+                requested_key = f"afe_{device}_atten_requested"
+                confirmed_key = f"afe_{device}_atten_confirmed"
+                state_key = f"afe_{device}_atten_state"
+                self._vars[requested_key] = tk.StringVar(value="0")
+                self._vars[confirmed_key] = tk.StringVar(value="—")
+                self._vars[state_key] = tk.StringVar(value="")
+                ttk.Label(ch_f, textvariable=self._vars[confirmed_key]).grid(
+                    row=row_i, column=1, sticky="w", padx=(4, 10))
+                atten_spin = ttk.Spinbox(
+                    ch_f,
+                    from_=atten_range[0],
+                    to=atten_range[1],
+                    increment=1,
+                    textvariable=self._vars[requested_key],
+                    width=6,
+                )
+                atten_spin.grid(row=row_i, column=2, sticky="w", padx=5)
+                atten_spin.bind("<Return>", lambda _event, device=device: self._afe_submit_attenuation(device))
+                ttk.Label(ch_f, text="0-31 dB", foreground="grey").grid(row=row_i, column=3, sticky="w")
+                ttk.Button(
+                    ch_f,
+                    text="Set",
+                    command=lambda device=device: self._afe_submit_attenuation(device),
+                ).grid(row=row_i, column=4, sticky="w", padx=(6, 0))
+                ttk.Label(ch_f, textvariable=self._vars[state_key], foreground="#8a5a00").grid(
+                    row=row_i, column=5, sticky="w", padx=(10, 0))
 
-                def _atten_cb(device=device, key=atten_key):
-                    if self._afe_updating:
-                        return
-                    db = int(self._vars[key].get())
-                    self.bus.afe_set_attenuation(device, db)
+                row_i += 1
 
-                self._vars[atten_key].trace_add("write", lambda *_, cb=_atten_cb: cb())
-                ttk.Spinbox(ch_f, from_=atten_range[0], to=atten_range[1], increment=1,
-                            textvariable=self._vars[atten_key],
-                            width=6, state="readonly").grid(
-                    row=row_i, column=1, sticky="w", padx=5)
-                ttk.Label(ch_f, text="dB", foreground="grey").grid(
-                    row=row_i, column=2, sticky="w")
+                self._afe_update_atten_ui_state(device)
 
         # ---- TX Channels ---- #
         if tx_devices:
@@ -3528,15 +3639,17 @@ class MEPGui:
                     except (TypeError, ValueError):
                         pass
 
-                atten_key = f"afe_{device}_atten"
-                if "ATTENUATION_DB" in dev_regs and atten_key in self._vars:
-                    atten_raw = dev_regs.get("ATTENUATION_DB")
-                    if isinstance(atten_raw, dict):
-                        atten_raw = atten_raw.get("value")
-                    try:
-                        self._vars[atten_key].set(int(atten_raw))
-                    except (TypeError, ValueError):
-                        pass
+                confirmed = self._afe_extract_confirmed_attenuation(data, device)
+                requested_key = f"afe_{device}_atten_requested"
+                if confirmed is not None and requested_key in self._vars and device not in self._afe_atten_initialized:
+                    self._vars[requested_key].set(str(confirmed))
+                    self._afe_atten_initialized.add(device)
+
+                pending = self._afe_atten_pending.get(device)
+                if pending and confirmed is not None and confirmed == pending.get("requested"):
+                    self._afe_atten_pending.pop(device, None)
+
+                self._afe_update_atten_ui_state(device, confirmed=confirmed)
         finally:
             self._afe_updating = False
         logging.info("AFE widgets updated from MQTT register data")
@@ -3562,9 +3675,11 @@ class MEPGui:
                 if key in self._vars:
                     self._vars[key].set(bool(reg_default))
             # Reset attenuation for RX devices
-            atten_key = f"afe_{device}_atten"
-            if atten_key in self._vars:
-                self._vars[atten_key].set(0)
+            requested_key = f"afe_{device}_atten_requested"
+            if requested_key in self._vars:
+                self._vars[requested_key].set("0")
+            self._afe_atten_pending.pop(device, None)
+            self._afe_update_atten_ui_state(device)
         logging.info("AFE: all registers reset to defaults")
 
     # ------------------------------------------------------------------ #

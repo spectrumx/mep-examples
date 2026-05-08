@@ -1510,14 +1510,17 @@ class MEPBus:
             "arguments": args,
         })
 
-    def afe_set_attenuation(self, device: str, db: int):
+    def afe_set_attenuation(self, device: str, db: int, session_id: str = None):
         """Set RX attenuation 0-31 dB."""
         if not (0 <= db <= 31):
             raise ValueError(f"Attenuation must be 0-31 dB, got {db}")
-        self.publish_command(f"{AFE_CMD_TOPIC}/registers", {
+        payload = {
             "task_name": "set_attenuation_db",
             "arguments": {"device": device, "db": db},
-        })
+        }
+        if session_id:
+            payload["session_id"] = session_id
+        self.publish_command(f"{AFE_CMD_TOPIC}/registers", payload)
 
     def afe_get_registers(self, device: str = "all"):
         """Query register state from AFE firmware."""
