@@ -3237,16 +3237,89 @@ class MEPGui:
         return reg.get("default", 0)
 
     def _afe_enabled_bit(self, reg: dict):
-        """Return which raw bit means Enabled for this register, or None if not an enable toggle."""
+        """Return which raw bit means the positive boolean state, or None if not boolean."""
         if not isinstance(reg, dict):
             return None
         zero = str(reg.get("0", "")).strip().lower()
         one = str(reg.get("1", "")).strip().lower()
-        if zero == "enabled" and one == "disabled":
-            return 0
-        if zero == "disabled" and one == "enabled":
-            return 1
+        for true_label, false_label in (
+            ("enabled", "disabled"),
+            ("on", "off"),
+            ("asserted", "not asserted"),
+        ):
+            if zero == true_label and one == false_label:
+                return 0
+            if zero == false_label and one == true_label:
+                return 1
         return None
+
+    def _afe_reserved_register(self, reg: dict):
+        if not isinstance(reg, dict):
+            return False
+        zero = str(reg.get("0", "")).strip().lower()
+        one = str(reg.get("1", "")).strip().lower()
+        return zero == "reserved" and one == "reserved"
+
+    def _afe_raw_to_choice(self, raw_val):
+        try:
+            bit = int(raw_val)
+        except (TypeError, ValueError):
+            return "0"
+        return str(bit) if bit in (0, 1) else "0"
+
+    def _afe_choice_to_raw(self, choice):
+        try:
+            bit = int(choice)
+        except (TypeError, ValueError):
+            return 0
+        return bit if bit in (0, 1) else 0
+
+    def _afe_set_control_var_from_raw(self, key: str, reg: dict, raw_val):
+        if key not in self._vars:
+            return
+        if self._afe_enabled_bit(reg) is None:
+            self._vars[key].set(self._afe_raw_to_choice(raw_val))
+        else:
+            self._vars[key].set(self._afe_raw_to_checked(reg, raw_val))
+
+    def _afe_add_register_control(self, parent, row_i: int, device: str, reg: dict,
+                                  key: str, label: str, columnspan: int = 1):
+        if self._afe_enabled_bit(reg) is None:
+            reg_f = ttk.Frame(parent)
+            reg_f.grid(row=row_i, column=0, columnspan=columnspan,
+                       sticky="w", padx=6, pady=(2, 1))
+            ttk.Label(reg_f, text=f"{label}:").grid(row=0, column=0, sticky="w")
+            self._vars[key] = tk.StringVar(
+                value=self._afe_raw_to_choice(self._afe_reg_default(reg))
+            )
+
+            def _selector_cb(device=device, name=reg["name"], key=key):
+                if self._afe_updating:
+                    return
+                self.bus.afe_set_register(device, name, self._afe_choice_to_raw(self._vars[key].get()))
+
+            self._vars[key].trace_add("write", lambda *_, cb=_selector_cb: cb())
+            ttk.Radiobutton(reg_f, text=reg.get("0", "0"),
+                            variable=self._vars[key], value="0").grid(
+                row=0, column=1, padx=6)
+            ttk.Radiobutton(reg_f, text=reg.get("1", "1"),
+                            variable=self._vars[key], value="1").grid(
+                row=0, column=2, padx=6)
+            return
+
+        self._vars[key] = tk.BooleanVar(
+            value=self._afe_raw_to_checked(reg, self._afe_reg_default(reg))
+        )
+
+        def _check_cb(device=device, name=reg["name"], key=key, reg=reg):
+            if self._afe_updating:
+                return
+            v = self._vars[key].get()
+            self.bus.afe_set_register(device, name, self._afe_checked_to_raw(reg, v))
+
+        self._vars[key].trace_add("write", lambda *_, cb=_check_cb: cb())
+        ttk.Checkbutton(parent, text=label, variable=self._vars[key]).grid(
+            row=row_i, column=0, columnspan=columnspan, sticky="w", padx=6, pady=1)
 
     def _afe_raw_to_checked(self, reg: dict, raw_val):
         """Map raw bit value to checkbox state, enforcing checked=enabled where labels define it."""
@@ -3305,48 +3378,12 @@ class MEPGui:
             row_i = 0
             for reg in misc_pins:
                 name = reg["name"]
-                if name.startswith("NOT_USED"):
+                if name.startswith("NOT_USED") or self._afe_reserved_register(reg):
                     continue
 
                 label = reg.get("label", name.replace("_", " ").title())
-                reg_default = self._afe_reg_default(reg)
-
-                if name == "GNSS_ANT_SEL":
-                    ant_f = ttk.Frame(self._afe_main_f)
-                    ant_f.grid(row=row_i, column=0, sticky="w", padx=6, pady=(4, 2))
-                    ttk.Label(ant_f, text=f"{label}:").grid(row=0, column=0, sticky="w")
-                    self._vars["afe_misc_GNSS_ANT_SEL"] = tk.StringVar(
-                        value="external" if reg_default == 0 else "internal")
-
-                    def _ant_cb(*_):
-                        if self._afe_updating:
-                            return
-                        v = self._vars["afe_misc_GNSS_ANT_SEL"].get()
-                        self.bus.afe_set_register("misc", "GNSS_ANT_SEL", 1 if v == "internal" else 0)
-
-                    self._vars["afe_misc_GNSS_ANT_SEL"].trace_add("write", _ant_cb)
-                    ttk.Radiobutton(ant_f, text=reg.get("1", "Internal"),
-                                    variable=self._vars["afe_misc_GNSS_ANT_SEL"],
-                                    value="internal").grid(row=0, column=1, padx=6)
-                    ttk.Radiobutton(ant_f, text=reg.get("0", "External"),
-                                    variable=self._vars["afe_misc_GNSS_ANT_SEL"],
-                                    value="external").grid(row=0, column=2, padx=6)
-                    row_i += 1
-                    continue
-
                 key = f"afe_misc_{name}"
-                self._vars[key] = tk.BooleanVar(value=self._afe_raw_to_checked(reg, reg_default))
-
-                def _main_cb(name=name, key=key, reg=reg):
-                    if self._afe_updating:
-                        return
-                    v = self._vars[key].get()
-                    self.bus.afe_set_register("misc", name, self._afe_checked_to_raw(reg, v))
-
-                self._vars[key].trace_add("write", lambda *_, cb=_main_cb: cb())
-                ttk.Checkbutton(self._afe_main_f, text=label,
-                                variable=self._vars[key]).grid(
-                    row=row_i, column=0, sticky="w", padx=6, pady=1)
+                self._afe_add_register_control(self._afe_main_f, row_i, "misc", reg, key, label)
                 row_i += 1
 
         # ---- RX Channels ---- #
@@ -3368,27 +3405,14 @@ class MEPGui:
                 row_i = 0
                 for reg in pins:
                     name = reg["name"]
-                    if name.startswith("NOT_USED"):
+                    if name.startswith("NOT_USED") or self._afe_reserved_register(reg):
                         continue
                     if name.startswith("ATTEN_"):
                         continue
 
                     key = f"afe_{device}_{name}"
                     label = reg.get("label", name.replace("_", " ").title())
-                    self._vars[key] = tk.BooleanVar(
-                        value=self._afe_raw_to_checked(reg, self._afe_reg_default(reg))
-                    )
-
-                    def _rx_cb(device=device, name=name, key=key, reg=reg):
-                        if self._afe_updating:
-                            return
-                        v = self._vars[key].get()
-                        self.bus.afe_set_register(device, name, self._afe_checked_to_raw(reg, v))
-
-                    self._vars[key].trace_add("write", lambda *_, cb=_rx_cb: cb())
-                    ttk.Checkbutton(ch_f, text=label,
-                                    variable=self._vars[key]).grid(
-                        row=row_i, column=0, columnspan=2, sticky="w", pady=1)
+                    self._afe_add_register_control(ch_f, row_i, device, reg, key, label, columnspan=2)
                     row_i += 1
 
                 # Attenuation controls
@@ -3446,25 +3470,12 @@ class MEPGui:
                 row_i = 0
                 for reg in pins:
                     name = reg["name"]
-                    if name.startswith("NOT_USED"):
+                    if name.startswith("NOT_USED") or self._afe_reserved_register(reg):
                         continue
 
                     key = f"afe_{device}_{name}"
                     label = reg.get("label", name.replace("_", " ").title())
-                    self._vars[key] = tk.BooleanVar(
-                        value=self._afe_raw_to_checked(reg, self._afe_reg_default(reg))
-                    )
-
-                    def _tx_cb(device=device, name=name, key=key, reg=reg):
-                        if self._afe_updating:
-                            return
-                        v = self._vars[key].get()
-                        self.bus.afe_set_register(device, name, self._afe_checked_to_raw(reg, v))
-
-                    self._vars[key].trace_add("write", lambda *_, cb=_tx_cb: cb())
-                    ttk.Checkbutton(ch_f, text=label,
-                                    variable=self._vars[key]).grid(
-                        row=row_i, column=0, sticky="w", pady=1)
+                    self._afe_add_register_control(ch_f, row_i, device, reg, key, label)
                     row_i += 1
 
         logging.info("AFE tab populated from announce data")
@@ -3617,28 +3628,19 @@ class MEPGui:
 
                 for reg in pins:
                     name = reg.get("name")
-                    if not name or name.startswith("NOT_USED") or name.startswith("ATTEN_"):
+                    if (not name or name.startswith("NOT_USED") or name.startswith("ATTEN_")
+                            or self._afe_reserved_register(reg)):
                         continue
                     key = f"afe_{device}_{name}"
                     raw_val = dev_regs.get(name)
                     if isinstance(raw_val, dict):
                         raw_val = raw_val.get("value")
 
-                    if name == "GNSS_ANT_SEL":
-                        if raw_val is not None and key in self._vars:
-                            try:
-                                self._vars[key].set(
-                                    "internal" if int(raw_val) == 1 else "external"
-                                )
-                            except (TypeError, ValueError):
-                                pass
-                        continue
-
                     if raw_val is None or key not in self._vars:
                         continue
 
                     try:
-                        self._vars[key].set(self._afe_raw_to_checked(reg, raw_val))
+                        self._afe_set_control_var_from_raw(key, reg, raw_val)
                     except (TypeError, ValueError):
                         pass
 
@@ -3667,16 +3669,13 @@ class MEPGui:
         for device, pins in reg_pins.items():
             for reg in pins:
                 name = reg["name"]
-                if name.startswith("NOT_USED") or name.startswith("ATTEN_"):
+                if (name.startswith("NOT_USED") or name.startswith("ATTEN_")
+                        or self._afe_reserved_register(reg)):
                     continue
                 key = f"afe_{device}_{name}"
                 reg_default = self._afe_reg_default(reg)
-                if name == "GNSS_ANT_SEL":
-                    self._vars.get(f"afe_{device}_GNSS_ANT_SEL", tk.StringVar()).set(
-                        "internal" if reg_default == 1 else "external")
-                    continue
                 if key in self._vars:
-                    self._vars[key].set(self._afe_raw_to_checked(reg, reg_default))
+                    self._afe_set_control_var_from_raw(key, reg, reg_default)
             # Reset attenuation for RX devices
             requested_key = f"afe_{device}_atten_requested"
             if requested_key in self._vars:

@@ -1532,11 +1532,9 @@ class MEPBus:
 
     def afe_set_registers(self, device: str, registers: dict):
         """Bulk set multiple registers for a device."""
-        args = {"device": device}
-        args.update(registers)
         self.publish_command(f"{AFE_CMD_TOPIC}/registers", {
             "task_name": "set_registers",
-            "arguments": args,
+            "arguments": {device: registers},
         })
 
     def afe_set_attenuation(self, device: str, db: int, session_id: str = None):
