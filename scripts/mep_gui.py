@@ -3246,6 +3246,9 @@ class MEPGui:
             ("enabled", "disabled"),
             ("on", "off"),
             ("asserted", "not asserted"),
+            ("bypassed", "filtered"),
+            ("bypassed", "enabled"),
+            ("blanked", "not blanked"),
         ):
             if zero == true_label and one == false_label:
                 return 0
@@ -3260,25 +3263,25 @@ class MEPGui:
         one = str(reg.get("1", "")).strip().lower()
         return zero == "reserved" and one == "reserved"
 
-    def _afe_raw_to_choice(self, raw_val):
+    def _afe_raw_to_choice(self, reg: dict, raw_val):
         try:
             bit = int(raw_val)
         except (TypeError, ValueError):
-            return "0"
-        return str(bit) if bit in (0, 1) else "0"
+            bit = 0
+        bit = bit if bit in (0, 1) else 0
+        return str(reg.get(str(bit), str(bit)))
 
-    def _afe_choice_to_raw(self, choice):
-        try:
-            bit = int(choice)
-        except (TypeError, ValueError):
-            return 0
-        return bit if bit in (0, 1) else 0
+    def _afe_choice_to_raw(self, reg: dict, choice):
+        choice_s = str(choice)
+        if choice_s == str(reg.get("1", "1")):
+            return 1
+        return 0
 
     def _afe_set_control_var_from_raw(self, key: str, reg: dict, raw_val):
         if key not in self._vars:
             return
         if self._afe_enabled_bit(reg) is None:
-            self._vars[key].set(self._afe_raw_to_choice(raw_val))
+            self._vars[key].set(self._afe_raw_to_choice(reg, raw_val))
         else:
             self._vars[key].set(self._afe_raw_to_checked(reg, raw_val))
 
@@ -3287,24 +3290,26 @@ class MEPGui:
         if self._afe_enabled_bit(reg) is None:
             reg_f = ttk.Frame(parent)
             reg_f.grid(row=row_i, column=0, columnspan=columnspan,
-                       sticky="w", padx=6, pady=(2, 1))
+                       sticky="ew", padx=6, pady=(2, 1))
+            reg_f.columnconfigure(1, weight=1)
             ttk.Label(reg_f, text=f"{label}:").grid(row=0, column=0, sticky="w")
             self._vars[key] = tk.StringVar(
-                value=self._afe_raw_to_choice(self._afe_reg_default(reg))
+                value=self._afe_raw_to_choice(reg, self._afe_reg_default(reg))
             )
 
             def _selector_cb(device=device, name=reg["name"], key=key):
                 if self._afe_updating:
                     return
-                self.bus.afe_set_register(device, name, self._afe_choice_to_raw(self._vars[key].get()))
+                self.bus.afe_set_register(device, name, self._afe_choice_to_raw(reg, self._vars[key].get()))
 
             self._vars[key].trace_add("write", lambda *_, cb=_selector_cb: cb())
-            ttk.Radiobutton(reg_f, text=reg.get("0", "0"),
-                            variable=self._vars[key], value="0").grid(
-                row=0, column=1, padx=6)
-            ttk.Radiobutton(reg_f, text=reg.get("1", "1"),
-                            variable=self._vars[key], value="1").grid(
-                row=0, column=2, padx=6)
+            ttk.Combobox(
+                reg_f,
+                textvariable=self._vars[key],
+                values=(str(reg.get("0", "0")), str(reg.get("1", "1"))),
+                width=18,
+                state="readonly",
+            ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
             return
 
         self._vars[key] = tk.BooleanVar(
