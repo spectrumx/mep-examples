@@ -2794,42 +2794,6 @@ class MEPGui:
                    command=self._soc_arm_next_pps).grid(
             row=0, column=2, padx=(2, 0), sticky="ew")
 
-        ts_f = ttk.LabelFrame(frame, text="Troubleshooting")
-        ts_f.grid(row=4, column=0, padx=4, pady=(0, 6), sticky="ew")
-        ts_f.columnconfigure(0, weight=1)
-        ttk.Label(
-            ts_f,
-            text="Icarus spawns a command over ssh which runs:",
-            foreground="grey",
-            font=("TkDefaultFont", 8),
-        ).grid(row=0, column=0, sticky="w", padx=6, pady=(4, 1))
-        ttk.Label(
-            ts_f,
-            text="BOARD=RFSoC4x2 XILINX_XRT=/usr python /opt/git/rfsoc_qsfp_10g/boards/RFSoC4x2/rfsoc_qsfp_offload/scripts/start_capture_rx.py",
-            foreground="grey",
-            font=("TkFixedFont", 8),
-            wraplength=420,
-            justify="left",
-        ).grid(row=1, column=0, sticky="w", padx=12, pady=(1, 3))
-        ttk.Label(
-            ts_f,
-            text="If RFSoC shows offline, verify board reachability:",
-            foreground="grey",
-            font=("TkDefaultFont", 8),
-        ).grid(row=2, column=0, sticky="w", padx=6, pady=(1, 1))
-        ttk.Label(
-            ts_f,
-            text="ping -c 2 192.168.20.100",
-            foreground="grey",
-            font=("TkFixedFont", 8),
-        ).grid(row=3, column=0, sticky="w", padx=12, pady=1)
-        ttk.Label(
-            ts_f,
-            text="ssh xilinx@192.168.20.100",
-            foreground="grey",
-            font=("TkFixedFont", 8),
-        ).grid(row=4, column=0, sticky="w", padx=12, pady=(1, 3))
-
         # Register tab-specific MQTT → UI. Emit-cached fires inline if data exists.
         self.bus.on_status(RFSOC_STATUS_TOPIC,
                           lambda data: self._gui_call(self._soc_apply, data))
