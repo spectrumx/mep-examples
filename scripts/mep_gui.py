@@ -1626,7 +1626,13 @@ class MEPGui:
             if scale <= 0.0:
                 idx = 0
             else:
-                idx = int((float(v) - vmin) * scale)
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    fv = vmin
+                if not math.isfinite(fv):
+                    fv = vmin
+                idx = int((fv - vmin) * scale)
                 if idx < 0:
                     idx = 0
                 elif idx > 255:
@@ -1773,11 +1779,16 @@ class MEPGui:
 
         auto = bool(self._vars.get("spec_autoscale", tk.BooleanVar(value=True)).get())
         if auto:
-            vmin = min(min(r["row"]) for r in rows)
-            vmax = max(max(r["row"]) for r in rows)
+            try:
+                vmin = min(min(r["row"]) for r in rows)
+                vmax = max(max(r["row"]) for r in rows)
+            except (TypeError, ValueError):
+                return
         else:
             vmin = float(self._vars.get("spec_vmin", tk.DoubleVar(value=-120.0)).get())
             vmax = float(self._vars.get("spec_vmax", tk.DoubleVar(value=0.0)).get())
+            if not (math.isfinite(vmin) and math.isfinite(vmax)) or vmax <= vmin:
+                return
 
         self._spec_line_canvas.delete("all")
         w = max(10, self._spec_line_canvas.winfo_width())
@@ -1786,7 +1797,13 @@ class MEPGui:
         points = []
         for i, v in enumerate(vals):
             x = int(i * (w - 1) / max(1, n - 1))
-            y_norm = 0.0 if vmax <= vmin else (float(v) - vmin) / (vmax - vmin)
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                fv = vmin
+            if not math.isfinite(fv):
+                fv = vmin
+            y_norm = 0.0 if vmax <= vmin else (fv - vmin) / (vmax - vmin)
             y_norm = 0.0 if y_norm < 0.0 else (1.0 if y_norm > 1.0 else y_norm)
             y = int((1.0 - y_norm) * (h - 1))
             points.extend((x, y))

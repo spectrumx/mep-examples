@@ -24,6 +24,7 @@ Author: john.marino@colorado.edu
 
 # ===== IMPORTS ===== #
 import argparse
+import base64
 import time
 import logging
 import json
@@ -33,6 +34,7 @@ import math
 import socket
 import subprocess
 import queue
+import struct
 from collections import deque
 from datetime import datetime
 import threading
@@ -1248,6 +1250,29 @@ class MEPBus:
             "last_error": self._last_error,
         }
 
+    @staticmethod
+    def _is_spec_topic(topic: str) -> bool:
+        return str(topic).startswith("radiohound/clients/data/")
+
+    @staticmethod
+    def _spec_payload_is_finite(data: dict) -> bool:
+        payload = data.get("data")
+        if not isinstance(payload, str):
+            return False
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except Exception:
+            return False
+        if len(raw) < 4 or len(raw) % 4 != 0:
+            return False
+        try:
+            for (value,) in struct.iter_unpack("<f", raw):
+                if not math.isfinite(value):
+                    return False
+        except Exception:
+            return False
+        return True
+
     def reconnect(self) -> bool:
         """Attempt one MQTT reconnect cycle. Returns True on success."""
         try:
@@ -1303,6 +1328,10 @@ class MEPBus:
         try:
             data = json.loads(msg.payload.decode())
         except Exception:
+            return
+
+        if self._is_spec_topic(msg.topic) and isinstance(data, dict) and not self._spec_payload_is_finite(data):
+            logging.warning("Dropping invalid SPEC frame on %s", msg.topic)
             return
 
         # Update status cache
