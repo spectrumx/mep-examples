@@ -2812,18 +2812,6 @@ class MEPGui:
             foreground="grey",
             font=("TkFixedFont", 8),
         ).grid(row=4, column=0, sticky="w", padx=12, pady=(1, 3))
-        ttk.Label(
-            ts_f,
-            text="If RFSoC service gets stuck, restart Icarus:",
-            foreground="grey",
-            font=("TkDefaultFont", 8),
-        ).grid(row=5, column=0, sticky="w", padx=6, pady=(1, 1))
-        ttk.Label(
-            ts_f,
-            text="docker compose restart icarus",
-            foreground="grey",
-            font=("TkFixedFont", 8),
-        ).grid(row=6, column=0, sticky="w", padx=12, pady=(1, 4))
 
         # Register tab-specific MQTT → UI. Emit-cached fires inline if data exists.
         self.bus.on_status(RFSOC_STATUS_TOPIC,
@@ -3267,6 +3255,36 @@ class MEPGui:
             return reg.get("service_default_override")
         return reg.get("default", 0)
 
+    def _afe_enabled_bit(self, reg: dict):
+        """Return which raw bit means Enabled for this register, or None if not an enable toggle."""
+        if not isinstance(reg, dict):
+            return None
+        zero = str(reg.get("0", "")).strip().lower()
+        one = str(reg.get("1", "")).strip().lower()
+        if zero == "enabled" and one == "disabled":
+            return 0
+        if zero == "disabled" and one == "enabled":
+            return 1
+        return None
+
+    def _afe_raw_to_checked(self, reg: dict, raw_val):
+        """Map raw bit value to checkbox state, enforcing checked=enabled where labels define it."""
+        try:
+            bit = int(raw_val)
+        except (TypeError, ValueError):
+            return False
+        enabled_bit = self._afe_enabled_bit(reg)
+        if enabled_bit is None:
+            return bool(bit)
+        return bit == enabled_bit
+
+    def _afe_checked_to_raw(self, reg: dict, checked):
+        """Map checkbox state to raw bit value, enforcing checked=enabled where labels define it."""
+        enabled_bit = self._afe_enabled_bit(reg)
+        if enabled_bit is None:
+            return int(bool(checked))
+        return enabled_bit if checked else (1 - enabled_bit)
+
     def _afe_populate_from_announce(self, announce: dict):
         """Build AFE register widgets from afe/announce describe data."""
         describe = announce.get("describe", {})
@@ -3336,13 +3354,13 @@ class MEPGui:
                     continue
 
                 key = f"afe_misc_{name}"
-                self._vars[key] = tk.BooleanVar(value=bool(reg_default))
+                self._vars[key] = tk.BooleanVar(value=self._afe_raw_to_checked(reg, reg_default))
 
-                def _main_cb(name=name, key=key):
+                def _main_cb(name=name, key=key, reg=reg):
                     if self._afe_updating:
                         return
                     v = self._vars[key].get()
-                    self.bus.afe_set_register("misc", name, int(v))
+                    self.bus.afe_set_register("misc", name, self._afe_checked_to_raw(reg, v))
 
                 self._vars[key].trace_add("write", lambda *_, cb=_main_cb: cb())
                 ttk.Checkbutton(self._afe_main_f, text=label,
@@ -3376,13 +3394,15 @@ class MEPGui:
 
                     key = f"afe_{device}_{name}"
                     label = reg.get("label", name.replace("_", " ").title())
-                    self._vars[key] = tk.BooleanVar(value=bool(self._afe_reg_default(reg)))
+                    self._vars[key] = tk.BooleanVar(
+                        value=self._afe_raw_to_checked(reg, self._afe_reg_default(reg))
+                    )
 
-                    def _rx_cb(device=device, name=name, key=key):
+                    def _rx_cb(device=device, name=name, key=key, reg=reg):
                         if self._afe_updating:
                             return
                         v = self._vars[key].get()
-                        self.bus.afe_set_register(device, name, int(v))
+                        self.bus.afe_set_register(device, name, self._afe_checked_to_raw(reg, v))
 
                     self._vars[key].trace_add("write", lambda *_, cb=_rx_cb: cb())
                     ttk.Checkbutton(ch_f, text=label,
@@ -3450,13 +3470,15 @@ class MEPGui:
 
                     key = f"afe_{device}_{name}"
                     label = reg.get("label", name.replace("_", " ").title())
-                    self._vars[key] = tk.BooleanVar(value=bool(self._afe_reg_default(reg)))
+                    self._vars[key] = tk.BooleanVar(
+                        value=self._afe_raw_to_checked(reg, self._afe_reg_default(reg))
+                    )
 
-                    def _tx_cb(device=device, name=name, key=key):
+                    def _tx_cb(device=device, name=name, key=key, reg=reg):
                         if self._afe_updating:
                             return
                         v = self._vars[key].get()
-                        self.bus.afe_set_register(device, name, int(v))
+                        self.bus.afe_set_register(device, name, self._afe_checked_to_raw(reg, v))
 
                     self._vars[key].trace_add("write", lambda *_, cb=_tx_cb: cb())
                     ttk.Checkbutton(ch_f, text=label,
@@ -3635,7 +3657,7 @@ class MEPGui:
                         continue
 
                     try:
-                        self._vars[key].set(bool(int(raw_val)))
+                        self._vars[key].set(self._afe_raw_to_checked(reg, raw_val))
                     except (TypeError, ValueError):
                         pass
 
@@ -3673,7 +3695,7 @@ class MEPGui:
                         "internal" if reg_default == 1 else "external")
                     continue
                 if key in self._vars:
-                    self._vars[key].set(bool(reg_default))
+                    self._vars[key].set(self._afe_raw_to_checked(reg, reg_default))
             # Reset attenuation for RX devices
             requested_key = f"afe_{device}_atten_requested"
             if requested_key in self._vars:
