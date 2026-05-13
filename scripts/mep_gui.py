@@ -3291,7 +3291,7 @@ class MEPGui:
             reg_f = ttk.Frame(parent)
             reg_f.grid(row=row_i, column=0, columnspan=columnspan,
                        sticky="ew", padx=6, pady=(2, 1))
-            reg_f.columnconfigure(1, weight=1)
+            reg_f.columnconfigure(2, weight=1)
             ttk.Label(reg_f, text=f"{label}:").grid(row=0, column=0, sticky="w")
             self._vars[key] = tk.StringVar(
                 value=self._afe_raw_to_choice(reg, self._afe_reg_default(reg))
@@ -3303,13 +3303,18 @@ class MEPGui:
                 self.bus.afe_set_register(device, name, self._afe_choice_to_raw(reg, self._vars[key].get()))
 
             self._vars[key].trace_add("write", lambda *_, cb=_selector_cb: cb())
-            ttk.Combobox(
+            ttk.Radiobutton(
                 reg_f,
-                textvariable=self._vars[key],
-                values=(str(reg.get("0", "0")), str(reg.get("1", "1"))),
-                width=18,
-                state="readonly",
-            ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+                text=str(reg.get("0", "0")),
+                variable=self._vars[key],
+                value=str(reg.get("0", "0")),
+            ).grid(row=0, column=1, sticky="w", padx=(6, 10))
+            ttk.Radiobutton(
+                reg_f,
+                text=str(reg.get("1", "1")),
+                variable=self._vars[key],
+                value=str(reg.get("1", "1")),
+            ).grid(row=0, column=2, sticky="w")
             return
 
         self._vars[key] = tk.BooleanVar(
