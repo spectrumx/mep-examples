@@ -1980,6 +1980,7 @@ class CaptureController:
         self.tuner = tuner
         self.adc_if_mhz = adc_if_mhz
         self.capture_name = capture_name
+        self.conjugate_policy = "auto"
 
         if tuner is None:
             self.injection = None
@@ -2225,7 +2226,20 @@ class CaptureController:
 
         self.bus.rfsoc_reset()
 
+        injection_mode = (self.injection or "").lower()
+        if self.conjugate_policy == "auto":
+            apply_conjugate = (self.tuner is not None and injection_mode == "high")
+        elif self.conjugate_policy == "force_on":
+            apply_conjugate = True
+        elif self.conjugate_policy == "force_off":
+            apply_conjugate = False
+        else:
+            apply_conjugate = (self.tuner is not None and injection_mode == "high")
+        self.bus.recorder_config_set("packet.apply_conjugate", str(apply_conjugate).lower())
+
         if self.tuner is None:
+            if self.injection is not None:
+                logging.debug("Ignoring injection=%r because tuner is None", self.injection)
             logging.info(f"[TUNER_NO] RFSoC NCO → {GREEN}{f_mhz:.2f} MHz{RESET}")
             self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {f_mhz}"})
             time.sleep(0.1)
@@ -2238,15 +2252,12 @@ class CaptureController:
             self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {self.adc_if_mhz}"})
             time.sleep(0.1)
 
-            lo_mhz = (f_mhz + self.adc_if_mhz) if self.injection == "high" else (f_mhz - self.adc_if_mhz)
+            lo_mhz = (f_mhz + self.adc_if_mhz) if injection_mode == "high" else (f_mhz - self.adc_if_mhz)
 
             logging.info(
-                f"[TUNER_YES/{self.injection}-side] RF → {GREEN}{f_mhz:.2f} MHz{RESET}  "
+                f"[TUNER_YES/{injection_mode or 'low'}-side] RF → {GREEN}{f_mhz:.2f} MHz{RESET}  "
                 f"LO={lo_mhz:.2f} MHz  IF={self.adc_if_mhz:.2f} MHz"
             )
-
-            apply_conjugate = (self.injection == "high")
-            self.bus.recorder_config_set("packet.apply_conjugate", str(apply_conjugate).lower())
 
             self.bus.tuner_set_freq(lo_mhz)
             time.sleep(0.1)

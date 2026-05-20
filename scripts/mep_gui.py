@@ -246,6 +246,8 @@ class MEPGui:
         self._vars["log_enabled"] = tk.StringVar(value="enabled")
         self._vars["log_path"] = tk.StringVar(value=AFE_DEFAULT_LOG_PATH)
         self._vars["log_rate"] = tk.IntVar(value=AFE_DEFAULT_LOG_RATE_S)
+        self._vars["conjugate_policy"] = tk.StringVar(value="auto")
+        self._vars["conjugate_actual"] = tk.StringVar(value="—")
 
     # ------------------------------------------------------------------ #
     #  MQTT listener callbacks (called from MQTT thread → schedule to GUI)
@@ -468,10 +470,14 @@ class MEPGui:
                 capture_name=params["capture_name"],
             )
         else:
-            self.capture.channel = params["channel"]
-            self.capture.sample_rate_mhz = params["sample_rate_mhz"]
-            self.capture.capture_name = params["capture_name"]
-            self.capture.injection = params["injection"]
+            self.capture.configure_sweep(
+                channel=params["channel"],
+                sample_rate_mhz=params["sample_rate_mhz"],
+                tuner=params["tuner"],
+                adc_if_mhz=params["adc_if_mhz"],
+                injection=params["injection"],
+                capture_name=params["capture_name"],
+            )
 
         return self.capture
 
@@ -985,10 +991,11 @@ class MEPGui:
         ttk.Label(frame, text="Injection Mode").grid(
             row=1, column=0, sticky="w", padx=5, pady=4)
         self._vars["injection_mode"] = tk.StringVar(value="High")
-        ttk.Combobox(
+        self._injection_combo = ttk.Combobox(
             frame, textvariable=self._vars["injection_mode"],
             values=["High", "Low"], width=16, state="readonly",
-        ).grid(row=1, column=1, sticky="ew", padx=5, pady=4)
+        )
+        self._injection_combo.grid(row=1, column=1, sticky="ew", padx=5, pady=4)
 
         ttk.Label(frame, text="Synth LO (MHz)").grid(
             row=1, column=2, sticky="w", padx=5, pady=4)
@@ -1001,6 +1008,7 @@ class MEPGui:
         self._vars["freq_start"].trace_add("write", self._update_synth_lo)
         self._vars["adc_if_mhz"].trace_add("write", self._update_synth_lo)
         self._vars["injection_mode"].trace_add("write", self._update_synth_lo)
+        self._on_tuner_change()
         self._update_synth_lo()
 
     def _build_control_section(self, parent: ttk.Frame, row: int):
@@ -3593,6 +3601,30 @@ class MEPGui:
         self.bus.on_status(RECORDER_STATUS_TOPIC,
                           lambda data: self._gui_call(self._rec_status_ui_update, data))
 
+    def _conjugate_policy_changed(self, *_):
+        """Update capture controller policy when user changes radio button."""
+        if self.capture is not None:
+            policy = self._vars["conjugate_policy"].get()
+            self.capture.conjugate_policy = policy
+            logging.info(f"Conjugate policy set to: {policy}")
+            self._update_conjugate_actual_display()
+
+    def _update_conjugate_actual_display(self):
+        """Compute and display the effective conjugate state."""
+        if self.capture is None:
+            self._vars["conjugate_actual"].set("—")
+            return
+        injection_mode = (self.capture.injection or "").lower()
+        if self.capture.conjugate_policy == "auto":
+            actual = (self.capture.tuner is not None and injection_mode == "high")
+        elif self.capture.conjugate_policy == "force_on":
+            actual = True
+        elif self.capture.conjugate_policy == "force_off":
+            actual = False
+        else:
+            actual = False
+        self._vars["conjugate_actual"].set(str(actual))
+
         # Set initial active config from current sample rate selection.
         config_name = f"sr{self._vars['sample_rate_mhz'].get()}MHz"
         self._vars["rec_active_config"].set(config_name)
@@ -4690,8 +4722,10 @@ class MEPGui:
     # ------------------------------------------------------------------ #
 
     def _on_tuner_change(self, *_):
-        state = "normal" if self._vars["tuner"].get() != "None" else "disabled"
+        tuner_enabled = self._vars["tuner"].get() != "None"
+        state = "normal" if tuner_enabled else "disabled"
         self._if_entry.configure(state=state)
+        self._injection_combo.configure(state="readonly" if tuner_enabled else "disabled")
         self._update_synth_lo()
 
     def _update_synth_lo(self, *_):
