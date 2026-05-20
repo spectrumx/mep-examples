@@ -3516,60 +3516,105 @@ class MEPGui:
         _se.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
         self._bind_copy_menu(_se, self._vars["rec_status"])
 
+        # Packet Conjugate
+        conj_frame = ttk.LabelFrame(frame, text="packet.apply_conjugate OVERRIDE")
+        conj_frame.grid(row=1, column=0, padx=4, pady=6, sticky="ew")
+        conj_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(conj_frame, text="Policy").grid(
+            row=0, column=0, sticky="w", padx=5, pady=4)
+        
+        policy_frame = ttk.Frame(conj_frame)
+        policy_frame.grid(row=0, column=1, sticky="ew", padx=5, pady=4)
+        policy_frame.columnconfigure(3, weight=1)
+        
+        ttk.Radiobutton(policy_frame, text="Auto", variable=self._vars["conjugate_policy"],
+                       value="auto", command=self._conjugate_policy_changed).grid(
+            row=0, column=0, sticky="w", padx=2)
+        ttk.Radiobutton(policy_frame, text="Force On", variable=self._vars["conjugate_policy"],
+                       value="force_on", command=self._conjugate_policy_changed).grid(
+            row=0, column=1, sticky="w", padx=2)
+        ttk.Radiobutton(policy_frame, text="Force Off", variable=self._vars["conjugate_policy"],
+                       value="force_off", command=self._conjugate_policy_changed).grid(
+            row=0, column=2, sticky="w", padx=2)
+
+        ttk.Label(conj_frame, text="Actual state").grid(
+            row=1, column=0, sticky="w", padx=5, pady=4)
+        ttk.Entry(conj_frame, textvariable=self._vars["conjugate_actual"],
+                 state="readonly", width=12).grid(
+            row=1, column=1, sticky="ew", padx=5, pady=4)
+        
+        help_text = (
+            "Auto: follows tuner selection logic\n"
+            "  No tuner → apply_conjugate = false\n"
+            "  High-side LO → apply_conjugate = true\n"
+            "  Low-side LO → apply_conjugate = false\n\n"
+            "Force On: apply_conjugate = true\n"
+            "Force Off: apply_conjugate = false"
+        )
+        ttk.Label(conj_frame, text="ⓘ", foreground="gray").grid(
+            row=2, column=0, sticky="w", padx=5, pady=2)
+        help_label = ttk.Label(conj_frame, text=help_text, justify="left",
+                              foreground="gray", font=("TkDefaultFont", 9))
+        help_label.grid(row=2, column=1, sticky="ew", padx=5, pady=2)
+        help_label.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
         # Spectrograms
         sg_frame = ttk.LabelFrame(frame, text="Spectrograms")
-        sg_frame.grid(row=1, column=0, padx=4, pady=6, sticky="ew")
+        sg_frame.grid(row=2, column=0, padx=4, pady=6, sticky="ew")
         sg_frame.columnconfigure(1, weight=1)
 
         self._vars["sg_compute"] = tk.BooleanVar(value=True)
         self._vars["sg_mqtt"]    = tk.BooleanVar(value=True)
         self._vars["sg_output"]  = tk.BooleanVar(value=True)
-        ttk.Checkbutton(sg_frame, text="Compute",
+        sg_check_frame = ttk.Frame(sg_frame)
+        sg_check_frame.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        ttk.Checkbutton(sg_check_frame, text="Compute",
                         variable=self._vars["sg_compute"]).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        ttk.Checkbutton(sg_frame, text="Stream via MQTT",
+            row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Checkbutton(sg_check_frame, text="Stream via MQTT",
                         variable=self._vars["sg_mqtt"]).grid(
-            row=1, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        ttk.Checkbutton(sg_frame, text="Save to disk",
+            row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Checkbutton(sg_check_frame, text="Save to disk",
                         variable=self._vars["sg_output"]).grid(
-            row=2, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+            row=0, column=2, sticky="w")
 
         ttk.Separator(sg_frame, orient="horizontal").grid(
-            row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=4)
+            row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=4)
 
         ttk.Label(sg_frame, text="Reduce Op").grid(
-            row=4, column=0, sticky="w", padx=5, pady=3)
+            row=2, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_reduce_op"] = tk.StringVar(value="max")
         ttk.Combobox(
             sg_frame, textvariable=self._vars["sg_reduce_op"],
             values=["max", "min", "mean"], width=10, state="readonly",
-        ).grid(row=4, column=1, sticky="ew", padx=5, pady=3)
+        ).grid(row=2, column=1, sticky="ew", padx=5, pady=3)
 
         ttk.Label(sg_frame, text="SNR Min (dB)").grid(
-            row=5, column=0, sticky="w", padx=5, pady=3)
+            row=3, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_snr_min"] = tk.StringVar(value="-5")
         ttk.Entry(sg_frame, textvariable=self._vars["sg_snr_min"], width=8).grid(
-            row=5, column=1, sticky="ew", padx=5, pady=3)
+            row=3, column=1, sticky="ew", padx=5, pady=3)
 
         ttk.Label(sg_frame, text="SNR Max (dB)").grid(
-            row=6, column=0, sticky="w", padx=5, pady=3)
+            row=4, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_snr_max"] = tk.StringVar(value="20")
         ttk.Entry(sg_frame, textvariable=self._vars["sg_snr_max"], width=8).grid(
-            row=6, column=1, sticky="ew", padx=5, pady=3)
+            row=4, column=1, sticky="ew", padx=5, pady=3)
 
         ttk.Label(sg_frame, text="Spectra per Image").grid(
-            row=7, column=0, sticky="w", padx=5, pady=3)
+            row=5, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_spectra_per_output"] = tk.StringVar(value="600")
         ttk.Entry(sg_frame, textvariable=self._vars["sg_spectra_per_output"], width=8).grid(
-            row=7, column=1, sticky="ew", padx=5, pady=3)
+            row=5, column=1, sticky="ew", padx=5, pady=3)
 
         ttk.Button(sg_frame, text="Send Now",
                    command=self._apply_rec_spectrogram).grid(
-            row=8, column=0, columnspan=2, padx=4, pady=6, sticky="ew")
+            row=6, column=0, columnspan=2, padx=4, pady=6, sticky="ew")
 
         # DRF Output
         drf_frame = ttk.LabelFrame(frame, text="DRF Output")
-        drf_frame.grid(row=2, column=0, padx=4, pady=6, sticky="ew")
+        drf_frame.grid(row=3, column=0, padx=4, pady=6, sticky="ew")
         drf_frame.columnconfigure(1, weight=1)
 
         ttk.Label(drf_frame, text="Batch Size").grid(
@@ -3584,7 +3629,7 @@ class MEPGui:
 
         # Config Load
         cfg_frame = ttk.LabelFrame(frame, text="Config")
-        cfg_frame.grid(row=3, column=0, padx=4, pady=6, sticky="ew")
+        cfg_frame.grid(row=4, column=0, padx=4, pady=6, sticky="ew")
         cfg_frame.columnconfigure(1, weight=1)
 
         ttk.Label(cfg_frame, text="Active Config").grid(
@@ -4858,6 +4903,9 @@ class MEPGui:
     def _configure_mep(self, params: dict):
         """Create or update CaptureController with GUI params."""
         self.capture = self._get_or_create_capture(params)
+        policy = self._vars["conjugate_policy"].get()
+        self.capture.conjugate_policy = policy
+        self._update_conjugate_actual_display()
 
     # ------------------------------------------------------------------ #
     #  Button handlers
