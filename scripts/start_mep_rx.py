@@ -2154,6 +2154,17 @@ class CaptureController:
 
         time.sleep(0.1)
 
+    def _resolve_apply_conjugate(self) -> bool:
+        """Resolve effective packet.apply_conjugate from policy + tuner state."""
+        injection_mode = (self.injection or "").lower()
+        if self.conjugate_policy == "auto":
+            return (self.tuner is not None and injection_mode == "high")
+        if self.conjugate_policy == "force_on":
+            return True
+        if self.conjugate_policy == "force_off":
+            return False
+        return (self.tuner is not None and injection_mode == "high")
+
     # ------------------------------------------------------------------ #
     #  Recorder recipe (sweep orchestration)                               #
     # ------------------------------------------------------------------ #
@@ -2190,6 +2201,15 @@ class CaptureController:
 
         self.bus.recorder_config_set("drf_sink.channel_dir", channel_dir)
         self.bus.recorder_config_set("basic_network.dst_port", str(dst_port))
+        apply_conjugate = self._resolve_apply_conjugate()
+        logging.info(
+            "Recorder pre-enable conjugate: policy=%s tuner=%r injection=%r apply_conjugate=%s",
+            self.conjugate_policy,
+            self.tuner,
+            self.injection,
+            str(apply_conjugate).lower(),
+        )
+        self.bus.recorder_config_set("packet.apply_conjugate", str(apply_conjugate).lower())
 
         # Arm the wait BEFORE sending enable to avoid missing a fast response
         self._status_events[RECORDER_STATUS_TOPIC].clear()
@@ -2227,15 +2247,6 @@ class CaptureController:
         self.bus.rfsoc_reset()
 
         injection_mode = (self.injection or "").lower()
-        if self.conjugate_policy == "auto":
-            apply_conjugate = (self.tuner is not None and injection_mode == "high")
-        elif self.conjugate_policy == "force_on":
-            apply_conjugate = True
-        elif self.conjugate_policy == "force_off":
-            apply_conjugate = False
-        else:
-            apply_conjugate = (self.tuner is not None and injection_mode == "high")
-        self.bus.recorder_config_set("packet.apply_conjugate", str(apply_conjugate).lower())
 
         if self.tuner is None:
             if self.injection is not None:
