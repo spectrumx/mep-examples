@@ -84,6 +84,9 @@ TUNER_INJECTION_SIDE = {
     "TEST":    "high",
 }
 
+CONJUGATE_POLICY_DEFAULT = "auto"
+CONJUGATE_POLICY_OPTIONS = ("auto", "force_on", "force_off")
+
 # Hardware configuration options (for dropdowns/validation)
 # CHANNEL_OPTIONS derived from RECORDER_CHANNEL_PORTS
 CHANNEL_OPTIONS     = list(sorted(RECORDER_CHANNEL_PORTS.keys()))
@@ -1889,6 +1892,7 @@ class CaptureController:
         self.adc_if_mhz: Optional[float] = None
         self.injection: Optional[str] = None
         self.capture_name: Optional[str] = None
+        self.conjugate_policy: str = CONJUGATE_POLICY_DEFAULT
         self._tuner_initialized_for: Optional[str] = None
         self._last_tuner_session_id: Optional[str] = None
         self._tuner_session_counter = 0
@@ -1980,7 +1984,6 @@ class CaptureController:
         self.tuner = tuner
         self.adc_if_mhz = adc_if_mhz
         self.capture_name = capture_name
-        self.conjugate_policy = "auto"
 
         if tuner is None:
             self.injection = None
@@ -2154,16 +2157,35 @@ class CaptureController:
 
         time.sleep(0.1)
 
+    def _normalized_conjugate_policy(self) -> str:
+        """Return a valid conjugate policy from current controller state."""
+        policy = str(self.conjugate_policy or "").strip().lower()
+        if policy in CONJUGATE_POLICY_OPTIONS:
+            return policy
+        return CONJUGATE_POLICY_DEFAULT
+
     def _resolve_apply_conjugate(self) -> bool:
         """Resolve effective packet.apply_conjugate from policy + tuner state."""
+        policy = self._normalized_conjugate_policy()
         injection_mode = (self.injection or "").lower()
-        if self.conjugate_policy == "auto":
+        if policy == "auto":
             return (self.tuner is not None and injection_mode == "high")
-        if self.conjugate_policy == "force_on":
+        if policy == "force_on":
             return True
-        if self.conjugate_policy == "force_off":
+        if policy == "force_off":
             return False
-        return (self.tuner is not None and injection_mode == "high")
+        return False
+
+    def get_conjugate_state(self) -> dict:
+        """Expose conjugate policy + effective state for GUI/CLI consumers."""
+        policy = self._normalized_conjugate_policy()
+        return {
+            "policy": policy,
+            "policy_options": list(CONJUGATE_POLICY_OPTIONS),
+            "tuner": self.tuner,
+            "injection": self.injection,
+            "apply_conjugate": self._resolve_apply_conjugate(),
+        }
 
     # ------------------------------------------------------------------ #
     #  Recorder recipe (sweep orchestration)                               #
@@ -2201,12 +2223,13 @@ class CaptureController:
 
         self.bus.recorder_config_set("drf_sink.channel_dir", channel_dir)
         self.bus.recorder_config_set("basic_network.dst_port", str(dst_port))
-        apply_conjugate = self._resolve_apply_conjugate()
+        state = self.get_conjugate_state()
+        apply_conjugate = bool(state["apply_conjugate"])
         logging.info(
             "Recorder pre-enable conjugate: policy=%s tuner=%r injection=%r apply_conjugate=%s",
-            self.conjugate_policy,
-            self.tuner,
-            self.injection,
+            state["policy"],
+            state["tuner"],
+            state["injection"],
             str(apply_conjugate).lower(),
         )
         self.bus.recorder_config_set("packet.apply_conjugate", str(apply_conjugate).lower())

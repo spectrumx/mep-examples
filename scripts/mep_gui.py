@@ -50,6 +50,8 @@ from start_mep_rx import (
     CHANNEL_OPTIONS,
     TUNER_OPTIONS,
     SAMPLE_RATE_OPTIONS,
+    CONJUGATE_POLICY_DEFAULT,
+    CONJUGATE_POLICY_OPTIONS,
     AFE_DEFAULT_LOG_PATH,
     AFE_DEFAULT_LOG_RATE_S,
     AFE_DEFAULT_LOG_RATE_RANGE,
@@ -192,6 +194,7 @@ class MEPGui:
         # False until root.mainloop() is running; _gui_call routes to _gui_queue until then,
         # so emit-cached callbacks drain via _pump_gui_queue after the window is first rendered.
         self._mainloop_started = False
+        self._conjugate_policy_user_override = False
 
         self._vars = {}
         self._init_shared_vars()
@@ -246,7 +249,7 @@ class MEPGui:
         self._vars["log_enabled"] = tk.StringVar(value="enabled")
         self._vars["log_path"] = tk.StringVar(value=AFE_DEFAULT_LOG_PATH)
         self._vars["log_rate"] = tk.IntVar(value=AFE_DEFAULT_LOG_RATE_S)
-        self._vars["conjugate_policy"] = tk.StringVar(value="auto")
+        self._vars["conjugate_policy"] = tk.StringVar(value="")
         self._vars["conjugate_actual"] = tk.StringVar(value="—")
 
     # ------------------------------------------------------------------ #
@@ -3527,16 +3530,20 @@ class MEPGui:
         policy_frame = ttk.Frame(conj_frame)
         policy_frame.grid(row=0, column=1, sticky="ew", padx=5, pady=4)
         policy_frame.columnconfigure(3, weight=1)
-        
-        ttk.Radiobutton(policy_frame, text="Auto", variable=self._vars["conjugate_policy"],
-                       value="auto", command=self._conjugate_policy_changed).grid(
-            row=0, column=0, sticky="w", padx=2)
-        ttk.Radiobutton(policy_frame, text="Force On", variable=self._vars["conjugate_policy"],
-                       value="force_on", command=self._conjugate_policy_changed).grid(
-            row=0, column=1, sticky="w", padx=2)
-        ttk.Radiobutton(policy_frame, text="Force Off", variable=self._vars["conjugate_policy"],
-                       value="force_off", command=self._conjugate_policy_changed).grid(
-            row=0, column=2, sticky="w", padx=2)
+
+        policy_labels = {
+            "auto": "Auto",
+            "force_on": "Force On",
+            "force_off": "Force Off",
+        }
+        for idx, policy in enumerate(CONJUGATE_POLICY_OPTIONS):
+            ttk.Radiobutton(
+                policy_frame,
+                text=policy_labels.get(policy, policy),
+                variable=self._vars["conjugate_policy"],
+                value=policy,
+                command=self._conjugate_policy_changed,
+            ).grid(row=0, column=idx, sticky="w", padx=2)
 
         ttk.Label(conj_frame, text="Actual state").grid(
             row=1, column=0, sticky="w", padx=5, pady=4)
@@ -3635,6 +3642,8 @@ class MEPGui:
         ttk.Label(cfg_frame, text="Active Config").grid(
             row=0, column=0, sticky="w", padx=5, pady=3)
         self._vars["rec_active_config"] = tk.StringVar(value="—")
+        config_name = f"sr{self._vars['sample_rate_mhz'].get()}MHz"
+        self._vars["rec_active_config"].set(config_name)
         ttk.Entry(cfg_frame, textvariable=self._vars["rec_active_config"],
                   state="readonly", width=12).grid(
             row=0, column=1, sticky="ew", padx=5, pady=3)
@@ -3645,34 +3654,41 @@ class MEPGui:
         # Register tab-specific MQTT → UI. Emit-cached fires inline if data exists.
         self.bus.on_status(RECORDER_STATUS_TOPIC,
                           lambda data: self._gui_call(self._rec_status_ui_update, data))
+        self._update_conjugate_actual_display()
 
-    def _conjugate_policy_changed(self, *_):
-        """Update capture controller policy when user changes radio button."""
-        if self.capture is not None:
-            policy = self._vars["conjugate_policy"].get()
-            self.capture.conjugate_policy = policy
-            logging.info(f"Conjugate policy set to: {policy}")
-            self._update_conjugate_actual_display()
-
-    def _update_conjugate_actual_display(self):
-        """Compute and display the effective conjugate state."""
+    def _sync_conjugate_policy_ui_from_capture(self):
+        """Sync conjugate policy and effective state from CaptureController."""
         if self.capture is None:
+            current_policy = self._vars["conjugate_policy"].get()
+            if (not self._conjugate_policy_user_override) or (current_policy not in CONJUGATE_POLICY_OPTIONS):
+                self._vars["conjugate_policy"].set(CONJUGATE_POLICY_DEFAULT)
             self._vars["conjugate_actual"].set("—")
             return
-        injection_mode = (self.capture.injection or "").lower()
-        if self.capture.conjugate_policy == "auto":
-            actual = (self.capture.tuner is not None and injection_mode == "high")
-        elif self.capture.conjugate_policy == "force_on":
-            actual = True
-        elif self.capture.conjugate_policy == "force_off":
-            actual = False
-        else:
-            actual = False
-        self._vars["conjugate_actual"].set(str(actual))
 
-        # Set initial active config from current sample rate selection.
-        config_name = f"sr{self._vars['sample_rate_mhz'].get()}MHz"
-        self._vars["rec_active_config"].set(config_name)
+        state = self.capture.get_conjugate_state()
+        policy = state.get("policy", CONJUGATE_POLICY_DEFAULT)
+        if policy not in CONJUGATE_POLICY_OPTIONS:
+            policy = CONJUGATE_POLICY_DEFAULT
+        self._vars["conjugate_policy"].set(policy)
+        self._vars["conjugate_actual"].set(str(bool(state.get("apply_conjugate"))))
+
+    def _conjugate_policy_changed(self, *_):
+        """Apply user-selected policy to CaptureController."""
+        self._conjugate_policy_user_override = True
+        policy = self._vars["conjugate_policy"].get()
+        if policy not in CONJUGATE_POLICY_OPTIONS:
+            logging.warning("Ignoring invalid conjugate policy selection: %r", policy)
+            self._sync_conjugate_policy_ui_from_capture()
+            return
+
+        if self.capture is not None:
+            self.capture.conjugate_policy = policy
+            logging.info(f"Conjugate policy set to: {policy}")
+        self._update_conjugate_actual_display()
+
+    def _update_conjugate_actual_display(self):
+        """Refresh conjugate display from CaptureController state."""
+        self._sync_conjugate_policy_ui_from_capture()
 
     # ------------------------------------------------------------------ #
     #  AFE helpers
@@ -4903,8 +4919,10 @@ class MEPGui:
     def _configure_mep(self, params: dict):
         """Create or update CaptureController with GUI params."""
         self.capture = self._get_or_create_capture(params)
-        policy = self._vars["conjugate_policy"].get()
-        self.capture.conjugate_policy = policy
+        if self._conjugate_policy_user_override:
+            policy = self._vars["conjugate_policy"].get()
+            if policy in CONJUGATE_POLICY_OPTIONS:
+                self.capture.conjugate_policy = policy
         self._update_conjugate_actual_display()
 
     # ------------------------------------------------------------------ #
