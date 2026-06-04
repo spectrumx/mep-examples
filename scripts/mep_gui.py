@@ -191,6 +191,7 @@ class MEPGui:
         self._spec_render_after_id = None
         self._spec_force_render = False   # one-shot redraw request (color-scale controls)
         self._spec_last_arrival = None    # monotonic ts of previous frame (jitter diagnostic)
+        self._spec_log_dt = False         # SPEC-tab toggle: log per-frame arrival dt
         self._spec_wf_fill = 0            # count of real rows currently in the buffer
         self._spec_color_lut = self._spec_build_color_lut()
         # PhotoImage-based waterfall (numpy/PIL fast path)
@@ -687,13 +688,24 @@ class MEPGui:
         log_frame = ttk.LabelFrame(left, text="Log")
         log_frame.grid(row=5, column=0, padx=10, pady=6, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
+        log_frame.rowconfigure(1, weight=1)
+
+        log_ctl = ttk.Frame(log_frame)
+        log_ctl.grid(row=0, column=0, sticky="ew", padx=5, pady=(4, 0))
+        ttk.Label(log_ctl, text="Level").pack(side="left")
+        self._vars["log_level"] = tk.StringVar(value="INFO")
+        log_level_combo = ttk.Combobox(
+            log_ctl, textvariable=self._vars["log_level"], width=10, state="readonly",
+            values=("DEBUG", "INFO", "WARNING", "ERROR"),
+        )
+        log_level_combo.pack(side="left", padx=(4, 0))
+        log_level_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_log_level())
 
         self._log_text = scrolledtext.ScrolledText(
             log_frame, height=15, width=80, state="disabled",
             font=("Courier", 9),
         )
-        self._log_text.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+        self._log_text.grid(row=1, column=0, padx=5, pady=5, sticky="nsew")
         self._bind_copy_menu(self._log_text)
 
         # ---- Right pane: Advanced Options ---- #
@@ -1457,8 +1469,14 @@ class MEPGui:
         )
         self._vars["spec_stream_state"] = tk.StringVar(value="paused")
         ttk.Label(cfg_f, textvariable=self._vars["spec_stream_state"], foreground="grey").grid(
-            row=1, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 2)
+            row=1, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 2)
         )
+        self._vars["spec_log_dt"] = tk.BooleanVar(value=self._spec_log_dt)
+        ttk.Checkbutton(
+            cfg_f, text="Log frame timing (dt)",
+            variable=self._vars["spec_log_dt"],
+            command=lambda: setattr(self, "_spec_log_dt", self._vars["spec_log_dt"].get()),
+        ).grid(row=1, column=2, columnspan=2, sticky="e", padx=5, pady=(0, 2))
 
         ctl_f = ttk.LabelFrame(frame, text="Display")
         ctl_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
@@ -1780,8 +1798,8 @@ class MEPGui:
         if bins.size == 0 or not np.all(np.isfinite(bins)):
             return
         now = time.monotonic()
-        if self._spec_last_arrival is not None:
-            logging.debug(f"SPEC frame dt={(now - self._spec_last_arrival) * 1000:.0f} ms")
+        if self._spec_log_dt and self._spec_last_arrival is not None:
+            logging.info(f"SPEC frame dt={(now - self._spec_last_arrival) * 1000:.0f} ms")
         self._spec_last_arrival = now
         row = (20.0 * np.log10(np.maximum(np.abs(bins), 1e-12))).astype(np.float32)
         metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
@@ -4933,10 +4951,19 @@ class MEPGui:
             logging.Formatter("%(asctime)s %(levelname)-7s %(message)s",
                               datefmt="%H:%M:%S")
         )
+        # Root logger stays permissive (DEBUG) so records of every level reach the
+        # handlers; the GUI panel's own threshold is what the user controls via the
+        # Log "Level" combo. This keeps verbosity a presentation-layer decision.
+        handler.setLevel(logging.INFO)
         root_logger = logging.getLogger()
-        root_logger.setLevel(logging.INFO)
+        root_logger.setLevel(logging.DEBUG)
         root_logger.addHandler(handler)
         self._text_log_handler = handler
+
+    def _apply_log_level(self):
+        """Set the GUI log panel's verbosity from the Level combo (handler only)."""
+        level = self._vars["log_level"].get()
+        self._text_log_handler.setLevel(getattr(logging, level, logging.INFO))
 
     def _pump_text_log(self):
         """Drain queued log records onto Tk widgets on the main thread."""
