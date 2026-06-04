@@ -20,7 +20,6 @@ import re
 import math
 import json
 import base64
-import struct
 import time
 import socket
 import subprocess
@@ -31,6 +30,8 @@ from collections import deque
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import datetime
+import numpy as np
+from PIL import Image as _PILImage, ImageTk as _PILImageTk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from start_mep_rx import (
@@ -180,16 +181,28 @@ class MEPGui:
         self._spec_stream_enabled = False
         self._spec_latest = None
         self._spec_rows = deque(maxlen=180)
-        self._spec_render_pending = False
-        self._spec_bins = 256
-        self._spec_render_interval_ms = 80
-        self._spec_min_ingest_interval_s = 0.03
-        self._spec_last_ingest_mono = 0.0
-        self._spec_frame_seq = 0
-        self._spec_last_rendered_seq = -1
-        self._spec_wf_row_counter = 0
-        self._spec_wf_row_tags = deque()
+        self._spec_bins = 256                # line-plot display resolution (FFT Bins)
+        self._spec_render_interval_ms = 40   # fixed render cadence (~25 FPS over X11)
+        # Producer/consumer decoupling: the MQTT thread decodes frames and queues
+        # ready-to-draw dB rows here; the steady Tk render timer drains and blits
+        # them in one operation per tick. Bounded so a fast producer cannot grow
+        # memory without bound (surplus rows scroll off the waterfall anyway).
+        self._spec_pending = deque(maxlen=240)
+        self._spec_render_after_id = None
+        self._spec_force_render = False   # one-shot redraw request (color-scale controls)
+        self._spec_last_arrival = None    # monotonic ts of previous frame (jitter diagnostic)
+        self._spec_wf_fill = 0            # count of real rows currently in the buffer
         self._spec_color_lut = self._spec_build_color_lut()
+        # PhotoImage-based waterfall (numpy/PIL fast path)
+        self._spec_wf_pixels = None       # np.ndarray (h, w, 3) uint8 rolling pixel buffer
+        self._spec_wf_pil = None          # PIL Image wrapping the current buffer
+        self._spec_wf_photo = None        # ImageTk.PhotoImage kept alive (Tk GC workaround)
+        self._spec_wf_image_id = None     # canvas item id for the single image item
+        # Persistent canvas items (created once, updated via coords/itemconfig each
+        # tick instead of delete-and-recreate — far fewer X11 requests per frame).
+        self._spec_line_item = None
+        self._spec_line_labels = {}
+        self._spec_wf_labels = {}
 
         # False until root.mainloop() is running; _gui_call routes to _gui_queue until then,
         # so emit-cached callbacks drain via _pump_gui_queue after the window is first rendered.
@@ -388,8 +401,13 @@ class MEPGui:
         logging.info("GUI: announce data applied to all dynamic widgets")
 
     def _on_spec_data(self, topic: str, data: dict):
-        """Listener for SPEC messages (radiohound/clients/data/+ pattern)."""
-        self._gui_call(self._spec_handle_stream_message, topic, data)
+        """Listener for SPEC messages (radiohound/clients/data/+ pattern).
+
+        Runs the decode/transform directly on the MQTT thread (the producer
+        makes no Tk calls and only appends to a locked queue). Keeping this off
+        the GUI thread is what lets the render timer stay responsive.
+        """
+        self._spec_handle_stream_message(topic, data)
 
     def _gui_call(self, func, *args, **kwargs):
         if self._gui_queue_closed:
@@ -1445,18 +1463,17 @@ class MEPGui:
         ctl_f = ttk.LabelFrame(frame, text="Display")
         ctl_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
         ctl_f.columnconfigure(1, weight=1)
-        self._vars["spec_autoscale"] = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ctl_f, text="Auto color scale", variable=self._vars["spec_autoscale"],
-                        command=self._spec_request_render).grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        ttk.Button(ctl_f, text="Autoscale", command=self._spec_autoscale_now).grid(
+            row=0, column=0, sticky="w", padx=5, pady=2)
         ttk.Label(ctl_f, text="Min").grid(row=0, column=1, sticky="e", padx=(5, 2), pady=2)
-        self._vars["spec_vmin"] = tk.DoubleVar(value=-120.0)
-        self._spec_min_scale = ttk.Scale(ctl_f, from_=-200.0, to=50.0, variable=self._vars["spec_vmin"],
-                                         command=lambda _v: self._spec_request_render())
+        self._vars["spec_vmin"] = tk.DoubleVar(value=-250.0)
+        self._spec_min_scale = ttk.Scale(ctl_f, from_=-250.0, to=50.0, variable=self._vars["spec_vmin"],
+                                         command=lambda _v: self._spec_apply_color_range())
         self._spec_min_scale.grid(row=0, column=2, sticky="ew", padx=2, pady=2)
         ttk.Label(ctl_f, text="Max").grid(row=0, column=3, sticky="e", padx=(8, 2), pady=2)
-        self._vars["spec_vmax"] = tk.DoubleVar(value=0.0)
-        self._spec_max_scale = ttk.Scale(ctl_f, from_=-200.0, to=50.0, variable=self._vars["spec_vmax"],
-                                         command=lambda _v: self._spec_request_render())
+        self._vars["spec_vmax"] = tk.DoubleVar(value=-100.0)
+        self._spec_max_scale = ttk.Scale(ctl_f, from_=-250.0, to=50.0, variable=self._vars["spec_vmax"],
+                                         command=lambda _v: self._spec_apply_color_range())
         self._spec_max_scale.grid(row=0, column=4, sticky="ew", padx=2, pady=2)
         ttk.Label(ctl_f, text="FFT Bins").grid(row=1, column=0, sticky="w", padx=5, pady=(0, 2))
         self._vars["spec_bins"] = tk.IntVar(value=self._spec_bins)
@@ -1478,6 +1495,16 @@ class MEPGui:
             self._spec_bin_buttons[n] = btn
         ctl_f.columnconfigure(2, weight=1)
         ctl_f.columnconfigure(4, weight=1)
+        ttk.Label(ctl_f, text="Refresh (ms)").grid(row=2, column=0, sticky="w", padx=5, pady=(0, 4))
+        self._vars["spec_render_interval_ms"] = tk.IntVar(value=self._spec_render_interval_ms)
+        _ri_scale = ttk.Scale(
+            ctl_f, from_=10, to=500,
+            variable=self._vars["spec_render_interval_ms"],
+            command=lambda v: self._spec_apply_render_interval(int(float(v))),
+        )
+        _ri_scale.grid(row=2, column=1, columnspan=3, sticky="ew", padx=2, pady=(0, 4))
+        self._spec_render_interval_label = ttk.Label(ctl_f, text=f"{self._spec_render_interval_ms} ms")
+        self._spec_render_interval_label.grid(row=2, column=4, sticky="w", padx=(4, 5), pady=(0, 4))
         self._spec_update_bin_button_states()
 
         self._spec_line_canvas = tk.Canvas(frame, height=170, background="#111111", highlightthickness=1,
@@ -1491,6 +1518,7 @@ class MEPGui:
         self._spec_wf_canvas.grid(row=3, column=0, padx=4, pady=(2, 2), sticky="nsew")
         self._spec_wf_canvas.bind("<Motion>", lambda e: self._spec_cursor_update(e, from_waterfall=True))
         self._spec_wf_canvas.bind("<Button-1>", lambda e: self._spec_cursor_update(e, from_waterfall=True))
+        self._spec_wf_canvas.bind("<Configure>", lambda e: self._spec_wf_resize(e.width, e.height))
 
         self._vars["spec_summary"] = tk.StringVar(value="Paused. Press Stream to start SPEC updates")
         ttk.Label(frame, textvariable=self._vars["spec_summary"], foreground="grey",
@@ -1506,18 +1534,41 @@ class MEPGui:
             wraplength=420,
         )
 
+    def _spec_wf_resize(self, w: int, h: int):
+        """Reallocate the pixel buffer on canvas resize and repaint stored rows."""
+        w = max(4, w)
+        h = max(4, h)
+        self._spec_wf_pixels = np.zeros((h, w, 3), dtype=np.uint8)
+        self._spec_wf_fill = 0
+        self._spec_wf_pil = _PILImage.fromarray(self._spec_wf_pixels, "RGB")
+        self._spec_wf_photo = _PILImageTk.PhotoImage(image=self._spec_wf_pil)
+        if self._spec_wf_image_id is None:
+            self._spec_wf_image_id = self._spec_wf_canvas.create_image(
+                0, 0, anchor="nw", image=self._spec_wf_photo
+            )
+        else:
+            self._spec_wf_canvas.itemconfig(self._spec_wf_image_id, image=self._spec_wf_photo)
+        vmin, vmax = self._spec_color_range()
+        if vmin is not None:
+            self._spec_repaint_waterfall(vmin, vmax)
+
     def _spec_reset_display(self):
         """Clear canvases and reset display state for a fresh SPEC stream."""
+        self._spec_rows.clear()
         with self._spec_lock:
-            self._spec_rows.clear()
+            self._spec_pending.clear()
             self._spec_latest = None
-            self._spec_last_rendered_seq = -1
-            self._spec_wf_row_counter = 0
-            self._spec_wf_row_tags.clear()
-        if hasattr(self, "_spec_wf_canvas"):
-            self._spec_wf_canvas.delete("all")
-        if hasattr(self, "_spec_line_canvas"):
-            self._spec_line_canvas.delete("all")
+        self._spec_wf_fill = 0
+        if self._spec_wf_pixels is not None:
+            self._spec_wf_pixels[:] = 0
+            self._spec_wf_pil = _PILImage.fromarray(self._spec_wf_pixels, "RGB")
+            self._spec_wf_photo.paste(self._spec_wf_pil)
+        for item in self._spec_wf_labels.values():
+            self._spec_wf_canvas.delete(item)
+        self._spec_wf_labels = {}
+        self._spec_line_canvas.delete("all")
+        self._spec_line_item = None
+        self._spec_line_labels = {}
 
     def _spec_stream_on(self):
         self._spec_reset_display()
@@ -1526,10 +1577,11 @@ class MEPGui:
             self._vars["spec_stream_state"].set("streaming")
         if "spec_summary" in self._vars:
             self._vars["spec_summary"].set(f"Listening on {self._spec_topic}")
-        self._spec_request_render()
+        self._spec_start_render_loop()
 
     def _spec_stream_off(self):
         self._spec_stream_enabled = False
+        self._spec_stop_render_loop()
         if "spec_stream_state" in self._vars:
             self._vars["spec_stream_state"].set("paused")
         if "spec_summary" in self._vars:
@@ -1546,62 +1598,47 @@ class MEPGui:
 
     def _spec_apply_bins(self, n=None):
         allowed = {64, 128, 256, 512, 1024, 2048}
-        try:
-            if n is None:
-                n = int(self._vars.get("spec_bins", tk.IntVar(value=self._spec_bins)).get())
-            else:
-                n = int(n)
-        except Exception:
-            logging.error("SPEC: bins must be an integer")
-            self._vars["spec_bins"].set(self._spec_bins)
-            self._spec_update_bin_button_states()
-            return
+        if n is None:
+            n = int(self._vars["spec_bins"].get())
+        else:
+            n = int(n)
         if n not in allowed:
-            logging.error("SPEC: bins must be one of 64, 128, 256, 512, 1024, 2048")
+            logging.error("SPEC: bins must be one of %s", sorted(allowed))
             self._vars["spec_bins"].set(self._spec_bins)
             self._spec_update_bin_button_states()
             return
         self._vars["spec_bins"].set(n)
-        if n == self._spec_bins:
-            self._spec_update_bin_button_states()
-            return
         self._spec_bins = n
         self._spec_update_bin_button_states()
-        self._spec_reset_display()
-        if self._spec_stream_enabled and "spec_summary" in self._vars:
-            self._vars["spec_summary"].set(f"Listening on {self._spec_topic} (bins={self._spec_bins})")
+        # FFT Bins only controls the line-plot resolution; the waterfall renders
+        # at native resolution, so no buffer reset is needed — just redraw.
+        self._spec_request_render()
+
+    def _spec_apply_render_interval(self, ms: int):
+        ms = max(10, min(500, ms))
+        self._spec_render_interval_ms = ms
+        if hasattr(self, "_spec_render_interval_label"):
+            self._spec_render_interval_label.config(text=f"{ms} ms")
 
     def _spec_decode_bins(self, data_b64: str):
+        """Decode a base64 little-endian float32 payload into a native numpy array."""
         raw = base64.b64decode(data_b64)
-        if len(raw) < 4:
-            return []
         n = len(raw) // 4
-        raw = raw[: n * 4]
-        return [x[0] for x in struct.iter_unpack("<f", raw)]
+        if n == 0:
+            return np.empty(0, dtype=np.float32)
+        return np.frombuffer(raw[: n * 4], dtype="<f4").astype(np.float32)
 
-    def _spec_resample(self, values, n_out: int):
-        if not values:
-            return []
-        if len(values) == n_out:
-            return list(values)
-        if len(values) < 2:
-            return [float(values[0])] * n_out
-        step = (len(values) - 1) / max(1, n_out - 1)
-        out = []
-        for i in range(n_out):
-            src = i * step
-            j = int(src)
-            frac = src - j
-            if j >= len(values) - 1:
-                out.append(float(values[-1]))
-            else:
-                a = float(values[j])
-                b = float(values[j + 1])
-                out.append(a + (b - a) * frac)
-        return out
+    def _spec_resample(self, arr, n_out: int):
+        """Linearly resample a 1-D array to n_out samples (returns a numpy array)."""
+        if len(arr) == n_out:
+            return arr
+        xp = np.linspace(0.0, 1.0, len(arr))
+        xq = np.linspace(0.0, 1.0, n_out)
+        return np.interp(xq, xp, arr).astype(np.float32)
 
     def _spec_build_color_lut(self):
-        lut = []
+        """Build a (256, 3) uint8 numpy array: index → (R, G, B) colormap."""
+        lut = np.zeros((256, 3), dtype=np.uint8)
         for idx in range(256):
             t = idx / 255.0
             if t < 0.33:
@@ -1613,95 +1650,89 @@ class MEPGui:
             else:
                 u = (t - 0.66) / 0.34
                 r, g, b = 255, int(255 * (1.0 - u)), 0
-            lut.append((r, g, b))
+            lut[idx] = (r, g, b)
         return lut
 
-    def _spec_render_waterfall_row(self, row, vmin: float, vmax: float):
-        if not row:
+    def _spec_row_to_rgb(self, db_row, w: int, vmin: float, vmax: float):
+        """Map one native dB row to a (w, 3) uint8 RGB strip via the colormap.
+
+        The native spectrum is resampled directly to the pixel width here — a
+        single resampling step (no intermediate bin-count round-trip).
+        """
+        vals = self._spec_resample(db_row, w)
+        scale = 255.0 / (vmax - vmin)
+        idx = np.clip((vals - vmin) * scale, 0, 255).astype(np.uint8)
+        return self._spec_color_lut[idx]
+
+    def _spec_blit_waterfall_block(self, db_rows, vmin: float, vmax: float):
+        """Scroll the waterfall by len(db_rows) and write them all in one transfer.
+
+        db_rows are native-resolution dB float32 arrays in arrival order (oldest
+        first). Each is colored under the current range, then a single PhotoImage
+        paste pushes the whole frame to X11 — one transfer per render tick
+        regardless of how many frames arrived since the last tick.
+        """
+        if not db_rows or self._spec_wf_pixels is None:
             return
-        ww = max(10, self._spec_wf_canvas.winfo_width())
-        wh = max(10, self._spec_wf_canvas.winfo_height())
+        h, w, _ = self._spec_wf_pixels.shape
+        block = np.empty((len(db_rows), w, 3), dtype=np.uint8)
+        for i, row in enumerate(db_rows):
+            block[i] = self._spec_row_to_rgb(row, w, vmin, vmax)
+        block = block[::-1]  # newest row first (row 0 = top = most recent)
+        k = block.shape[0]
+        if k >= h:
+            self._spec_wf_pixels[:] = block[:h]
+        else:
+            self._spec_wf_pixels[k:] = self._spec_wf_pixels[:-k]
+            self._spec_wf_pixels[:k] = block
+        self._spec_wf_fill = min(h, self._spec_wf_fill + k)
+        self._spec_wf_pil = _PILImage.fromarray(self._spec_wf_pixels, "RGB")
+        self._spec_wf_photo.paste(self._spec_wf_pil)
 
-        # Shift existing history down by one pixel, then draw newest row at y=0.
-        self._spec_wf_canvas.move("specwf", 0, 1)
-        row_tag = f"specwf_row_{self._spec_wf_row_counter}"
-        self._spec_wf_row_counter += 1
+    def _spec_repaint_waterfall(self, vmin: float, vmax: float):
+        """Rebuild the entire pixel buffer from stored rows on one consistent scale.
 
-        scale = 255.0 / (vmax - vmin) if vmax > vmin else 0.0
-        n = len(row)
-        for i, v in enumerate(row):
-            x0 = int(i * ww / n)
-            x1 = int((i + 1) * ww / n)
-            if x1 <= x0:
-                x1 = x0 + 1
-            if scale <= 0.0:
-                idx = 0
-            else:
-                try:
-                    fv = float(v)
-                except (TypeError, ValueError):
-                    fv = vmin
-                if not math.isfinite(fv):
-                    fv = vmin
-                idx = int((fv - vmin) * scale)
-                if idx < 0:
-                    idx = 0
-                elif idx > 255:
-                    idx = 255
-            r, g, b = self._spec_color_lut[idx]
-            self._spec_wf_canvas.create_rectangle(
-                x0, 0, x1, 1,
-                outline="",
-                fill=f"#{r:02x}{g:02x}{b:02x}",
-                tags=("specwf", row_tag),
-            )
+        Used whenever the color range changes (Autoscale button / sliders) or the
+        canvas is resized, so every visible row is colored under the same range —
+        this is what prevents color drift across the image.
+        """
+        if self._spec_wf_pixels is None:
+            return
+        h, w, _ = self._spec_wf_pixels.shape
+        rows = list(self._spec_rows)[-h:]          # oldest..newest, capped to height
+        self._spec_wf_pixels[:] = 0
+        for i, entry in enumerate(reversed(rows)):  # newest at row 0 (top)
+            self._spec_wf_pixels[i] = self._spec_row_to_rgb(entry["row"], w, vmin, vmax)
+        self._spec_wf_fill = len(rows)
+        self._spec_wf_pil = _PILImage.fromarray(self._spec_wf_pixels, "RGB")
+        self._spec_wf_photo.paste(self._spec_wf_pil)
 
-        self._spec_wf_row_tags.append(row_tag)
-        while len(self._spec_wf_row_tags) > wh:
-            stale = self._spec_wf_row_tags.popleft()
-            self._spec_wf_canvas.delete(stale)
-
-    def _spec_get_abs_freq_limits(self, latest: dict, n_bins: int):
+    def _spec_freq_axis(self, latest: dict, n_bins: int):
+        """Return (lo, hi, is_hz). Absolute Hz when metadata is present, else bin indices."""
         cf = latest.get("center_frequency")
-        fmin_off = latest.get("fmin")
-        fmax_off = latest.get("fmax")
-        if isinstance(cf, (int, float)) and isinstance(fmin_off, (int, float)) and isinstance(fmax_off, (int, float)):
-            return float(cf + fmin_off), float(cf + fmax_off)
-        return 0.0, float(max(0, n_bins - 1))
+        fmin = latest.get("fmin")
+        fmax = latest.get("fmax")
+        if isinstance(cf, (int, float)) and isinstance(fmin, (int, float)) and isinstance(fmax, (int, float)):
+            return float(cf + fmin), float(cf + fmax), True
+        return 0.0, float(max(0, n_bins - 1)), False
 
-    def _spec_fmt_freq(self, hz: float):
-        return f"{hz/1e6:.3f} MHz"
-
-    def _spec_amp_to_db(self, amp: float):
-        # Convert linear amplitude to dBFS-like scale with floor protection.
-        a = abs(float(amp))
-        if a < 1e-12:
-            a = 1e-12
-        return 20.0 * math.log10(a)
+    def _spec_fmt_axis(self, value: float, is_hz: bool):
+        return f"{value / 1e6:.3f} MHz" if is_hz else f"bin {int(round(value))}"
 
     def _spec_fmt_amp(self, amp: float):
         return f"{float(amp):.2f} dB"
 
-    def _spec_bin_to_freq(self, idx: int, n_bins: int, latest: dict):
-        f0, f1 = self._spec_get_abs_freq_limits(latest, n_bins)
-        if n_bins <= 1:
-            return f0
-        return f0 + (f1 - f0) * (idx / (n_bins - 1))
-
     def _spec_cursor_update(self, event, from_waterfall: bool):
         with self._spec_lock:
-            latest = dict(self._spec_latest) if isinstance(self._spec_latest, dict) else None
-            rows = list(self._spec_rows)
-        if not latest or not rows:
+            latest = self._spec_latest
+        if latest is None:
             return
+        rows = self._spec_rows
 
-        if from_waterfall:
-            canvas = self._spec_wf_canvas
-        else:
-            canvas = self._spec_line_canvas
+        canvas = self._spec_wf_canvas if from_waterfall else self._spec_line_canvas
         w = max(10, canvas.winfo_width())
 
-        row_latest = latest.get("row", [])
+        row_latest = latest["row"]
         n = len(row_latest)
         if n <= 0:
             return
@@ -1709,164 +1740,245 @@ class MEPGui:
         x = 0 if event.x < 0 else (w - 1 if event.x >= w else event.x)
         idx = int(round(x * (n - 1) / max(1, w - 1)))
         idx = 0 if idx < 0 else (n - 1 if idx >= n else idx)
-        freq_hz = self._spec_bin_to_freq(idx, n, latest)
+        f0, f1, is_hz = self._spec_freq_axis(latest, n)
+        axis_val = f0 + (f1 - f0) * (idx / max(1, n - 1))
+        flabel = self._spec_fmt_axis(axis_val, is_hz)
 
         if from_waterfall:
+            if not rows:
+                return
             h = max(1, self._spec_wf_canvas.winfo_height())
             y = 0 if event.y < 0 else (h - 1 if event.y >= h else event.y)
-            row_offset = int(y)
-            if row_offset >= len(rows):
-                row_offset = len(rows) - 1
+            row_offset = min(int(y), len(rows) - 1)
             entry = rows[-1 - row_offset]
             amp = float(entry["row"][idx])
             ts = entry.get("ts", "?")
-            label = f"Cursor: f={self._spec_fmt_freq(freq_hz)}  t={ts}  amp={self._spec_fmt_amp(amp)}"
         else:
             amp = float(row_latest[idx])
             ts = latest.get("ts", "?")
-            label = f"Cursor: f={self._spec_fmt_freq(freq_hz)}  t={ts}  amp={self._spec_fmt_amp(amp)}"
+        label = f"Cursor: f={flabel}  t={ts}  amp={self._spec_fmt_amp(amp)}"
 
         if "spec_cursor" in self._vars:
             self._vars["spec_cursor"].set(label)
 
     def _spec_handle_stream_message(self, topic: str, data: dict):
+        """Producer (MQTT thread): decode + transform one frame, queue it.
+
+        Runs entirely off the Tk thread and makes no widget calls. Frames that
+        cannot be decoded or contain non-finite samples are dropped here, so the
+        renderer only ever receives displayable data. The native-resolution dB
+        spectrum is stored; downsampling to the display resolution happens at
+        draw time. The steady render timer (_spec_render) drains _spec_pending.
+        """
         if not self._spec_stream_enabled:
             return
-        now = time.monotonic()
-        if (now - self._spec_last_ingest_mono) < self._spec_min_ingest_interval_s:
-            return
-        self._spec_last_ingest_mono = now
         try:
             bins = self._spec_decode_bins(data.get("data", ""))
         except Exception as e:
             logging.debug(f"SPEC: decode failed: {e}")
             return
-        if not bins:
+        if bins.size == 0 or not np.all(np.isfinite(bins)):
             return
-        row_lin = self._spec_resample(bins, self._spec_bins)
-        row = [self._spec_amp_to_db(v) for v in row_lin]
-        metadata = data.get("metadata", {}) if isinstance(data.get("metadata"), dict) else {}
+        now = time.monotonic()
+        if self._spec_last_arrival is not None:
+            logging.debug(f"SPEC frame dt={(now - self._spec_last_arrival) * 1000:.0f} ms")
+        self._spec_last_arrival = now
+        row = (20.0 * np.log10(np.maximum(np.abs(bins), 1e-12))).astype(np.float32)
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        entry = {
+            "row": row,                       # native-resolution dB spectrum
+            "row_min": float(row.min()),
+            "row_max": float(row.max()),
+            "ts": data.get("timestamp"),
+            "center_frequency": data.get("center_frequency"),
+            "sample_rate": data.get("sample_rate"),
+            "n": int(row.size),
+            "fmin": metadata.get("fmin"),
+            "fmax": metadata.get("fmax"),
+            "scan_time": metadata.get("scan_time"),
+        }
         with self._spec_lock:
-            self._spec_rows.append({"row": row, "ts": data.get("timestamp")})
-            self._spec_frame_seq += 1
-            self._spec_latest = {
-                "ts": data.get("timestamp"),
-                "center_frequency": data.get("center_frequency"),
-                "sample_rate": data.get("sample_rate"),
-                "n": len(bins),
-                "row": row,
-                "fmin": metadata.get("fmin"),
-                "fmax": metadata.get("fmax"),
-                "scan_time": metadata.get("scan_time"),
-            }
-        if self._is_adv_tab_selected("SPEC"):
-            self._gui_call(self._spec_request_render)
+            self._spec_pending.append(entry)
 
     def _spec_request_render(self):
-        if not self._spec_stream_enabled:
-            return
-        if self._spec_render_pending:
-            return
-        self._spec_render_pending = True
-        self.root.after(self._spec_render_interval_ms, self._spec_render)
+        """Request a single redraw soon (used by the color-scale controls)."""
+        self._spec_force_render = True
+        if self._spec_render_after_id is None:
+            self._spec_render_after_id = self.root.after(0, self._spec_render)
+
+    def _spec_start_render_loop(self):
+        """Begin the fixed-cadence render timer (idempotent)."""
+        if self._spec_render_after_id is None:
+            self._spec_render_after_id = self.root.after(
+                self._spec_render_interval_ms, self._spec_render
+            )
+
+    def _spec_stop_render_loop(self):
+        """Cancel the render timer if running."""
+        if self._spec_render_after_id is not None:
+            try:
+                self.root.after_cancel(self._spec_render_after_id)
+            except Exception:
+                pass
+            self._spec_render_after_id = None
 
     def _spec_render(self):
-        self._spec_render_pending = False
-        if not hasattr(self, "_spec_line_canvas") or not hasattr(self, "_spec_wf_canvas"):
-            return
+        """Consumer (Tk thread): drain queued frames and draw one coalesced tick."""
+        self._spec_render_after_id = None
+        force = self._spec_force_render
+        self._spec_force_render = False
+
+        # Drain everything the producer queued since the last tick. The lock only
+        # guards the producer/consumer handoff (_spec_pending, _spec_latest);
+        # _spec_rows is touched on the Tk thread only.
         with self._spec_lock:
-            latest = dict(self._spec_latest) if isinstance(self._spec_latest, dict) else None
-            rows = list(self._spec_rows)
-            seq = self._spec_frame_seq
-        if not latest or not rows:
-            return
-        if seq == self._spec_last_rendered_seq:
-            return
-        self._spec_last_rendered_seq = seq
+            new_rows = list(self._spec_pending)
+            self._spec_pending.clear()
+            if new_rows:
+                self._spec_latest = new_rows[-1]
+        for entry in new_rows:
+            self._spec_rows.append(entry)
+        latest = self._spec_latest
 
-        vals = latest.get("row", [])
-        if not vals:
+        if latest is not None and self._is_adv_tab_selected("SPEC") and (new_rows or force):
+            vmin, vmax = self._spec_color_range()
+            if vmin is not None:
+                if new_rows:
+                    self._spec_blit_waterfall_block(
+                        [e["row"] for e in new_rows], vmin, vmax
+                    )
+                self._spec_update_line(latest, vmin, vmax)
+                self._spec_update_wf_labels(latest)
+                self._spec_update_summary(latest)
+
+        if self._spec_stream_enabled:
+            self._spec_render_after_id = self.root.after(
+                self._spec_render_interval_ms, self._spec_render
+            )
+
+    def _spec_color_range(self):
+        """Return the active (vmin, vmax) from the sliders, or (None, None)."""
+        vmin = float(self._vars["spec_vmin"].get())
+        vmax = float(self._vars["spec_vmax"].get())
+        if not (math.isfinite(vmin) and math.isfinite(vmax)) or vmax <= vmin:
+            return None, None
+        return vmin, vmax
+
+    def _spec_autoscale_now(self):
+        """One-shot: fit the color range to the current waterfall history."""
+        rows = self._spec_rows
+        if not rows:
             return
+        vmin = min(r["row_min"] for r in rows)
+        vmax = max(r["row_max"] for r in rows)
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        self._vars["spec_vmin"].set(round(vmin, 1))
+        self._vars["spec_vmax"].set(round(vmax, 1))
+        self._spec_apply_color_range()
 
-        auto = bool(self._vars.get("spec_autoscale", tk.BooleanVar(value=True)).get())
-        if auto:
-            try:
-                vmin = min(min(r["row"]) for r in rows)
-                vmax = max(max(r["row"]) for r in rows)
-            except (TypeError, ValueError):
-                return
-        else:
-            vmin = float(self._vars.get("spec_vmin", tk.DoubleVar(value=-120.0)).get())
-            vmax = float(self._vars.get("spec_vmax", tk.DoubleVar(value=0.0)).get())
-            if not (math.isfinite(vmin) and math.isfinite(vmax)) or vmax <= vmin:
-                return
+    def _spec_apply_color_range(self):
+        """Recolor the entire waterfall under the current range, then redraw once.
 
-        self._spec_line_canvas.delete("all")
-        w = max(10, self._spec_line_canvas.winfo_width())
-        h = max(10, self._spec_line_canvas.winfo_height())
+        Repainting the whole buffer (rather than only new rows) keeps every
+        visible row on the same scale, so the image never mixes color mappings.
+        """
+        vmin, vmax = self._spec_color_range()
+        if vmin is None:
+            return
+        self._spec_repaint_waterfall(vmin, vmax)
+        self._spec_request_render()
+
+    def _spec_ensure_line_items(self):
+        """Create the persistent FFT line + label items once."""
+        if self._spec_line_item is not None:
+            return
+        c = self._spec_line_canvas
+        self._spec_line_item = c.create_line(0, 0, 0, 0, fill="#6ad7ff", width=1)
+        self._spec_line_labels = {
+            "title": c.create_text(6, 6, anchor="nw", fill="#cccccc", text="Live FFT"),
+            "ylab": c.create_text(6, 0, anchor="w", fill="#aaaaaa", text="Amplitude (dB)"),
+            "vmax": c.create_text(6, 20, anchor="nw", fill="#888888", text=""),
+            "vmin": c.create_text(6, 0, anchor="sw", fill="#888888", text=""),
+            "f0": c.create_text(6, 0, anchor="sw", fill="#aaaaaa", text=""),
+            "f1": c.create_text(0, 0, anchor="se", fill="#aaaaaa", text=""),
+            "fmid": c.create_text(0, 0, anchor="s", fill="#aaaaaa", text="Frequency"),
+        }
+
+    def _spec_update_line(self, latest: dict, vmin: float, vmax: float):
+        """Update the FFT line + labels in place (resampled to the chosen bin count)."""
+        c = self._spec_line_canvas
+        self._spec_ensure_line_items()
+        native = latest["row"]
+        vals = self._spec_resample(native, self._spec_bins)
+        w = max(10, c.winfo_width())
+        h = max(10, c.winfo_height())
         n = len(vals)
-        points = []
-        for i, v in enumerate(vals):
-            x = int(i * (w - 1) / max(1, n - 1))
-            try:
-                fv = float(v)
-            except (TypeError, ValueError):
-                fv = vmin
-            if not math.isfinite(fv):
-                fv = vmin
-            y_norm = 0.0 if vmax <= vmin else (fv - vmin) / (vmax - vmin)
-            y_norm = 0.0 if y_norm < 0.0 else (1.0 if y_norm > 1.0 else y_norm)
-            y = int((1.0 - y_norm) * (h - 1))
-            points.extend((x, y))
-        if len(points) >= 4:
-            self._spec_line_canvas.create_line(*points, fill="#6ad7ff", width=1)
-        self._spec_line_canvas.create_text(6, 6, anchor="nw", fill="#cccccc", text="Live FFT")
-        self._spec_line_canvas.create_text(6, h // 2, anchor="w", fill="#aaaaaa", text="Amplitude (dB)")
-        self._spec_line_canvas.create_text(6, 20, anchor="nw", fill="#888888", text=f"max {self._spec_fmt_amp(vmax)}")
-        self._spec_line_canvas.create_text(6, h - 20, anchor="sw", fill="#888888", text=f"min {self._spec_fmt_amp(vmin)}")
-        f0, f1 = self._spec_get_abs_freq_limits(latest, n)
-        self._spec_line_canvas.create_text(6, h - 4, anchor="sw", fill="#aaaaaa",
-                                           text=self._spec_fmt_freq(f0))
-        self._spec_line_canvas.create_text(w - 6, h - 4, anchor="se", fill="#aaaaaa",
-                                           text=self._spec_fmt_freq(f1))
-        self._spec_line_canvas.create_text(w // 2, h - 4, anchor="s", fill="#aaaaaa",
-                                           text="Frequency")
+        xs = (np.arange(n) * (w - 1) / max(1, n - 1)).astype(int)
+        y_norm = np.clip((vals - vmin) / (vmax - vmin), 0.0, 1.0)
+        ys = ((1.0 - y_norm) * (h - 1)).astype(int)
+        pts = np.empty(n * 2, dtype=int)
+        pts[0::2] = xs
+        pts[1::2] = ys
+        c.coords(self._spec_line_item, *pts.tolist())
+        f0, f1, is_hz = self._spec_freq_axis(latest, len(native))
+        lbl = self._spec_line_labels
+        c.coords(lbl["ylab"], 6, h // 2)
+        c.itemconfig(lbl["vmax"], text=f"max {self._spec_fmt_amp(vmax)}")
+        c.coords(lbl["vmin"], 6, h - 20)
+        c.itemconfig(lbl["vmin"], text=f"min {self._spec_fmt_amp(vmin)}")
+        c.coords(lbl["f0"], 6, h - 4)
+        c.itemconfig(lbl["f0"], text=self._spec_fmt_axis(f0, is_hz))
+        c.coords(lbl["f1"], w - 6, h - 4)
+        c.itemconfig(lbl["f1"], text=self._spec_fmt_axis(f1, is_hz))
+        c.coords(lbl["fmid"], w // 2, h - 4)
 
-        self._spec_render_waterfall_row(vals, vmin, vmax)
-        self._spec_wf_canvas.delete("specwf_label")
-        wf_w = max(10, self._spec_wf_canvas.winfo_width())
-        wf_h = max(10, self._spec_wf_canvas.winfo_height())
-        self._spec_wf_canvas.create_text(6, 6, anchor="nw", fill="#cccccc",
-                                         text="Waterfall", tags=("specwf_label",))
+    def _spec_ensure_wf_items(self):
+        """Create the persistent waterfall overlay label items once."""
+        if self._spec_wf_labels:
+            return
+        c = self._spec_wf_canvas
+        self._spec_wf_labels = {
+            "title": c.create_text(6, 6, anchor="nw", fill="#cccccc", text="Waterfall"),
+            "now": c.create_text(0, 6, anchor="n", fill="#aaaaaa", text="now"),
+            "span": c.create_text(0, 0, anchor="s", fill="#aaaaaa", text=""),
+            "tlab": c.create_text(0, 0, anchor="s", fill="#aaaaaa", text="Time"),
+            "f0": c.create_text(6, 0, anchor="sw", fill="#aaaaaa", text=""),
+            "f1": c.create_text(0, 0, anchor="se", fill="#aaaaaa", text=""),
+        }
+        for item in self._spec_wf_labels.values():
+            c.tag_raise(item)
+
+    def _spec_update_wf_labels(self, latest: dict):
+        """Update waterfall overlay labels in place (kept above the image item)."""
+        c = self._spec_wf_canvas
+        self._spec_ensure_wf_items()
+        w = max(10, c.winfo_width())
+        h = max(10, c.winfo_height())
+        n = len(latest["row"])
+        f0, f1, is_hz = self._spec_freq_axis(latest, n)
+        lbl = self._spec_wf_labels
+        c.coords(lbl["now"], w // 2, 6)
         scan_t = latest.get("scan_time")
         if isinstance(scan_t, (int, float)) and scan_t > 0:
-            visible_rows = max(1, len(self._spec_wf_row_tags))
-            span = scan_t * visible_rows
-            self._spec_wf_canvas.create_text(wf_w // 2, 6,
-                                             anchor="n", fill="#aaaaaa", text="now",
-                                             tags=("specwf_label",))
-            self._spec_wf_canvas.create_text(wf_w // 2, wf_h - 4,
-                                             anchor="s", fill="#aaaaaa",
-                                             text=f"-{span:.1f} s", tags=("specwf_label",))
-        self._spec_wf_canvas.create_text(wf_w // 2,
-                                         wf_h - 20,
-                                         anchor="s", fill="#aaaaaa", text="Time",
-                                         tags=("specwf_label",))
-        self._spec_wf_canvas.create_text(6, self._spec_wf_canvas.winfo_height() - 18,
-                                         anchor="sw", fill="#aaaaaa", text=self._spec_fmt_freq(f0),
-                                         tags=("specwf_label",))
-        self._spec_wf_canvas.create_text(self._spec_wf_canvas.winfo_width() - 6,
-                                         self._spec_wf_canvas.winfo_height() - 18,
-                                         anchor="se", fill="#aaaaaa", text=self._spec_fmt_freq(f1),
-                                         tags=("specwf_label",))
+            span = scan_t * max(1, self._spec_wf_fill)
+            c.coords(lbl["span"], w // 2, h - 4)
+            c.itemconfig(lbl["span"], text=f"-{span:.1f} s", state="normal")
+        else:
+            c.itemconfig(lbl["span"], state="hidden")
+        c.coords(lbl["tlab"], w // 2, h - 20)
+        c.coords(lbl["f0"], 6, h - 18)
+        c.itemconfig(lbl["f0"], text=self._spec_fmt_axis(f0, is_hz))
+        c.coords(lbl["f1"], w - 6, h - 18)
+        c.itemconfig(lbl["f1"], text=self._spec_fmt_axis(f1, is_hz))
+        for item in lbl.values():
+            c.tag_raise(item)
 
+    def _spec_update_summary(self, latest: dict):
         if "spec_summary" in self._vars:
-            ts = latest.get("ts", "?")
-            cf = latest.get("center_frequency", "?")
-            sr = latest.get("sample_rate", "?")
-            n_in = latest.get("n", "?")
             self._vars["spec_summary"].set(
-                f"ts={ts}   cf={cf} Hz   sr={sr} Hz   bins={n_in}"
+                f"ts={latest.get('ts', '?')}   cf={latest.get('center_frequency', '?')} Hz   "
+                f"sr={latest.get('sample_rate', '?')} Hz   bins={self._spec_bins} (src {latest.get('n', '?')})"
             )
 
     def _mqtt_publish_manual(self):
