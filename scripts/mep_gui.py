@@ -2074,29 +2074,18 @@ class MEPGui:
 
     def _mqtt_topic_is_suppressed(self, topic: str) -> bool:
         topic = (topic or "").strip().lower()
-        rules = []
+        parts = [p for p in topic.split("/") if p]
 
         if bool(self._vars.get("mqtt_suppress_announce", tk.BooleanVar(value=False)).get()):
-            rules.extend([
-                "afe/announce",
-            ])
+            if "announce" in parts:
+                return True
 
         if bool(self._vars.get("mqtt_suppress_data", tk.BooleanVar(value=False)).get()):
-            parts = [p for p in topic.split("/") if p]
             if "data" in parts:
                 return True
 
         if bool(self._vars.get("mqtt_suppress_status", tk.BooleanVar(value=False)).get()):
-            rules.extend([
-                "rfsoc/status",
-                "recorder/status",
-                "tuner_control/status",
-                "afe/status",
-                "afe/status/#",
-            ])
-
-        for pattern in rules:
-            if self.bus.topic_matches(topic, pattern.lower()):
+            if "status" in parts:
                 return True
         return False
 
