@@ -1355,7 +1355,7 @@ class MEPGui:
             "write", lambda *_: self._mqtt_render_from_buffer())
 
         self._vars["mqtt_suppress_data"] = tk.BooleanVar(value=True)
-        ttk.Checkbutton(suppress_f, text="radiohound/clients/data/#",
+        ttk.Checkbutton(suppress_f, text="+/data/+",
                         variable=self._vars["mqtt_suppress_data"]).grid(
             row=0, column=1, sticky="w", padx=5, pady=(2, 4))
         self._vars["mqtt_suppress_data"].trace_add(
@@ -2082,9 +2082,9 @@ class MEPGui:
             ])
 
         if bool(self._vars.get("mqtt_suppress_data", tk.BooleanVar(value=False)).get()):
-            rules.extend([
-                self.bus.spec_topic,
-            ])
+            parts = [p for p in topic.split("/") if p]
+            if "data" in parts:
+                return True
 
         if bool(self._vars.get("mqtt_suppress_status", tk.BooleanVar(value=False)).get()):
             rules.extend([
