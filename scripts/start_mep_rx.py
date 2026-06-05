@@ -1325,7 +1325,7 @@ class MEPBus:
         # Fire pattern-match listeners
         if isinstance(data, dict):
             for pattern, cb in self._pattern_listeners:
-                if self._mqtt_topic_matches(msg.topic, pattern):
+                if self.topic_matches(msg.topic, pattern):
                     cb(msg.topic, data)
 
     def _on_disconnect(self, client, userdata, rc):
@@ -1335,7 +1335,7 @@ class MEPBus:
             logging.warning(f"MQTT unexpectedly disconnected: rc={rc}")
         self._emit_connection_state()
 
-    def _mqtt_topic_matches(self, topic: str, pattern: str) -> bool:
+    def topic_matches(self, topic: str, pattern: str) -> bool:
         """Check if topic matches MQTT wildcard pattern.
         
         '+' matches exactly one level between slashes

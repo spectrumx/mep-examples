@@ -1355,7 +1355,7 @@ class MEPGui:
             "write", lambda *_: self._mqtt_render_from_buffer())
 
         self._vars["mqtt_suppress_data"] = tk.BooleanVar(value=True)
-        ttk.Checkbutton(suppress_f, text="+/data/+",
+        ttk.Checkbutton(suppress_f, text="radiohound/clients/data/#",
                         variable=self._vars["mqtt_suppress_data"]).grid(
             row=0, column=1, sticky="w", padx=5, pady=(2, 4))
         self._vars["mqtt_suppress_data"].trace_add(
@@ -2073,31 +2073,31 @@ class MEPGui:
         )
 
     def _mqtt_topic_is_suppressed(self, topic: str) -> bool:
-        topic_lower = (topic or "").lower()
+        topic = (topic or "").strip().lower()
+        rules = []
 
-        suppress_announce = bool(
-            self._vars.get("mqtt_suppress_announce", tk.BooleanVar(value=False)).get()
-        )
-        if suppress_announce and "announce" in topic_lower:
-            return True
+        if bool(self._vars.get("mqtt_suppress_announce", tk.BooleanVar(value=False)).get()):
+            rules.extend([
+                "afe/announce",
+            ])
 
-        suppress_data = bool(
-            self._vars.get("mqtt_suppress_data", tk.BooleanVar(value=False)).get()
-        )
-        if suppress_data:
-            parts = [p for p in topic_lower.split("/") if p]
-            # Match MQTT shape +/data/+ (three levels with middle level "data").
-            if len(parts) == 3 and parts[1] == "data":
+        if bool(self._vars.get("mqtt_suppress_data", tk.BooleanVar(value=False)).get()):
+            rules.extend([
+                self.bus.spec_topic,
+            ])
+
+        if bool(self._vars.get("mqtt_suppress_status", tk.BooleanVar(value=False)).get()):
+            rules.extend([
+                "rfsoc/status",
+                "recorder/status",
+                "tuner_control/status",
+                "afe/status",
+                "afe/status/#",
+            ])
+
+        for pattern in rules:
+            if self.bus.topic_matches(topic, pattern.lower()):
                 return True
-
-        suppress_status = bool(
-            self._vars.get("mqtt_suppress_status", tk.BooleanVar(value=False)).get()
-        )
-        if suppress_status:
-            parts = [p for p in topic_lower.split("/") if p]
-            if "status" in parts:
-                return True
-
         return False
 
     def _mqtt_flush_buffer_to_widget(self):
