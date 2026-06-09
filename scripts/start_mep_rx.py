@@ -2199,10 +2199,13 @@ class CaptureController:
 
         if self.capture_name:
             channel_dir = f"{self.capture_name}/data/ch{self.channel}"
+            spectrogram_subdir = f"{self.capture_name}/data/ch{self.channel}/spectrograms"
         else:
             channel_dir = f"/data/captures/preview/data/ch{self.channel}"
+            spectrogram_subdir = f"preview/data/ch{self.channel}/spectrograms"
 
         self.bus.recorder_config_set("drf_sink.channel_dir", channel_dir)
+        self.bus.recorder_config_set("spectrogram_output.plot_subdir", spectrogram_subdir)
         self.bus.recorder_config_set("basic_network.dst_port", str(dst_port))
         state = self.get_conjugate_state()
         apply_conjugate = bool(state["apply_conjugate"])
