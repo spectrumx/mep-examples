@@ -15,12 +15,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # ==== User inputs ==== #
-capture_name = "livestream"           # name of the capture folder
-sample_rate_folder_name = "sr32MHz"   # sample rate folder
+capture_name = "preview"              # capture folder under /data/captures
 channel = "chC"                       # channel to read
 
 # ==== Open the reader ==== #
-rootdir = Path("/data/captures") / capture_name / sample_rate_folder_name
+rootdir = Path("/data/captures") / capture_name / "data"
 dro = digital_rf.DigitalRFReader(str(rootdir))
 print("Channels in this capture:", dro.get_channels())
 
