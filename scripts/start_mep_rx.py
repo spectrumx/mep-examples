@@ -2192,11 +2192,7 @@ class CaptureController:
             "response_topic": "recorder/config/response",
         })
 
-        if (
-            not self.capture_name
-            and self._active_sample_rate is not None
-            and self.sample_rate_mhz != self._active_sample_rate
-        ):
+        if not self.capture_name:
             self._clear_preview_data_dir()
 
         self.bus.recorder_config_set("packet.freq_idx_offset", str(freq_idx_offset))
