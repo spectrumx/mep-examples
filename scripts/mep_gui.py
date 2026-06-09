@@ -1769,7 +1769,13 @@ class MEPGui:
             y = 0 if event.y < 0 else (h - 1 if event.y >= h else event.y)
             row_offset = min(int(y), len(rows) - 1)
             entry = rows[-1 - row_offset]
-            amp = float(entry["row"][idx])
+            entry_row = entry["row"]
+            entry_n = len(entry_row)
+            if entry_n <= 0:
+                return
+            entry_idx = int(round(idx * (entry_n - 1) / max(1, n - 1)))
+            entry_idx = 0 if entry_idx < 0 else (entry_n - 1 if entry_idx >= entry_n else entry_idx)
+            amp = float(entry_row[entry_idx])
             ts = entry.get("ts", "?")
         else:
             amp = float(row_latest[idx])
