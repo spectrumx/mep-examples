@@ -28,6 +28,7 @@ import time
 import logging
 import json
 import os
+import shutil
 import re
 import math
 import socket
@@ -92,6 +93,7 @@ TUNER_OPTIONS       = ["None"] + list(TUNER_INJECTION_SIDE.keys()) + ["auto"]
 
 RECORDER_CONFIG_DIR = "/opt/radiohound/docker/recorder/configs"
 DOCKER_COMPOSE_DIR = "/opt/radiohound/docker"
+PREVIEW_DATA_DIR = "/data/captures/preview/data"
 
 GREEN = "\033[92m"
 RESET = "\033[0m"
@@ -2162,6 +2164,11 @@ class CaptureController:
     #  Recorder recipe (sweep orchestration)                               #
     # ------------------------------------------------------------------ #
 
+    def _clear_preview_data_dir(self):
+        if os.path.isdir(PREVIEW_DATA_DIR):
+            logging.info("Preview sample rate changed: clearing %s", PREVIEW_DATA_DIR)
+            shutil.rmtree(PREVIEW_DATA_DIR)
+
     def start_recorder(self, freq_idx_offset: float = 0.0):
         """Configure and enable the DigitalRF recorder."""
         if not self._require_mqtt("start recorder"):
@@ -2184,6 +2191,13 @@ class CaptureController:
             "arguments": {"name": config_name},
             "response_topic": "recorder/config/response",
         })
+
+        if (
+            not self.capture_name
+            and self._active_sample_rate is not None
+            and self.sample_rate_mhz != self._active_sample_rate
+        ):
+            self._clear_preview_data_dir()
 
         self.bus.recorder_config_set("packet.freq_idx_offset", str(freq_idx_offset))
 
