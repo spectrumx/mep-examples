@@ -2188,9 +2188,9 @@ class CaptureController:
         self.bus.recorder_config_set("packet.freq_idx_offset", str(freq_idx_offset))
 
         if self.capture_name:
-            channel_dir = f"{self.capture_name}/{config_name}/ch{self.channel}"
+            channel_dir = f"{self.capture_name}/data/ch{self.channel}"
         else:
-            channel_dir = f"/data/captures/livestream/{config_name}/ch{self.channel}"
+            channel_dir = f"/data/captures/preview/data/ch{self.channel}"
 
         self.bus.recorder_config_set("drf_sink.channel_dir", channel_dir)
         self.bus.recorder_config_set("basic_network.dst_port", str(dst_port))
