@@ -35,6 +35,8 @@ import math
 import socket
 import subprocess
 import queue
+import copy
+from fractions import Fraction
 from collections import deque
 from datetime import datetime
 import threading
@@ -78,7 +80,7 @@ SPEC_TOPIC_PATTERN    = "radiohound/clients/data/#"
 # Topics that support synchronous _wait_for_status() during sweep orchestration
 _SYNC_STATUS_TOPICS = (RFSOC_STATUS_TOPIC, RECORDER_STATUS_TOPIC, TUNER_STATUS_TOPIC)
 
-# Owned by the Recorder service. This is not the source of truth of this information.
+# Owned by the FPGA UDP packet emitter. This is not the source of truth of this information.
 RECORDER_CHANNEL_PORTS = {"A": 60134, "B": 60133, "C": 60132, "D": 60131}
 
 TUNER_INJECTION_SIDE = {
@@ -172,6 +174,237 @@ def discover_sample_rate_options(recorder_config_dir: str = RECORDER_CONFIG_DIR)
         return default_rates.copy()
     
     return [str(rate) for rate in sorted(rates)]
+
+
+def _load_yaml_mapping(path: str) -> dict:
+    """Load one recorder YAML file without making YAML a GUI dependency."""
+    try:
+        from ruamel.yaml import YAML
+
+        with open(path, "r", encoding="utf-8") as fh:
+            data = YAML(typ="safe").load(fh)
+    except ImportError:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise RuntimeError(
+                "Recorder preset parsing requires ruamel.yaml or PyYAML"
+            ) from exc
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"Recorder preset must contain a YAML mapping: {path}")
+    return data
+
+
+def _set_dotted_value(mapping: dict, key: str, value):
+    """Apply recorder-service-style dotted configuration replacement."""
+    parts = key.split(".")
+    target = mapping
+    for part in parts[:-1]:
+        child = target.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            target[part] = child
+        target = child
+    target[parts[-1]] = value
+
+
+def recorder_preset_path(sample_rate_mhz: int, config_dir: str = None) -> tuple[str, str]:
+    """Return the authoritative path and availability of the selected preset."""
+    config_dir = config_dir or RECORDER_CONFIG_DIR
+    filename = f"sr{int(sample_rate_mhz)}MHz.yaml"
+    deployed_path = os.path.join(config_dir, filename)
+    if os.path.isfile(deployed_path):
+        return deployed_path, "deployed"
+    return deployed_path, "unavailable"
+
+
+def resolve_recorder_preset(
+    sample_rate_mhz: int,
+    overrides: dict[str, object] = None,
+    config_dir: str = None,
+) -> dict:
+    """Resolve a recorder preset into editable values and calculated metrics."""
+    preset_name = f"sr{int(sample_rate_mhz)}MHz"
+    path, source = recorder_preset_path(sample_rate_mhz, config_dir)
+    base = {
+        "available": False,
+        "preset_name": preset_name,
+        "preset_path": path,
+        "preset_source": source,
+        "error": None,
+        "values": {},
+        "metrics": {},
+        "enabled_resamplers": [],
+    }
+    if source == "unavailable":
+        base["error"] = f"Recorder preset not found: {path}"
+        return base
+
+    try:
+        config = copy.deepcopy(_load_yaml_mapping(path))
+        for key, value in (overrides or {}).items():
+            _set_dotted_value(config, key, value)
+
+        packet = config["packet"]
+        pipeline = config["pipeline"]
+        spectrogram = config["spectrogram"]
+        output = config["spectrogram_output"]
+        metadata = packet["header_metadata"]
+
+        input_rate = Fraction(
+            int(metadata["sample_rate_numerator"]),
+            int(metadata.get("sample_rate_denominator", 1)),
+        )
+        chunk_size = int(packet["num_samples"])
+        if input_rate <= 0 or chunk_size <= 0:
+            raise ValueError("Input sample rate and packet.num_samples must be positive")
+
+        effective_rate = input_rate
+        enabled_resamplers = []
+        for name in ("resampler0", "resampler1", "resampler2"):
+            if not bool(pipeline.get(name, False)):
+                continue
+            params = config.get(name)
+            if not isinstance(params, dict):
+                raise ValueError(f"{name} is enabled but has no configuration")
+            up = int(params["up"])
+            down = int(params["down"])
+            if up <= 0 or down <= 0:
+                raise ValueError(f"{name}.up and {name}.down must be positive")
+            scaled_chunk = chunk_size * up
+            if scaled_chunk % down:
+                raise ValueError(
+                    f"{name} produces a non-integral chunk: {chunk_size} * {up} / {down}"
+                )
+            chunk_size = scaled_chunk // down
+            effective_rate *= Fraction(up, down)
+            enabled_resamplers.append({"name": name, "up": up, "down": down})
+
+        nperseg = int(spectrogram.get("nperseg", 1024))
+        noverlap_raw = spectrogram.get("noverlap")
+        noverlap = nperseg // 2 if noverlap_raw is None else int(noverlap_raw)
+        nfft_raw = spectrogram.get("nfft")
+        nfft = nperseg if nfft_raw is None else int(nfft_raw)
+        spectra_per_chunk = int(spectrogram.get("num_spectra_per_chunk", 1))
+        spectra_per_output = int(output.get("num_spectra_per_output", 600))
+        if nperseg <= 0 or nfft < nperseg:
+            raise ValueError("nperseg must be positive and nfft must be >= nperseg")
+        if noverlap < 0 or noverlap >= nperseg:
+            raise ValueError("noverlap must satisfy 0 <= noverlap < nperseg")
+        if spectra_per_chunk <= 0 or chunk_size % spectra_per_chunk:
+            raise ValueError("num_spectra_per_chunk must evenly divide the effective chunk")
+        if spectra_per_output <= 0:
+            raise ValueError("num_spectra_per_output must be positive")
+
+        samples_per_row = chunk_size // spectra_per_chunk
+        if samples_per_row < nperseg:
+            raise ValueError("nperseg does not fit in each spectrum input chunk")
+        hop_samples = nperseg - noverlap
+        segments_per_row = 1 + (samples_per_row - nperseg) // hop_samples
+        scan_time = Fraction(samples_per_row, 1) / effective_rate
+        fft_hop_time = Fraction(hop_samples, 1) / effective_rate
+        frequency_resolution = effective_rate / nfft
+        waterfall_duration = scan_time * spectra_per_output
+
+        values = {
+            "nperseg": nperseg,
+            "nfft": nfft,
+            "noverlap": noverlap,
+            "window": str(spectrogram.get("window", "hann")),
+            "reduce_op": str(spectrogram.get("reduce_op", "max")),
+            "num_spectra_per_chunk": spectra_per_chunk,
+            "num_spectra_per_output": spectra_per_output,
+            "snr_db_min": float(output.get("snr_db_min", -5)),
+            "snr_db_max": float(output.get("snr_db_max", 20)),
+            "cmap": str(output.get("cmap", "viridis")),
+            "dpi": int(output.get("dpi", 200)),
+            "figsize": tuple(output.get("figsize", (6.4, 4.8))),
+            "compute": bool(pipeline.get("spectrogram", True)),
+            "mqtt": bool(pipeline.get("spectrogram_mqtt", True)),
+            "output": bool(pipeline.get("spectrogram_output", True)),
+        }
+        metrics = {
+            "input_sample_rate_hz": float(input_rate),
+            "effective_sample_rate_hz": float(effective_rate),
+            "input_chunk_size": int(packet["num_samples"]),
+            "effective_chunk_size": chunk_size,
+            "frequency_bins": nfft,
+            "frequency_resolution_hz": float(frequency_resolution),
+            "fft_hop_samples": hop_samples,
+            "fft_hop_time_s": float(fft_hop_time),
+            "segments_per_row": segments_per_row,
+            "samples_per_row": samples_per_row,
+            "scan_time_s": float(scan_time),
+            "spectrum_rate_hz": float(1 / scan_time),
+            "waterfall_rows": spectra_per_output,
+            "waterfall_duration_s": float(waterfall_duration),
+        }
+        base.update(
+            available=True,
+            values=values,
+            metrics=metrics,
+            enabled_resamplers=enabled_resamplers,
+            config=config,
+        )
+    except Exception as exc:
+        base["error"] = f"Invalid recorder preset {path}: {exc}"
+    return base
+
+
+def recorder_draft_to_overrides(draft: dict[str, object]) -> dict[str, object]:
+    """Validate GUI-neutral draft values and map them to recorder config keys."""
+    figsize_value = draft["figsize"]
+    if isinstance(figsize_value, str):
+        figsize = tuple(float(part.strip()) for part in figsize_value.split(","))
+    else:
+        figsize = tuple(float(part) for part in figsize_value)
+    if len(figsize) != 2 or any(value <= 0 for value in figsize):
+        raise ValueError("Figure size must contain two positive values")
+
+    return {
+        "spectrogram.nperseg": int(draft["nperseg"]),
+        "spectrogram.nfft": int(draft["nfft"]),
+        "spectrogram.noverlap": int(draft["noverlap"]),
+        "spectrogram.window": str(draft["window"]),
+        "spectrogram.reduce_op": str(draft["reduce_op"]),
+        "spectrogram.num_spectra_per_chunk": int(draft["num_spectra_per_chunk"]),
+        "spectrogram_output.num_spectra_per_output": int(draft["num_spectra_per_output"]),
+        "spectrogram_output.snr_db_min": float(draft["snr_db_min"]),
+        "spectrogram_output.snr_db_max": float(draft["snr_db_max"]),
+        "spectrogram_output.cmap": str(draft["cmap"]),
+        "spectrogram_output.dpi": int(draft["dpi"]),
+        "spectrogram_output.figsize": figsize,
+        "pipeline.spectrogram": bool(draft["compute"]),
+        "pipeline.spectrogram_mqtt": bool(draft["mqtt"]),
+        "pipeline.spectrogram_output": bool(draft["output"]),
+    }
+
+
+def preview_recorder_settings(
+    sample_rate_mhz: int,
+    draft: dict[str, object],
+    config_dir: str = None,
+) -> dict:
+    """Resolve draft REC values without mutating controller or recorder state."""
+    try:
+        overrides = recorder_draft_to_overrides(draft)
+    except (KeyError, TypeError, ValueError) as exc:
+        path, source = recorder_preset_path(sample_rate_mhz, config_dir)
+        return {
+            "available": False,
+            "preset_name": f"sr{int(sample_rate_mhz)}MHz",
+            "preset_path": path,
+            "preset_source": source,
+            "error": f"Invalid REC draft: {exc}",
+            "values": {},
+            "metrics": {},
+            "enabled_resamplers": [],
+        }
+    model = resolve_recorder_preset(sample_rate_mhz, overrides, config_dir)
+    model["overrides"] = overrides
+    return model
 
 
 def derive_spec_topic_from_primary_mac(spec_topic_prefix: str = "radiohound/clients/data/") -> Optional[str]:
@@ -1919,6 +2152,7 @@ class CaptureController:
         self._active_channel = None
         self._active_sample_rate = None
         self._recorder_running = False
+        self.recorder_overrides: dict[str, object] = {}
 
         # ---- Stop flag for sweeps ----
         self._stop_flag = threading.Event()
@@ -2008,6 +2242,46 @@ class CaptureController:
         else:
             self.injection = resolve_injection(tuner, injection)
             self._initialize_tuner_if_needed()
+
+    def set_recorder_overrides(self, overrides: dict[str, object]):
+        """Replace the persistent recorder overrides used after config.load."""
+        self.recorder_overrides = dict(overrides)
+
+    def get_recorder_preset_model(self) -> dict:
+        """Return the selected preset resolved with no REC overrides."""
+        return resolve_recorder_preset(self.sample_rate_mhz)
+
+    def preview_recorder_settings(self, draft: dict[str, object]) -> dict:
+        """Resolve draft REC settings without changing staged state."""
+        return preview_recorder_settings(self.sample_rate_mhz, draft)
+
+    def stage_recorder_settings(self, draft: dict[str, object]) -> dict:
+        """Atomically validate and replace staged REC overrides."""
+        model = self.preview_recorder_settings(draft)
+        if not model.get("available"):
+            raise ValueError(model.get("error") or "Recorder settings are unavailable")
+        self.recorder_overrides = dict(model["overrides"])
+        return model
+
+    def get_staged_recorder_model(self) -> dict:
+        """Return the selected preset resolved with current staged overrides."""
+        return resolve_recorder_preset(self.sample_rate_mhz, self.recorder_overrides)
+
+    def clear_recorder_overrides(self):
+        """Clear the persistent recorder overrides."""
+        self.recorder_overrides.clear()
+
+    def apply_recorder_overrides(self):
+        """Reapply the persistent recorder overrides after config.load."""
+        if not self.recorder_overrides:
+            return
+
+        logging.info(
+            "Applying recorder overrides: %s",
+            ", ".join(sorted(self.recorder_overrides.keys())),
+        )
+        for key, value in self.recorder_overrides.items():
+            self.bus.recorder_config_set(key, value)
 
     # ------------------------------------------------------------------ #
     #  Synchronous wait helpers (used during sweep orchestration)          #
@@ -2224,6 +2498,14 @@ class CaptureController:
         if not self._require_mqtt("start recorder"):
             return False
 
+        recorder_model = self.get_staged_recorder_model()
+        if not recorder_model.get("available"):
+            logging.error(
+                "Recorder preset validation failed before start: %s",
+                recorder_model.get("error") or "unknown error",
+            )
+            return False
+
         if self.channel not in RECORDER_CHANNEL_PORTS:
             raise ValueError(f"channel must be one of {list(RECORDER_CHANNEL_PORTS.keys())}")
 
@@ -2267,6 +2549,7 @@ class CaptureController:
             str(apply_conjugate).lower(),
         )
         self.bus.recorder_config_set("packet.apply_conjugate", str(apply_conjugate).lower())
+        self.apply_recorder_overrides()
 
         # Arm the wait BEFORE sending enable to avoid missing a fast response
         self._status_events[RECORDER_STATUS_TOPIC].clear()

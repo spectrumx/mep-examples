@@ -40,6 +40,8 @@ from start_mep_rx import (
     DockerManager,
     GPSDMonitor,
     get_frequency_list,
+    resolve_recorder_preset,
+    preview_recorder_settings,
     resolve_injection,
     sync_ntp_on_rfsoc,
     get_primary_network_info,
@@ -72,7 +74,6 @@ from start_mep_rx import (
     AFE_REGISTERS_TOPIC,
     MQTT_BROKER,
     MQTT_PORT,
-    RECORDER_CONFIG_DIR,
     DOCKER_COMPOSE_DIR,
 )
 
@@ -209,6 +210,7 @@ class MEPGui:
         # so emit-cached callbacks drain via _pump_gui_queue after the window is first rendered.
         self._mainloop_started = False
         self._conjugate_policy_user_override = False
+        self._rec_pending_overrides = {}
 
         self._vars = {}
         self._init_shared_vars()
@@ -2152,6 +2154,9 @@ class MEPGui:
                     if not widget.selection_present():
                         return
                     sel = widget.selection_get()
+                elif isinstance(widget, (tk.Label, ttk.Label)):
+                    variable_name = str(widget.cget("textvariable"))
+                    sel = self.root.getvar(variable_name) if variable_name else widget.cget("text")
                 else:
                     sel = widget.selection_get()
             except Exception:
@@ -3610,24 +3615,55 @@ class MEPGui:
 
     def _build_rec_tab(self, frame: ttk.Frame):
         frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
 
-        # Status
-        status_frame = ttk.LabelFrame(frame, text="Recorder Status")
-        status_frame.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
+        # Create scrollable area
+        canvas = tk.Canvas(frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollable_frame.columnconfigure(0, weight=1)
+
+        row = 0
+
+        # ===== SUMMARY =====
+        status_frame = ttk.LabelFrame(scrollable_frame, text="Recorder Summary")
+        status_frame.grid(row=row, column=0, padx=4, pady=(4, 2), sticky="ew")
         status_frame.columnconfigure(1, weight=1)
+        row += 1
 
-        ttk.Label(status_frame, text="State").grid(
-            row=0, column=0, sticky="w", padx=5, pady=2)
         self._vars["rec_status"] = tk.StringVar(value="—")
-        _se = ttk.Entry(status_frame, textvariable=self._vars["rec_status"],
-                        state="readonly", width=18)
-        _se.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
-        self._bind_copy_menu(_se, self._vars["rec_status"])
+        self._vars["rec_config_source"] = tk.StringVar(value="—")
+        self._vars["rec_preset_state"] = tk.StringVar(value="Loading preset...")
+        for summary_row, (label, key) in enumerate((
+            ("Recorder state", "rec_status"),
+            ("Preset file", "rec_config_source"),
+            ("Preset status", "rec_preset_state"),
+        )):
+            ttk.Label(status_frame, text=label).grid(
+                row=summary_row, column=0, sticky="w", padx=5, pady=2)
+            entry = ttk.Entry(
+                status_frame, textvariable=self._vars[key], state="readonly", width=18
+            )
+            entry.grid(row=summary_row, column=1, sticky="ew", padx=5, pady=2)
+        ttk.Label(
+            status_frame,
+            text="Applied REC settings take effect on the next recording; running recorders are not reconfigured.",
+            wraplength=420,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 5))
 
-        # Packet Conjugate
-        conj_frame = ttk.LabelFrame(frame, text="packet.apply_conjugate OVERRIDE")
-        conj_frame.grid(row=1, column=0, padx=4, pady=6, sticky="ew")
+        # ===== PACKET CONJUGATE =====
+        conj_frame = ttk.LabelFrame(scrollable_frame, text="packet.apply_conjugate OVERRIDE")
+        conj_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
         conj_frame.columnconfigure(1, weight=1)
+        row += 1
 
         ttk.Label(conj_frame, text="Policy").grid(
             row=0, column=0, sticky="w", padx=5, pady=4)
@@ -3655,111 +3691,174 @@ class MEPGui:
         ttk.Entry(conj_frame, textvariable=self._vars["conjugate_actual"],
                  state="readonly", width=12).grid(
             row=1, column=1, sticky="ew", padx=5, pady=4)
-        
-        help_text = (
-            "Auto: follows tuner selection logic\n"
-            "  No tuner → apply_conjugate = false\n"
-            "  High-side LO → apply_conjugate = true\n"
-            "  Low-side LO → apply_conjugate = false\n\n"
-            "Force On: apply_conjugate = true\n"
-            "Force Off: apply_conjugate = false"
-        )
-        ttk.Label(conj_frame, text="ⓘ", foreground="gray").grid(
-            row=2, column=0, sticky="w", padx=5, pady=2)
-        help_label = ttk.Label(conj_frame, text=help_text, justify="left",
-                              foreground="gray", font=("TkDefaultFont", 9))
-        help_label.grid(row=2, column=1, sticky="ew", padx=5, pady=2)
-        help_label.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
-        # Spectrograms
-        sg_frame = ttk.LabelFrame(frame, text="Spectrograms")
-        sg_frame.grid(row=2, column=0, padx=4, pady=6, sticky="ew")
-        sg_frame.columnconfigure(1, weight=1)
+        # ===== FREQUENCY RESOLUTION =====
+        fft_frame = ttk.LabelFrame(scrollable_frame, text="Frequency Resolution")
+        fft_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
+        fft_frame.columnconfigure(1, weight=1)
+        fft_frame.columnconfigure(3, weight=1)
+        row += 1
 
-        self._vars["sg_compute"] = tk.BooleanVar(value=True)
-        self._vars["sg_mqtt"]    = tk.BooleanVar(value=True)
-        self._vars["sg_output"]  = tk.BooleanVar(value=True)
-        sg_check_frame = ttk.Frame(sg_frame)
-        sg_check_frame.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        ttk.Checkbutton(sg_check_frame, text="Compute",
+        self._vars["calc_freq_formula"] = tk.StringVar(value="—")
+        self._vars["calc_hop_formula"] = tk.StringVar(value="—")
+        self._vars["calc_segments"] = tk.StringVar(value="—")
+        ttk.Label(fft_frame, textvariable=self._vars["calc_freq_formula"],
+                  justify="left", wraplength=420).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=5, pady=(4, 2))
+        ttk.Label(fft_frame, textvariable=self._vars["calc_hop_formula"],
+                  justify="left", wraplength=420).grid(
+            row=1, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+        ttk.Label(fft_frame, textvariable=self._vars["calc_segments"],
+                  justify="left", wraplength=420).grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=5, pady=(2, 5))
+
+        ttk.Label(fft_frame, text="Segment length (nperseg)").grid(row=3, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_nperseg"] = tk.StringVar(value="")
+        ttk.Entry(fft_frame, textvariable=self._vars["sg_nperseg"], width=10).grid(
+            row=3, column=1, sticky="ew", padx=5, pady=3)
+
+        ttk.Label(fft_frame, text="FFT bins (nfft)").grid(row=3, column=2, sticky="w", padx=5, pady=3)
+        self._vars["sg_nfft"] = tk.StringVar(value="")
+        ttk.Entry(fft_frame, textvariable=self._vars["sg_nfft"], width=10).grid(
+            row=3, column=3, sticky="ew", padx=5, pady=3)
+
+        ttk.Label(fft_frame, text="Overlap (noverlap)").grid(row=4, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_noverlap"] = tk.StringVar(value="")
+        ttk.Entry(fft_frame, textvariable=self._vars["sg_noverlap"], width=10).grid(
+            row=4, column=1, sticky="ew", padx=5, pady=3)
+
+        ttk.Label(fft_frame, text="Window").grid(row=4, column=2, sticky="w", padx=5, pady=3)
+        self._vars["sg_window"] = tk.StringVar(value="")
+        ttk.Combobox(fft_frame, textvariable=self._vars["sg_window"],
+                     values=["hann", "hamming", "blackman", "rectangular"], width=10, state="readonly").grid(
+            row=4, column=3, sticky="ew", padx=5, pady=3)
+
+        # ===== ROW CADENCE =====
+        cadence_frame = ttk.LabelFrame(scrollable_frame, text="Spectrum Row Cadence")
+        cadence_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
+        cadence_frame.columnconfigure(1, weight=1)
+        cadence_frame.columnconfigure(3, weight=1)
+        row += 1
+
+        self._vars["calc_cadence_formula"] = tk.StringVar(value="—")
+        self._vars["calc_resamplers"] = tk.StringVar(value="—")
+        ttk.Label(cadence_frame, textvariable=self._vars["calc_cadence_formula"],
+                  justify="left", wraplength=420).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=5, pady=(4, 2))
+        ttk.Label(cadence_frame, textvariable=self._vars["calc_resamplers"],
+                  justify="left", wraplength=420).grid(
+            row=1, column=0, columnspan=4, sticky="w", padx=5, pady=(2, 5))
+        ttk.Label(cadence_frame, text="Spectra per chunk").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_num_spectra_per_chunk"] = tk.StringVar(value="")
+        ttk.Entry(cadence_frame, textvariable=self._vars["sg_num_spectra_per_chunk"], width=10).grid(
+            row=2, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Label(cadence_frame, text="Reduction").grid(row=2, column=2, sticky="w", padx=5, pady=3)
+        self._vars["sg_reduce_op"] = tk.StringVar(value="")
+        ttk.Combobox(cadence_frame, textvariable=self._vars["sg_reduce_op"],
+                     values=["max", "median", "mean"], width=10, state="readonly").grid(
+            row=2, column=3, sticky="ew", padx=5, pady=3)
+
+        # ===== WATERFALL =====
+        waterfall_frame = ttk.LabelFrame(scrollable_frame, text="Waterfall Duration")
+        waterfall_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
+        waterfall_frame.columnconfigure(1, weight=1)
+        row += 1
+        self._vars["calc_waterfall_formula"] = tk.StringVar(value="—")
+        ttk.Label(waterfall_frame, textvariable=self._vars["calc_waterfall_formula"],
+                  justify="left", wraplength=420).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
+        ttk.Label(waterfall_frame, text="Rows per waterfall").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_spectra_per_output"] = tk.StringVar(value="")
+        ttk.Entry(waterfall_frame, textvariable=self._vars["sg_spectra_per_output"], width=10).grid(
+            row=1, column=1, sticky="ew", padx=5, pady=3)
+
+        # ===== PROCESSING AND OUTPUTS =====
+        disp_frame = ttk.LabelFrame(scrollable_frame, text="Processing and Outputs")
+        disp_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
+        disp_frame.columnconfigure(1, weight=1)
+        disp_frame.columnconfigure(3, weight=1)
+        row += 1
+
+        ttk.Label(disp_frame, text="Color scale min (dB)").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_snr_min"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_snr_min"], width=10).grid(
+            row=0, column=1, sticky="ew", padx=5, pady=3)
+
+        ttk.Label(disp_frame, text="Color scale max (dB)").grid(row=0, column=2, sticky="w", padx=5, pady=3)
+        self._vars["sg_snr_max"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_snr_max"], width=10).grid(
+            row=0, column=3, sticky="ew", padx=5, pady=3)
+
+        ttk.Label(disp_frame, text="Colormap").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_cmap"] = tk.StringVar(value="")
+        ttk.Combobox(disp_frame, textvariable=self._vars["sg_cmap"],
+                     values=["viridis", "plasma", "inferno", "magma", "hot", "jet"], width=10, state="readonly").grid(
+            row=1, column=1, sticky="ew", padx=5, pady=3)
+
+        ttk.Label(disp_frame, text="DPI").grid(row=1, column=2, sticky="w", padx=5, pady=3)
+        self._vars["sg_dpi"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_dpi"], width=10).grid(
+            row=1, column=3, sticky="ew", padx=5, pady=3)
+
+        ttk.Label(disp_frame, text="Figure size (w,h inches)").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_figsize"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_figsize"], width=10).grid(
+            row=2, column=1, columnspan=3, sticky="ew", padx=5, pady=3)
+
+        self._vars["sg_compute"] = tk.BooleanVar(value=False)
+        self._vars["sg_mqtt"]    = tk.BooleanVar(value=False)
+        self._vars["sg_output"]  = tk.BooleanVar(value=False)
+        checks_frame = ttk.Frame(disp_frame)
+        checks_frame.grid(row=3, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+        ttk.Checkbutton(checks_frame, text="Compute",
                         variable=self._vars["sg_compute"]).grid(
             row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Checkbutton(sg_check_frame, text="Stream via MQTT",
+        ttk.Checkbutton(checks_frame, text="Stream MQTT",
                         variable=self._vars["sg_mqtt"]).grid(
             row=0, column=1, sticky="w", padx=(0, 8))
-        ttk.Checkbutton(sg_check_frame, text="Save to disk",
+        ttk.Checkbutton(checks_frame, text="Save to disk",
                         variable=self._vars["sg_output"]).grid(
             row=0, column=2, sticky="w")
 
-        ttk.Separator(sg_frame, orient="horizontal").grid(
-            row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=4)
+        # ===== NEXT-RECORD ACTIONS =====
+        action_frame = ttk.LabelFrame(scrollable_frame, text="REC Settings")
+        action_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
+        for column in range(3):
+            action_frame.columnconfigure(column, weight=1)
+        self._rec_stage_button = ttk.Button(
+            action_frame, text="Apply On Next Record", command=self._stage_rec_settings
+        )
+        self._rec_stage_button.grid(row=0, column=0, padx=4, pady=6, sticky="ew")
+        ttk.Button(action_frame, text="Undo Changes", command=self._rec_discard_draft).grid(
+            row=0, column=1, padx=4, pady=6, sticky="ew")
+        ttk.Button(action_frame, text="Reset to Config File", command=self._rec_reset_config).grid(
+            row=0, column=2, padx=4, pady=6, sticky="ew")
 
-        ttk.Label(sg_frame, text="Reduce Op").grid(
-            row=2, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_reduce_op"] = tk.StringVar(value="max")
-        ttk.Combobox(
-            sg_frame, textvariable=self._vars["sg_reduce_op"],
-            values=["max", "min", "mean"], width=10, state="readonly",
-        ).grid(row=2, column=1, sticky="ew", padx=5, pady=3)
+        def _bind_rec_copy_menus(container):
+            for widget in container.winfo_children():
+                if isinstance(widget, (ttk.Entry, ttk.Combobox, ttk.Spinbox)):
+                    allow_paste = str(widget.cget("state")) not in ("readonly", "disabled")
+                    self._bind_copy_menu(widget, allow_paste=allow_paste)
+                elif isinstance(widget, (tk.Label, ttk.Label)):
+                    self._bind_copy_menu(widget, allow_paste=False)
+                _bind_rec_copy_menus(widget)
 
-        ttk.Label(sg_frame, text="SNR Min (dB)").grid(
-            row=3, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_snr_min"] = tk.StringVar(value="-5")
-        ttk.Entry(sg_frame, textvariable=self._vars["sg_snr_min"], width=8).grid(
-            row=3, column=1, sticky="ew", padx=5, pady=3)
-
-        ttk.Label(sg_frame, text="SNR Max (dB)").grid(
-            row=4, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_snr_max"] = tk.StringVar(value="20")
-        ttk.Entry(sg_frame, textvariable=self._vars["sg_snr_max"], width=8).grid(
-            row=4, column=1, sticky="ew", padx=5, pady=3)
-
-        ttk.Label(sg_frame, text="Spectra per Image").grid(
-            row=5, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_spectra_per_output"] = tk.StringVar(value="600")
-        ttk.Entry(sg_frame, textvariable=self._vars["sg_spectra_per_output"], width=8).grid(
-            row=5, column=1, sticky="ew", padx=5, pady=3)
-
-        ttk.Button(sg_frame, text="Send Now",
-                   command=self._apply_rec_spectrogram).grid(
-            row=6, column=0, columnspan=2, padx=4, pady=6, sticky="ew")
-
-        # DRF Output
-        drf_frame = ttk.LabelFrame(frame, text="DRF Output")
-        drf_frame.grid(row=3, column=0, padx=4, pady=6, sticky="ew")
-        drf_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(drf_frame, text="Batch Size").grid(
-            row=0, column=0, sticky="w", padx=5, pady=3)
-        self._vars["rec_batch_size"] = tk.StringVar(value="625")
-        ttk.Entry(drf_frame, textvariable=self._vars["rec_batch_size"], width=8).grid(
-            row=0, column=1, sticky="ew", padx=5, pady=3)
-
-        ttk.Button(drf_frame, text="Send Now",
-                   command=self._apply_rec_drf).grid(
-            row=1, column=0, columnspan=2, padx=4, pady=6, sticky="ew")
-
-        # Config Load
-        cfg_frame = ttk.LabelFrame(frame, text="Config")
-        cfg_frame.grid(row=4, column=0, padx=4, pady=6, sticky="ew")
-        cfg_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(cfg_frame, text="Active Config").grid(
-            row=0, column=0, sticky="w", padx=5, pady=3)
-        self._vars["rec_active_config"] = tk.StringVar(value="—")
-        config_name = f"sr{self._vars['sample_rate_mhz'].get()}MHz"
-        self._vars["rec_active_config"].set(config_name)
-        ttk.Entry(cfg_frame, textvariable=self._vars["rec_active_config"],
-                  state="readonly", width=12).grid(
-            row=0, column=1, sticky="ew", padx=5, pady=3)
-        ttk.Button(cfg_frame, text="Reload Config",
-                   command=self._rec_reload_config).grid(
-            row=1, column=0, columnspan=2, padx=4, pady=6, sticky="ew")
+        _bind_rec_copy_menus(scrollable_frame)
 
         # Register tab-specific MQTT → UI. Emit-cached fires inline if data exists.
         self.bus.on_status(RECORDER_STATUS_TOPIC,
                           lambda data: self._gui_call(self._rec_status_ui_update, data))
         self._update_conjugate_actual_display()
+        self._rec_trace_busy = False
+        self._rec_load_preset()
+        self._vars["sample_rate_mhz"].trace_add("write", self._on_rec_sample_rate_change)
+        for key in (
+            "sg_nperseg", "sg_nfft", "sg_noverlap", "sg_window", "sg_reduce_op",
+            "sg_num_spectra_per_chunk", "sg_spectra_per_output", "sg_snr_min",
+            "sg_snr_max", "sg_cmap", "sg_dpi", "sg_figsize", "sg_compute",
+            "sg_mqtt", "sg_output",
+        ):
+            self._vars[key].trace_add("write", self._rec_preview_draft)
 
     def _sync_conjugate_policy_ui_from_capture(self):
         """Sync conjugate policy and effective state from CaptureController."""
@@ -4842,46 +4941,185 @@ class MEPGui:
     #  REC helpers
     # ------------------------------------------------------------------ #
 
+    def _on_rec_sample_rate_change(self, *_):
+        if "rec_config_source" not in self._vars:
+            return
+        self._rec_pending_overrides.clear()
+        if self.capture is not None:
+            self.capture.clear_recorder_overrides()
+        self._rec_load_preset()
+
+    def _rec_sample_rate_mhz(self) -> int:
+        return int(float(self._vars["sample_rate_mhz"].get()))
+
+    def _rec_collect_draft(self) -> dict:
+        """Collect widget values only; recorder parsing belongs to start_mep_rx."""
+        return {
+            "nperseg": self._vars["sg_nperseg"].get(),
+            "nfft": self._vars["sg_nfft"].get(),
+            "noverlap": self._vars["sg_noverlap"].get(),
+            "window": self._vars["sg_window"].get(),
+            "reduce_op": self._vars["sg_reduce_op"].get(),
+            "num_spectra_per_chunk": self._vars["sg_num_spectra_per_chunk"].get(),
+            "num_spectra_per_output": self._vars["sg_spectra_per_output"].get(),
+            "snr_db_min": self._vars["sg_snr_min"].get(),
+            "snr_db_max": self._vars["sg_snr_max"].get(),
+            "cmap": self._vars["sg_cmap"].get(),
+            "dpi": self._vars["sg_dpi"].get(),
+            "figsize": self._vars["sg_figsize"].get(),
+            "compute": self._vars["sg_compute"].get(),
+            "mqtt": self._vars["sg_mqtt"].get(),
+            "output": self._vars["sg_output"].get(),
+        }
+
+    def _rec_set_draft_values(self, values: dict):
+        self._rec_trace_busy = True
+        try:
+            field_map = {
+                "sg_nperseg": "nperseg",
+                "sg_nfft": "nfft",
+                "sg_noverlap": "noverlap",
+                "sg_window": "window",
+                "sg_reduce_op": "reduce_op",
+                "sg_num_spectra_per_chunk": "num_spectra_per_chunk",
+                "sg_spectra_per_output": "num_spectra_per_output",
+                "sg_snr_min": "snr_db_min",
+                "sg_snr_max": "snr_db_max",
+                "sg_cmap": "cmap",
+                "sg_dpi": "dpi",
+            }
+            for widget_key, value_key in field_map.items():
+                self._vars[widget_key].set(str(values[value_key]))
+            self._vars["sg_figsize"].set(
+                ",".join(f"{float(value):g}" for value in values["figsize"])
+            )
+            self._vars["sg_compute"].set(bool(values["compute"]))
+            self._vars["sg_mqtt"].set(bool(values["mqtt"]))
+            self._vars["sg_output"].set(bool(values["output"]))
+        finally:
+            self._rec_trace_busy = False
+
+    def _rec_clear_draft_values(self):
+        self._rec_trace_busy = True
+        try:
+            for key in (
+                "sg_nperseg", "sg_nfft", "sg_noverlap", "sg_window", "sg_reduce_op",
+                "sg_num_spectra_per_chunk", "sg_spectra_per_output", "sg_snr_min",
+                "sg_snr_max", "sg_cmap", "sg_dpi", "sg_figsize",
+            ):
+                self._vars[key].set("")
+            self._vars["sg_compute"].set(False)
+            self._vars["sg_mqtt"].set(False)
+            self._vars["sg_output"].set(False)
+        finally:
+            self._rec_trace_busy = False
+
+    def _rec_render_model(self, model: dict, load_values: bool = False):
+        self._vars["rec_config_source"].set(model.get("preset_path", "—"))
+        source = model.get("preset_source", "unknown")
+        error = model.get("error")
+        if not model.get("available"):
+            self._vars["rec_preset_state"].set(error or "Preset unavailable")
+            for key in (
+                "calc_freq_formula", "calc_hop_formula", "calc_segments",
+                "calc_cadence_formula", "calc_resamplers", "calc_waterfall_formula",
+            ):
+                self._vars[key].set("Unavailable until the selected preset can be resolved")
+            self._rec_stage_button.configure(state="disabled")
+            return
+
+        self._vars["rec_preset_state"].set(f"Ready ({source})")
+        self._rec_stage_button.configure(state="normal")
+        if load_values:
+            self._rec_set_draft_values(model["values"])
+
+        metrics = model["metrics"]
+        self._vars["calc_freq_formula"].set(
+            "Frequency bins = nfft = {frequency_bins:,} bins\n"
+            "Frequency resolution = effective sample rate / nfft\n"
+            "= {effective_sample_rate_hz:,.0f} / {frequency_bins:,} "
+            "= {frequency_resolution_hz:,.3f} Hz/bin".format(**metrics)
+        )
+        self._vars["calc_hop_formula"].set(
+            "FFT hop = nperseg - noverlap = {fft_hop_samples:,} samples\n"
+            "FFT hop time = {fft_hop_samples:,} / {effective_sample_rate_hz:,.0f} "
+            "= {hop_us:,.3f} us".format(
+                hop_us=metrics["fft_hop_time_s"] * 1e6, **metrics
+            )
+        )
+        self._vars["calc_segments"].set(
+            f"STFT segments reduced into each row: {metrics['segments_per_row']:,}"
+        )
+        self._vars["calc_cadence_formula"].set(
+            "Samples per row = effective chunk / spectra per chunk\n"
+            "= {effective_chunk_size:,} / {spectra_per_chunk:,} = {samples_per_row:,}\n"
+            "Scan time = {samples_per_row:,} / {effective_sample_rate_hz:,.0f} "
+            "= {scan_time_s:.6g} s/row; spectrum rate = {spectrum_rate_hz:,.6g} rows/s".format(
+                spectra_per_chunk=model["values"]["num_spectra_per_chunk"], **metrics
+            )
+        )
+        stages = model.get("enabled_resamplers", [])
+        stage_text = ", ".join(
+            f"{stage['name']} {stage['up']}/{stage['down']}" for stage in stages
+        ) or "none"
+        self._vars["calc_resamplers"].set(
+            f"Input: {metrics['input_sample_rate_hz']:,.0f} samples/s, "
+            f"{metrics['input_chunk_size']:,} samples | Resampling: {stage_text} | "
+            f"Effective chunk: {metrics['effective_chunk_size']:,} samples"
+        )
+        self._vars["calc_waterfall_formula"].set(
+            "Waterfall duration = rows x scan time\n"
+            "= {waterfall_rows:,} x {scan_time_s:.6g} = {waterfall_duration_s:,.6g} s\n"
+            "Native array = {waterfall_rows:,} rows x {frequency_bins:,} frequency bins".format(
+                **metrics
+            )
+        )
+
+    def _rec_load_preset(self):
+        model = resolve_recorder_preset(self._rec_sample_rate_mhz())
+        if not model.get("available"):
+            self._rec_clear_draft_values()
+        self._rec_render_model(model, load_values=bool(model.get("available")))
+        if not model.get("available"):
+            logging.warning("REC: %s", model.get("error"))
+
+    def _rec_preview_draft(self, *_):
+        if getattr(self, "_rec_trace_busy", False):
+            return
+        model = preview_recorder_settings(
+            self._rec_sample_rate_mhz(), self._rec_collect_draft()
+        )
+        self._rec_render_model(model)
+
+    def _stage_rec_settings(self):
+        model = preview_recorder_settings(
+            self._rec_sample_rate_mhz(), self._rec_collect_draft()
+        )
+        if not model.get("available"):
+            messagebox.showerror("REC Settings", model.get("error") or "Invalid settings")
+            return
+        self._rec_pending_overrides = dict(model["overrides"])
+        if self.capture is not None:
+            self.capture.set_recorder_overrides(self._rec_pending_overrides)
+        self._rec_render_model(model)
+        logging.info("REC: settings will apply on next recorder start")
+
+    def _rec_discard_draft(self):
+        model = resolve_recorder_preset(
+            self._rec_sample_rate_mhz(), self._rec_pending_overrides
+        )
+        self._rec_render_model(model, load_values=bool(model.get("available")))
+
+    def _rec_reset_config(self):
+        self._rec_pending_overrides.clear()
+        if self.capture is not None:
+            self.capture.clear_recorder_overrides()
+        self._rec_load_preset()
+        logging.info("REC: staged overrides cleared; selected preset restored")
+
     def _rec_status_ui_update(self, data: dict):
         """Update REC tab widgets from recorder status (only called after tab is built)."""
         self._vars["rec_status"].set(data.get("state", "—"))
-
-    def _rec_reload_config(self):
-        sr = self._vars["sample_rate_mhz"].get()
-        config_name = f"sr{sr}MHz"
-        self.bus.recorder_config_load(config_name)
-        self._vars["rec_active_config"].set(config_name)
-        logging.info(f"REC: config.load sent ({config_name})")
-
-    def _apply_rec_spectrogram(self):
-        self.bus.recorder_config_set("pipeline.spectrogram",
-                                     self._vars["sg_compute"].get())
-        self.bus.recorder_config_set("pipeline.spectrogram_mqtt",
-                                     self._vars["sg_mqtt"].get())
-        self.bus.recorder_config_set("pipeline.spectrogram_output",
-                                     self._vars["sg_output"].get())
-        self.bus.recorder_config_set("spectrogram.reduce_op",
-                                     self._vars["sg_reduce_op"].get())
-        try:
-            self.bus.recorder_config_set("spectrogram_output.snr_db_min",
-                                         float(self._vars["sg_snr_min"].get()))
-            self.bus.recorder_config_set("spectrogram_output.snr_db_max",
-                                         float(self._vars["sg_snr_max"].get()))
-            self.bus.recorder_config_set("spectrogram_output.num_spectra_per_output",
-                                         int(self._vars["sg_spectra_per_output"].get()))
-        except ValueError as e:
-            logging.error(f"Spectrogram config error: {e}")
-            return
-        logging.info("Spectrogram settings applied")
-
-    def _apply_rec_drf(self):
-        try:
-            self.bus.recorder_config_set("packet.batch_size",
-                                         int(self._vars["rec_batch_size"].get()))
-        except ValueError as e:
-            logging.error(f"DRF config error: {e}")
-            return
-        logging.info("DRF settings applied")
 
     # ------------------------------------------------------------------ #
     #  Tuner trace
@@ -5033,6 +5271,7 @@ class MEPGui:
     def _configure_mep(self, params: dict):
         """Create or update CaptureController with GUI params."""
         self.capture = self._get_or_create_capture(params)
+        self.capture.set_recorder_overrides(self._rec_pending_overrides)
         if self._conjugate_policy_user_override:
             policy = self._vars["conjugate_policy"].get()
             if policy in CONJUGATE_POLICY_OPTIONS:
