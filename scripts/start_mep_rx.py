@@ -388,22 +388,30 @@ def preview_recorder_settings(
     config_dir: str = None,
 ) -> dict:
     """Resolve draft REC values without mutating controller or recorder state."""
+    preset_model = resolve_recorder_preset(sample_rate_mhz, config_dir=config_dir)
+    if not preset_model.get("available"):
+        preset_model["draft_valid"] = False
+        preset_model["draft_error"] = preset_model.get("error", "Preset unavailable")
+        return preset_model
+
     try:
         overrides = recorder_draft_to_overrides(draft)
     except (KeyError, TypeError, ValueError) as exc:
-        path, source = recorder_preset_path(sample_rate_mhz, config_dir)
-        return {
-            "available": False,
-            "preset_name": f"sr{int(sample_rate_mhz)}MHz",
-            "preset_path": path,
-            "preset_source": source,
-            "error": f"Invalid REC draft: {exc}",
-            "values": {},
-            "metrics": {},
-            "enabled_resamplers": [],
-        }
+        preset_model["draft_valid"] = False
+        preset_model["draft_error"] = str(exc)
+        return preset_model
+
     model = resolve_recorder_preset(sample_rate_mhz, overrides, config_dir)
+    if not model.get("available"):
+        preset_model["draft_valid"] = False
+        error = model.get("error", "Invalid REC settings")
+        prefix = f"Invalid recorder preset {model.get('preset_path')}: "
+        preset_model["draft_error"] = error.removeprefix(prefix)
+        return preset_model
+
     model["overrides"] = overrides
+    model["draft_valid"] = True
+    model["draft_error"] = ""
     return model
 
 

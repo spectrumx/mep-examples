@@ -79,7 +79,7 @@ from start_mep_rx import (
 
 # ===== LAYOUT CONSTANTS ===== #
 LEFT_PANEL_WIDTH = 450
-ADV_PANEL_WIDTH = 475
+ADV_PANEL_WIDTH = 510
 DEFAULT_WIN_HEIGHT = 750
 MQTT_LOG_BUFFER_MAX_MESSAGES = 500
 MQTT_LOG_WIDGET_MAX_LINES = 10000
@@ -3625,7 +3625,13 @@ class MEPGui:
             "<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(
+                canvas_window, width=max(event.width - 8, 1)
+            ),
+        )
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -3641,11 +3647,10 @@ class MEPGui:
 
         self._vars["rec_status"] = tk.StringVar(value="—")
         self._vars["rec_config_source"] = tk.StringVar(value="—")
-        self._vars["rec_preset_state"] = tk.StringVar(value="Loading preset...")
+        self._vars["rec_draft_error"] = tk.StringVar(value="")
         for summary_row, (label, key) in enumerate((
             ("Recorder state", "rec_status"),
             ("Preset file", "rec_config_source"),
-            ("Preset status", "rec_preset_state"),
         )):
             ttk.Label(status_frame, text=label).grid(
                 row=summary_row, column=0, sticky="w", padx=5, pady=2)
@@ -3656,8 +3661,14 @@ class MEPGui:
         ttk.Label(
             status_frame,
             text="Applied REC settings take effect on the next recording; running recorders are not reconfigured.",
-            wraplength=420,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 5))
+            wraplength=455,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
+        ttk.Label(
+            status_frame,
+            textvariable=self._vars["rec_draft_error"],
+            foreground="#a33a2b",
+            wraplength=455,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 5))
 
         # ===== PACKET CONJUGATE =====
         conj_frame = ttk.LabelFrame(scrollable_frame, text="packet.apply_conjugate OVERRIDE")
@@ -3702,36 +3713,40 @@ class MEPGui:
         self._vars["calc_freq_formula"] = tk.StringVar(value="—")
         self._vars["calc_hop_formula"] = tk.StringVar(value="—")
         self._vars["calc_segments"] = tk.StringVar(value="—")
-        ttk.Label(fft_frame, textvariable=self._vars["calc_freq_formula"],
-                  justify="left", wraplength=420).grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=5, pady=(4, 2))
-        ttk.Label(fft_frame, textvariable=self._vars["calc_hop_formula"],
-                  justify="left", wraplength=420).grid(
-            row=1, column=0, columnspan=4, sticky="w", padx=5, pady=2)
-        ttk.Label(fft_frame, textvariable=self._vars["calc_segments"],
-                  justify="left", wraplength=420).grid(
-            row=2, column=0, columnspan=4, sticky="w", padx=5, pady=(2, 5))
+        ttk.Label(fft_frame, text="EDITABLE", font=("TkDefaultFont", 9, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
+        ttk.Label(fft_frame, text="CALCULATED", font=("TkDefaultFont", 9, "bold")).grid(
+            row=0, column=3, sticky="w", padx=5, pady=(4, 2))
 
-        ttk.Label(fft_frame, text="Segment length (nperseg)").grid(row=3, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(fft_frame, text="nperseg").grid(row=1, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_nperseg"] = tk.StringVar(value="")
         ttk.Entry(fft_frame, textvariable=self._vars["sg_nperseg"], width=10).grid(
-            row=3, column=1, sticky="ew", padx=5, pady=3)
+            row=1, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Label(fft_frame, text="→").grid(row=1, column=2, padx=2)
+        ttk.Label(fft_frame, textvariable=self._vars["calc_segments"], justify="left").grid(
+            row=1, column=3, sticky="w", padx=5, pady=3)
 
-        ttk.Label(fft_frame, text="FFT bins (nfft)").grid(row=3, column=2, sticky="w", padx=5, pady=3)
+        ttk.Label(fft_frame, text="nfft").grid(row=2, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_nfft"] = tk.StringVar(value="")
         ttk.Entry(fft_frame, textvariable=self._vars["sg_nfft"], width=10).grid(
-            row=3, column=3, sticky="ew", padx=5, pady=3)
+            row=2, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Label(fft_frame, text="→").grid(row=2, column=2, padx=2)
+        ttk.Label(fft_frame, textvariable=self._vars["calc_freq_formula"], justify="left").grid(
+            row=2, column=3, sticky="w", padx=5, pady=3)
 
-        ttk.Label(fft_frame, text="Overlap (noverlap)").grid(row=4, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(fft_frame, text="noverlap").grid(row=3, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_noverlap"] = tk.StringVar(value="")
         ttk.Entry(fft_frame, textvariable=self._vars["sg_noverlap"], width=10).grid(
-            row=4, column=1, sticky="ew", padx=5, pady=3)
+            row=3, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Label(fft_frame, text="→").grid(row=3, column=2, padx=2)
+        ttk.Label(fft_frame, textvariable=self._vars["calc_hop_formula"], justify="left").grid(
+            row=3, column=3, sticky="w", padx=5, pady=3)
 
-        ttk.Label(fft_frame, text="Window").grid(row=4, column=2, sticky="w", padx=5, pady=3)
+        ttk.Label(fft_frame, text="window").grid(row=4, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_window"] = tk.StringVar(value="")
         ttk.Combobox(fft_frame, textvariable=self._vars["sg_window"],
                      values=["hann", "hamming", "blackman", "rectangular"], width=10, state="readonly").grid(
-            row=4, column=3, sticky="ew", padx=5, pady=3)
+            row=4, column=1, sticky="ew", padx=5, pady=3)
 
         # ===== ROW CADENCE =====
         cadence_frame = ttk.LabelFrame(scrollable_frame, text="Spectrum Row Cadence")
@@ -3742,35 +3757,43 @@ class MEPGui:
 
         self._vars["calc_cadence_formula"] = tk.StringVar(value="—")
         self._vars["calc_resamplers"] = tk.StringVar(value="—")
-        ttk.Label(cadence_frame, textvariable=self._vars["calc_cadence_formula"],
-                  justify="left", wraplength=420).grid(
-            row=0, column=0, columnspan=4, sticky="w", padx=5, pady=(4, 2))
-        ttk.Label(cadence_frame, textvariable=self._vars["calc_resamplers"],
-                  justify="left", wraplength=420).grid(
-            row=1, column=0, columnspan=4, sticky="w", padx=5, pady=(2, 5))
-        ttk.Label(cadence_frame, text="Spectra per chunk").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(cadence_frame, text="EDITABLE", font=("TkDefaultFont", 9, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
+        ttk.Label(cadence_frame, text="CALCULATED", font=("TkDefaultFont", 9, "bold")).grid(
+            row=0, column=3, sticky="w", padx=5, pady=(4, 2))
+        ttk.Label(cadence_frame, text="spectra/chunk").grid(row=1, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_num_spectra_per_chunk"] = tk.StringVar(value="")
         ttk.Entry(cadence_frame, textvariable=self._vars["sg_num_spectra_per_chunk"], width=10).grid(
-            row=2, column=1, sticky="ew", padx=5, pady=3)
-        ttk.Label(cadence_frame, text="Reduction").grid(row=2, column=2, sticky="w", padx=5, pady=3)
+            row=1, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Label(cadence_frame, text="→").grid(row=1, column=2, padx=2)
+        ttk.Label(cadence_frame, textvariable=self._vars["calc_cadence_formula"], justify="left").grid(
+            row=1, column=3, sticky="w", padx=5, pady=3)
+        ttk.Label(cadence_frame, text="reduction").grid(row=2, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_reduce_op"] = tk.StringVar(value="")
         ttk.Combobox(cadence_frame, textvariable=self._vars["sg_reduce_op"],
                      values=["max", "median", "mean"], width=10, state="readonly").grid(
-            row=2, column=3, sticky="ew", padx=5, pady=3)
+            row=2, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Label(cadence_frame, textvariable=self._vars["calc_resamplers"], justify="left").grid(
+            row=2, column=3, sticky="w", padx=5, pady=3)
 
         # ===== WATERFALL =====
         waterfall_frame = ttk.LabelFrame(scrollable_frame, text="Waterfall Duration")
         waterfall_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
         waterfall_frame.columnconfigure(1, weight=1)
+        waterfall_frame.columnconfigure(3, weight=1)
         row += 1
         self._vars["calc_waterfall_formula"] = tk.StringVar(value="—")
-        ttk.Label(waterfall_frame, textvariable=self._vars["calc_waterfall_formula"],
-                  justify="left", wraplength=420).grid(
+        ttk.Label(waterfall_frame, text="EDITABLE", font=("TkDefaultFont", 9, "bold")).grid(
             row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
-        ttk.Label(waterfall_frame, text="Rows per waterfall").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(waterfall_frame, text="CALCULATED", font=("TkDefaultFont", 9, "bold")).grid(
+            row=0, column=3, sticky="w", padx=5, pady=(4, 2))
+        ttk.Label(waterfall_frame, text="rows/output").grid(row=1, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_spectra_per_output"] = tk.StringVar(value="")
         ttk.Entry(waterfall_frame, textvariable=self._vars["sg_spectra_per_output"], width=10).grid(
             row=1, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Label(waterfall_frame, text="→").grid(row=1, column=2, padx=2)
+        ttk.Label(waterfall_frame, textvariable=self._vars["calc_waterfall_formula"], justify="left").grid(
+            row=1, column=3, sticky="w", padx=5, pady=3)
 
         # ===== PROCESSING AND OUTPUTS =====
         disp_frame = ttk.LabelFrame(scrollable_frame, text="Processing and Outputs")
@@ -5015,64 +5038,59 @@ class MEPGui:
             self._rec_trace_busy = False
 
     def _rec_render_model(self, model: dict, load_values: bool = False):
-        self._vars["rec_config_source"].set(model.get("preset_path", "—"))
-        source = model.get("preset_source", "unknown")
-        error = model.get("error")
+        preset_path = model.get("preset_path", "—")
         if not model.get("available"):
-            self._vars["rec_preset_state"].set(error or "Preset unavailable")
+            self._vars["rec_config_source"].set(f"Not Found: {preset_path}")
+            self._vars["rec_draft_error"].set("")
             for key in (
                 "calc_freq_formula", "calc_hop_formula", "calc_segments",
                 "calc_cadence_formula", "calc_resamplers", "calc_waterfall_formula",
             ):
-                self._vars[key].set("Unavailable until the selected preset can be resolved")
+                self._vars[key].set("—")
             self._rec_stage_button.configure(state="disabled")
             return
 
-        self._vars["rec_preset_state"].set(f"Ready ({source})")
+        self._vars["rec_config_source"].set(preset_path)
+        if model.get("draft_valid") is False:
+            self._vars["rec_draft_error"].set(
+                f"Fix input: {model.get('draft_error', 'invalid value')}"
+            )
+            self._rec_stage_button.configure(state="disabled")
+            return
+
+        self._vars["rec_draft_error"].set("")
         self._rec_stage_button.configure(state="normal")
         if load_values:
             self._rec_set_draft_values(model["values"])
 
         metrics = model["metrics"]
         self._vars["calc_freq_formula"].set(
-            "Frequency bins = nfft = {frequency_bins:,} bins\n"
-            "Frequency resolution = effective sample rate / nfft\n"
-            "= {effective_sample_rate_hz:,.0f} / {frequency_bins:,} "
-            "= {frequency_resolution_hz:,.3f} Hz/bin".format(**metrics)
+            "{frequency_bins:,} bins | {frequency_resolution_hz:,.3f} Hz/bin".format(
+                **metrics
+            )
         )
         self._vars["calc_hop_formula"].set(
-            "FFT hop = nperseg - noverlap = {fft_hop_samples:,} samples\n"
-            "FFT hop time = {fft_hop_samples:,} / {effective_sample_rate_hz:,.0f} "
-            "= {hop_us:,.3f} us".format(
+            "{fft_hop_samples:,} samples | {hop_us:,.3f} us".format(
                 hop_us=metrics["fft_hop_time_s"] * 1e6, **metrics
             )
         )
         self._vars["calc_segments"].set(
-            f"STFT segments reduced into each row: {metrics['segments_per_row']:,}"
+            f"{metrics['segments_per_row']:,} STFT segments/row"
         )
         self._vars["calc_cadence_formula"].set(
-            "Samples per row = effective chunk / spectra per chunk\n"
-            "= {effective_chunk_size:,} / {spectra_per_chunk:,} = {samples_per_row:,}\n"
-            "Scan time = {samples_per_row:,} / {effective_sample_rate_hz:,.0f} "
-            "= {scan_time_s:.6g} s/row; spectrum rate = {spectrum_rate_hz:,.6g} rows/s".format(
-                spectra_per_chunk=model["values"]["num_spectra_per_chunk"], **metrics
-            )
+            "{samples_per_row:,} samples/row | {scan_time_s:.6g} s/row | "
+            "{spectrum_rate_hz:,.6g} rows/s".format(**metrics)
         )
         stages = model.get("enabled_resamplers", [])
         stage_text = ", ".join(
             f"{stage['name']} {stage['up']}/{stage['down']}" for stage in stages
         ) or "none"
         self._vars["calc_resamplers"].set(
-            f"Input: {metrics['input_sample_rate_hz']:,.0f} samples/s, "
-            f"{metrics['input_chunk_size']:,} samples | Resampling: {stage_text} | "
-            f"Effective chunk: {metrics['effective_chunk_size']:,} samples"
+            f"chunk {metrics['effective_chunk_size']:,} | resampling: {stage_text}"
         )
         self._vars["calc_waterfall_formula"].set(
-            "Waterfall duration = rows x scan time\n"
-            "= {waterfall_rows:,} x {scan_time_s:.6g} = {waterfall_duration_s:,.6g} s\n"
-            "Native array = {waterfall_rows:,} rows x {frequency_bins:,} frequency bins".format(
-                **metrics
-            )
+            "{waterfall_duration_s:,.6g} s | {waterfall_rows:,} rows x "
+            "{frequency_bins:,} bins".format(**metrics)
         )
 
     def _rec_load_preset(self):
@@ -5095,8 +5113,11 @@ class MEPGui:
         model = preview_recorder_settings(
             self._rec_sample_rate_mhz(), self._rec_collect_draft()
         )
-        if not model.get("available"):
-            messagebox.showerror("REC Settings", model.get("error") or "Invalid settings")
+        if not model.get("available") or not model.get("draft_valid", False):
+            messagebox.showerror(
+                "REC Settings",
+                model.get("draft_error") or model.get("error") or "Invalid settings",
+            )
             return
         self._rec_pending_overrides = dict(model["overrides"])
         if self.capture is not None:
