@@ -2165,9 +2165,14 @@ class CaptureController:
     # ------------------------------------------------------------------ #
 
     def _clear_preview_data_dir(self):
+        parent = os.path.dirname(PREVIEW_DATA_DIR)
+        stale_dir = os.path.join(parent, f".preview_data_stale_{int(time.time() * 1000)}")
         if os.path.isdir(PREVIEW_DATA_DIR):
-            logging.info("Preview sample rate changed: clearing %s", PREVIEW_DATA_DIR)
-            shutil.rmtree(PREVIEW_DATA_DIR)
+            logging.info("Preview sample rate changed: rotating %s", PREVIEW_DATA_DIR)
+            os.replace(PREVIEW_DATA_DIR, stale_dir)
+        os.makedirs(PREVIEW_DATA_DIR, exist_ok=True)
+        if os.path.isdir(stale_dir):
+            shutil.rmtree(stale_dir, ignore_errors=True)
 
     def start_recorder(self, freq_idx_offset: float = 0.0):
         """Configure and enable the DigitalRF recorder."""
