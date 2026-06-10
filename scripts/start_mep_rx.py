@@ -29,6 +29,7 @@ import logging
 import json
 import os
 import shutil
+import base64
 import re
 import math
 import socket
@@ -38,12 +39,15 @@ from collections import deque
 from datetime import datetime
 import threading
 from typing import Optional, Callable
+import numpy as np
 import paho.mqtt.client as mqtt_lib
 
 # ===== CONFIG ===== #
 LOG_DIR     = os.path.join(os.path.expanduser("~"), "log", "spectrumx")
 MQTT_BROKER = "localhost"
 MQTT_PORT   = 1883
+SPEC_POWER_FLOOR = np.float32(1e-12)
+SPEC_DB_SCALE = np.float32(10.0)
 
 # AFE logging defaults shared with GUI/CLI callers.
 AFE_DEFAULT_LOG_PATH = "/data/log_telemetry"
@@ -1843,6 +1847,47 @@ class MEPBus:
             f"pps={tlm.get('pps_count')} "
             f"ch={tlm.get('channels')}"
         )
+
+    @staticmethod
+    def normalize_spec_payload(payload: Optional[dict]) -> Optional[dict]:
+        """Normalize SPEC MQTT payload into display-ready dBFS row metadata."""
+        if not isinstance(payload, dict):
+            return None
+        data_b64 = payload.get("data", "")
+        if not isinstance(data_b64, str) or not data_b64:
+            return None
+        try:
+            raw = base64.b64decode(data_b64)
+        except Exception:
+            return None
+        n = len(raw) // 4
+        if n <= 0:
+            return None
+        bins = np.frombuffer(raw, dtype="<f4", count=n)
+        if bins.size == 0:
+            return None
+        row = bins.copy()
+        np.maximum(row, SPEC_POWER_FLOOR, out=row)
+        np.log10(row, out=row)
+        row *= SPEC_DB_SCALE
+        row_min = float(np.min(row))
+        row_max = float(np.max(row))
+        if not (math.isfinite(row_min) and math.isfinite(row_max)):
+            return None
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        return {
+            "row": row,
+            "row_min": row_min,
+            "row_max": row_max,
+            "ts": payload.get("timestamp"),
+            "center_frequency": payload.get("center_frequency"),
+            "sample_rate": payload.get("sample_rate"),
+            "n": int(row.size),
+            "fmin": metadata.get("fmin"),
+            "fmax": metadata.get("fmax"),
+            "scan_time": metadata.get("scan_time"),
+            "units": "dBFS",
+        }
 
 
 # ===== CAPTURE CONTROLLER ===== #

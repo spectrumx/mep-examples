@@ -1738,7 +1738,7 @@ class MEPGui:
         return f"{value / 1e6:.3f} MHz" if is_hz else f"bin {int(round(value))}"
 
     def _spec_fmt_amp(self, amp: float):
-        return f"{float(amp):.2f} dB"
+        return f"{float(amp):.2f} dBFS"
 
     def _spec_cursor_update(self, event, from_waterfall: bool):
         with self._spec_lock:
@@ -1780,47 +1780,27 @@ class MEPGui:
         else:
             amp = float(row_latest[idx])
             ts = latest.get("ts", "?")
-        label = f"Cursor: f={flabel}  t={ts}  amp={self._spec_fmt_amp(amp)}"
+        label = f"Cursor: f={flabel}  t={ts}  pwr={self._spec_fmt_amp(amp)}"
 
         if "spec_cursor" in self._vars:
             self._vars["spec_cursor"].set(label)
 
     def _spec_handle_stream_message(self, topic: str, data: dict):
-        """Producer (MQTT thread): decode + transform one frame, queue it.
+        """Producer (MQTT thread): normalize one frame and queue it.
 
-        Runs entirely off the Tk thread and makes no widget calls. Frames that
-        cannot be decoded or contain non-finite samples are dropped here, so the
-        renderer only ever receives displayable data. The native-resolution dB
-        spectrum is stored; downsampling to the display resolution happens at
-        draw time. The steady render timer (_spec_render) drains _spec_pending.
+        Runs entirely off the Tk thread and makes no widget calls. Payload
+        normalization (base64 decode + power->dBFS conversion) is delegated to
+        MEPBus so GUI remains presentation-focused.
         """
         if not self._spec_stream_enabled:
             return
-        try:
-            bins = self._spec_decode_bins(data.get("data", ""))
-        except Exception as e:
-            logging.debug(f"SPEC: decode failed: {e}")
-            return
-        if bins.size == 0 or not np.all(np.isfinite(bins)):
+        entry = self.bus.normalize_spec_payload(data)
+        if entry is None:
             return
         now = time.monotonic()
         if self._spec_log_dt and self._spec_last_arrival is not None:
             logging.info(f"SPEC frame dt={(now - self._spec_last_arrival) * 1000:.0f} ms")
         self._spec_last_arrival = now
-        row = (20.0 * np.log10(np.maximum(np.abs(bins), 1e-12))).astype(np.float32)
-        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
-        entry = {
-            "row": row,                       # native-resolution dB spectrum
-            "row_min": float(row.min()),
-            "row_max": float(row.max()),
-            "ts": data.get("timestamp"),
-            "center_frequency": data.get("center_frequency"),
-            "sample_rate": data.get("sample_rate"),
-            "n": int(row.size),
-            "fmin": metadata.get("fmin"),
-            "fmax": metadata.get("fmax"),
-            "scan_time": metadata.get("scan_time"),
-        }
         with self._spec_lock:
             self._spec_pending.append(entry)
 
@@ -1921,7 +1901,7 @@ class MEPGui:
         self._spec_line_item = c.create_line(0, 0, 0, 0, fill="#6ad7ff", width=1)
         self._spec_line_labels = {
             "title": c.create_text(6, 6, anchor="nw", fill="#cccccc", text="Live FFT"),
-            "ylab": c.create_text(6, 0, anchor="w", fill="#aaaaaa", text="Amplitude (dB)"),
+            "ylab": c.create_text(6, 0, anchor="w", fill="#aaaaaa", text="Power (dBFS)"),
             "vmax": c.create_text(6, 20, anchor="nw", fill="#888888", text=""),
             "vmin": c.create_text(6, 0, anchor="sw", fill="#888888", text=""),
             "f0": c.create_text(6, 0, anchor="sw", fill="#aaaaaa", text=""),
