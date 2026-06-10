@@ -3762,28 +3762,46 @@ class MEPGui:
         cadence_frame = ttk.LabelFrame(scrollable_frame, text="Spectrum Row Cadence")
         cadence_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
         cadence_frame.columnconfigure(0, weight=0, minsize=170)
-        cadence_frame.columnconfigure(1, weight=1, minsize=300)
+        cadence_frame.columnconfigure(1, weight=0, minsize=20)
+        cadence_frame.columnconfigure(2, weight=1, minsize=280)
         row += 1
 
         self._vars["calc_cadence_formula"] = tk.StringVar(value="—")
         self._vars["calc_resamplers"] = tk.StringVar(value="—")
         ttk.Label(cadence_frame, text="EDITABLE", font=("TkDefaultFont", 9, "bold")).grid(
             row=0, column=0, sticky="w", padx=5, pady=(4, 2))
-        ttk.Label(cadence_frame, text="CALCULATED", font=("TkDefaultFont", 9, "bold")).grid(
-            row=0, column=1, sticky="w", padx=5, pady=(4, 2))
+        ttk.Label(cadence_frame, text="DERIVED", font=("TkDefaultFont", 9, "bold")).grid(
+            row=0, column=2, sticky="w", padx=5, pady=(4, 2))
         ttk.Label(cadence_frame, text="spectra/chunk").grid(row=1, column=0, sticky="w", padx=5, pady=(3, 0))
         self._vars["sg_num_spectra_per_chunk"] = tk.StringVar(value="")
         ttk.Entry(cadence_frame, textvariable=self._vars["sg_num_spectra_per_chunk"], width=14).grid(
             row=2, column=0, sticky="ew", padx=5, pady=(1, 4))
-        ttk.Label(cadence_frame, textvariable=self._vars["calc_cadence_formula"], justify="left", wraplength=290).grid(
-            row=1, column=1, rowspan=2, sticky="nw", padx=5, pady=3)
+        ttk.Label(cadence_frame, text="→").grid(row=2, column=1, sticky="n", padx=2, pady=(2, 0))
+        ttk.Label(
+            cadence_frame,
+            textvariable=self._vars["calc_cadence_formula"],
+            justify="left",
+            wraplength=250,
+            font=("TkDefaultFont", 9),
+        ).grid(row=1, column=2, rowspan=2, sticky="nw", padx=5, pady=3)
         ttk.Label(cadence_frame, text="reduction").grid(row=3, column=0, sticky="w", padx=5, pady=(3, 0))
         self._vars["sg_reduce_op"] = tk.StringVar(value="")
         ttk.Combobox(cadence_frame, textvariable=self._vars["sg_reduce_op"],
                      values=["max", "median", "mean"], width=14, state="readonly").grid(
             row=4, column=0, sticky="ew", padx=5, pady=(1, 3))
-        ttk.Label(cadence_frame, textvariable=self._vars["calc_resamplers"], justify="left", wraplength=290).grid(
-            row=3, column=1, rowspan=2, sticky="nw", padx=5, pady=3)
+
+        # ===== YAML-ONLY SETTINGS =====
+        yaml_only_frame = ttk.LabelFrame(scrollable_frame, text="Set via YAML only")
+        yaml_only_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
+        yaml_only_frame.columnconfigure(0, weight=1)
+        row += 1
+        ttk.Label(
+            yaml_only_frame,
+            textvariable=self._vars["calc_resamplers"],
+            justify="left",
+            wraplength=450,
+            font=("TkDefaultFont", 9),
+        ).grid(row=0, column=0, sticky="w", padx=5, pady=(2, 4))
 
         # ===== WATERFALL =====
         waterfall_frame = ttk.LabelFrame(scrollable_frame, text="Waterfall Duration")
@@ -5096,8 +5114,8 @@ class MEPGui:
             f"{stage['name']} {stage['up']}/{stage['down']}" for stage in stages
         ) or "none"
         self._vars["calc_resamplers"].set(
-            f"effective chunk: {metrics['effective_chunk_size']:,}\n"
-            f"resampling: {stage_text}"
+            f"Configured chain: {stage_text}\n"
+            f"packet.num_samples -> chunk after chain: {metrics['effective_chunk_size']:,}"
         )
         self._vars["calc_waterfall_formula"].set(
             "{waterfall_duration_s:,.6g} s | {waterfall_rows:,} rows x "
