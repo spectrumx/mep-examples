@@ -182,7 +182,7 @@ class MEPGui:
         self._spec_stream_enabled = False
         self._spec_latest = None
         self._spec_rows = deque(maxlen=180)
-        self._spec_bins = 256                # line-plot display resolution (FFT Bins)
+        self._spec_bins = None               # line-plot display resolution (None = native)
         self._spec_render_interval_ms = 40   # fixed render cadence (~25 FPS over X11)
         # Producer/consumer decoupling: the MQTT thread decodes frames and queues
         # ready-to-draw dB rows here; the steady Tk render timer drains and blits
@@ -1495,16 +1495,16 @@ class MEPGui:
         self._spec_max_scale = ttk.Scale(ctl_f, from_=-250.0, to=50.0, variable=self._vars["spec_vmax"],
                                          command=lambda _v: self._spec_apply_color_range())
         self._spec_max_scale.grid(row=0, column=4, sticky="ew", padx=2, pady=2)
-        ttk.Label(ctl_f, text="FFT Bins").grid(row=1, column=0, sticky="w", padx=5, pady=(0, 2))
-        self._vars["spec_bins"] = tk.IntVar(value=self._spec_bins)
-        bin_vals = (64, 128, 256, 512, 1024, 2048)
+        ttk.Label(ctl_f, text="Num Points").grid(row=1, column=0, sticky="w", padx=5, pady=(0, 2))
+        self._vars["spec_bins"] = tk.StringVar(value="native" if self._spec_bins is None else str(self._spec_bins))
+        bin_vals = (None, 64, 256, 512, 1024, 2048, 4096)
         bin_f = ttk.Frame(ctl_f)
         bin_f.grid(row=1, column=1, columnspan=4, sticky="w", padx=(2, 2), pady=(0, 2))
         self._spec_bin_buttons = {}
         for i, n in enumerate(bin_vals):
             btn = tk.Button(
                 bin_f,
-                text=str(n),
+                text="native" if n is None else str(n),
                 width=4,
                 relief="raised",
                 padx=2,
@@ -1616,21 +1616,25 @@ class MEPGui:
             else:
                 btn.configure(relief="raised", bd=2)
 
-    def _spec_apply_bins(self, n=None):
-        allowed = {64, 128, 256, 512, 1024, 2048}
-        if n is None:
-            n = int(self._vars["spec_bins"].get())
+    def _spec_apply_bins(self, n="__from_var__"):
+        allowed = {None, 64, 256, 512, 1024, 2048, 4096}
+        if n == "__from_var__":
+            token = str(self._vars["spec_bins"].get()).strip().lower()
+            if token in ("none", "native", ""):
+                n = None
+            else:
+                n = int(token)
         else:
-            n = int(n)
+            n = None if n is None else int(n)
         if n not in allowed:
-            logging.error("SPEC: bins must be one of %s", sorted(allowed))
-            self._vars["spec_bins"].set(self._spec_bins)
+            logging.error("SPEC: line points must be one of none, 64, 256, 512, 1024, 2048, 4096")
+            self._vars["spec_bins"].set("native" if self._spec_bins is None else str(self._spec_bins))
             self._spec_update_bin_button_states()
             return
-        self._vars["spec_bins"].set(n)
+        self._vars["spec_bins"].set("native" if n is None else str(n))
         self._spec_bins = n
         self._spec_update_bin_button_states()
-        # FFT Bins only controls the line-plot resolution; the waterfall renders
+        # Line resample controls only the line-plot resolution; the waterfall renders
         # at native resolution, so no buffer reset is needed — just redraw.
         self._spec_request_render()
 
@@ -1916,7 +1920,7 @@ class MEPGui:
         c = self._spec_line_canvas
         self._spec_ensure_line_items()
         native = latest["row"]
-        vals = self._spec_resample(native, self._spec_bins)
+        vals = native if self._spec_bins is None else self._spec_resample(native, self._spec_bins)
         w = max(10, c.winfo_width())
         h = max(10, c.winfo_height())
         n = len(vals)
@@ -1982,9 +1986,10 @@ class MEPGui:
 
     def _spec_update_summary(self, latest: dict):
         if "spec_summary" in self._vars:
+            line_mode = "native" if self._spec_bins is None else str(self._spec_bins)
             self._vars["spec_summary"].set(
                 f"ts={latest.get('ts', '?')}   cf={latest.get('center_frequency', '?')} Hz   "
-                f"sr={latest.get('sample_rate', '?')} Hz   bins={self._spec_bins} (src {latest.get('n', '?')})"
+                f"sr={latest.get('sample_rate', '?')} Hz   line={line_mode} (src {latest.get('n', '?')})"
             )
 
     def _mqtt_publish_manual(self):
