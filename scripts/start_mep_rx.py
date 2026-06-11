@@ -324,6 +324,8 @@ def resolve_recorder_preset(
             "compute": bool(pipeline.get("spectrogram", True)),
             "mqtt": bool(pipeline.get("spectrogram_mqtt", True)),
             "output": bool(pipeline.get("spectrogram_output", True)),
+            "digital_rf": bool(pipeline.get("digital_rf", True)),
+            "metadata": bool(pipeline.get("metadata", True)),
         }
         metrics = {
             "input_sample_rate_hz": float(input_rate),
@@ -379,6 +381,8 @@ def recorder_draft_to_overrides(draft: dict[str, object]) -> dict[str, object]:
         "pipeline.spectrogram": bool(draft["compute"]),
         "pipeline.spectrogram_mqtt": bool(draft["mqtt"]),
         "pipeline.spectrogram_output": bool(draft["output"]),
+        "pipeline.digital_rf": bool(draft["digital_rf"]),
+        "pipeline.metadata": bool(draft["metadata"]),
     }
 
 

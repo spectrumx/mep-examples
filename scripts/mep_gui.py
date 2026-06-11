@@ -3844,65 +3844,85 @@ class MEPGui:
             justify="left",
             wraplength=450,
             font=("TkDefaultFont", 9),
-        ).grid(row=0, column=0, sticky="w", padx=5, pady=(2, 4))
+        ).grid(row=0, column=0, sticky="w", padx=5, pady=(2, 2))
+        ttk.Label(
+            yaml_only_frame,
+            text="pipeline.converter (int\u2192float): always enabled",
+            foreground="grey",
+            font=("TkDefaultFont", 9),
+        ).grid(row=1, column=0, sticky="w", padx=5, pady=0)
+        ttk.Label(
+            yaml_only_frame,
+            text="pipeline.int_converter (float\u2192int before DRF sink): always enabled",
+            foreground="grey",
+            font=("TkDefaultFont", 9),
+        ).grid(row=2, column=0, sticky="w", padx=5, pady=(0, 4))
 
-        # ===== WATERFALL =====
-        waterfall_frame = ttk.LabelFrame(scrollable_frame, text="Waterfall Duration")
-        waterfall_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
-        waterfall_frame.columnconfigure(1, weight=1)
-        waterfall_frame.columnconfigure(3, weight=1)
+        # ===== DIGITAL RF IQ =====
+        drf_frame = ttk.LabelFrame(scrollable_frame, text="DigitalRF IQ")
+        drf_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
+        drf_frame.columnconfigure(0, weight=1)
         row += 1
-        self._vars["calc_waterfall_formula"] = tk.StringVar(value="—")
-        ttk.Label(waterfall_frame, text="EDITABLE", font=("TkDefaultFont", 9, "bold")).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
-        ttk.Label(waterfall_frame, text="CALCULATED", font=("TkDefaultFont", 9, "bold")).grid(
-            row=0, column=3, sticky="w", padx=5, pady=(4, 2))
-        ttk.Label(waterfall_frame, text="rows/output").grid(row=1, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_spectra_per_output"] = tk.StringVar(value="")
-        ttk.Entry(waterfall_frame, textvariable=self._vars["sg_spectra_per_output"], width=10).grid(
-            row=1, column=1, sticky="ew", padx=5, pady=3)
-        ttk.Label(waterfall_frame, text="→").grid(row=1, column=2, padx=2)
-        ttk.Label(waterfall_frame, textvariable=self._vars["calc_waterfall_formula"], justify="left").grid(
-            row=1, column=3, sticky="w", padx=5, pady=3)
+        self._vars["sg_digital_rf"] = tk.BooleanVar(value=False)
+        self._vars["sg_metadata"] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            drf_frame,
+            text="pipeline.digital_rf (IQ recording to disk)",
+            variable=self._vars["sg_digital_rf"],
+        ).grid(row=0, column=0, sticky="w", padx=5, pady=(4, 2))
+        ttk.Checkbutton(
+            drf_frame,
+            text="pipeline.metadata (DRF metadata file alongside IQ)",
+            variable=self._vars["sg_metadata"],
+        ).grid(row=1, column=0, sticky="w", padx=5, pady=(0, 4))
 
-        # ===== PROCESSING AND OUTPUTS =====
-        disp_frame = ttk.LabelFrame(scrollable_frame, text="Processing and Outputs")
+        # ===== SPECTROGRAMS =====
+        disp_frame = ttk.LabelFrame(scrollable_frame, text="Spectrograms")
         disp_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
         disp_frame.columnconfigure(1, weight=1)
         disp_frame.columnconfigure(3, weight=1)
         row += 1
 
-        ttk.Label(disp_frame, text="Color scale min (dB)").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["calc_waterfall_formula"] = tk.StringVar(value="—")
+        ttk.Label(disp_frame, text="rows/output").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_spectra_per_output"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_spectra_per_output"], width=10).grid(
+            row=0, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Label(disp_frame, text="→").grid(row=0, column=2, padx=2)
+        ttk.Label(disp_frame, textvariable=self._vars["calc_waterfall_formula"], justify="left").grid(
+            row=0, column=3, sticky="w", padx=5, pady=3)
+
+        ttk.Label(disp_frame, text="Color scale min (dB)").grid(row=1, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_snr_min"] = tk.StringVar(value="")
         ttk.Entry(disp_frame, textvariable=self._vars["sg_snr_min"], width=10).grid(
-            row=0, column=1, sticky="ew", padx=5, pady=3)
+            row=1, column=1, sticky="ew", padx=5, pady=3)
 
-        ttk.Label(disp_frame, text="Color scale max (dB)").grid(row=0, column=2, sticky="w", padx=5, pady=3)
+        ttk.Label(disp_frame, text="Color scale max (dB)").grid(row=1, column=2, sticky="w", padx=5, pady=3)
         self._vars["sg_snr_max"] = tk.StringVar(value="")
         ttk.Entry(disp_frame, textvariable=self._vars["sg_snr_max"], width=10).grid(
-            row=0, column=3, sticky="ew", padx=5, pady=3)
+            row=1, column=3, sticky="ew", padx=5, pady=3)
 
-        ttk.Label(disp_frame, text="Colormap").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(disp_frame, text="Colormap").grid(row=2, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_cmap"] = tk.StringVar(value="")
         ttk.Combobox(disp_frame, textvariable=self._vars["sg_cmap"],
                      values=["viridis", "plasma", "inferno", "magma", "hot", "jet"], width=10, state="readonly").grid(
-            row=1, column=1, sticky="ew", padx=5, pady=3)
+            row=2, column=1, sticky="ew", padx=5, pady=3)
 
-        ttk.Label(disp_frame, text="DPI").grid(row=1, column=2, sticky="w", padx=5, pady=3)
+        ttk.Label(disp_frame, text="DPI").grid(row=2, column=2, sticky="w", padx=5, pady=3)
         self._vars["sg_dpi"] = tk.StringVar(value="")
         ttk.Entry(disp_frame, textvariable=self._vars["sg_dpi"], width=10).grid(
-            row=1, column=3, sticky="ew", padx=5, pady=3)
+            row=2, column=3, sticky="ew", padx=5, pady=3)
 
-        ttk.Label(disp_frame, text="Figure size (w,h inches)").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(disp_frame, text="Figure size (w,h inches)").grid(row=3, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_figsize"] = tk.StringVar(value="")
         ttk.Entry(disp_frame, textvariable=self._vars["sg_figsize"], width=10).grid(
-            row=2, column=1, columnspan=3, sticky="ew", padx=5, pady=3)
+            row=3, column=1, columnspan=3, sticky="ew", padx=5, pady=3)
 
         self._vars["sg_compute"] = tk.BooleanVar(value=False)
         self._vars["sg_mqtt"]    = tk.BooleanVar(value=False)
         self._vars["sg_output"]  = tk.BooleanVar(value=False)
         checks_frame = ttk.Frame(disp_frame)
-        checks_frame.grid(row=3, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+        checks_frame.grid(row=4, column=0, columnspan=4, sticky="w", padx=5, pady=2)
         ttk.Checkbutton(checks_frame, text="Compute",
                         variable=self._vars["sg_compute"]).grid(
             row=0, column=0, sticky="w", padx=(0, 8))
@@ -3949,7 +3969,7 @@ class MEPGui:
             "sg_nperseg", "sg_nfft", "sg_noverlap", "sg_window", "sg_reduce_op",
             "sg_num_spectra_per_chunk", "sg_spectra_per_output", "sg_snr_min",
             "sg_snr_max", "sg_cmap", "sg_dpi", "sg_figsize", "sg_compute",
-            "sg_mqtt", "sg_output",
+            "sg_mqtt", "sg_output", "sg_digital_rf", "sg_metadata",
         ):
             self._vars[key].trace_add("write", self._rec_preview_draft)
 
@@ -5063,6 +5083,8 @@ class MEPGui:
             "compute": self._vars["sg_compute"].get(),
             "mqtt": self._vars["sg_mqtt"].get(),
             "output": self._vars["sg_output"].get(),
+            "digital_rf": self._vars["sg_digital_rf"].get(),
+            "metadata": self._vars["sg_metadata"].get(),
         }
 
     def _rec_set_draft_values(self, values: dict):
@@ -5089,6 +5111,8 @@ class MEPGui:
             self._vars["sg_compute"].set(bool(values["compute"]))
             self._vars["sg_mqtt"].set(bool(values["mqtt"]))
             self._vars["sg_output"].set(bool(values["output"]))
+            self._vars["sg_digital_rf"].set(bool(values["digital_rf"]))
+            self._vars["sg_metadata"].set(bool(values["metadata"]))
         finally:
             self._rec_trace_busy = False
 
@@ -5104,6 +5128,8 @@ class MEPGui:
             self._vars["sg_compute"].set(False)
             self._vars["sg_mqtt"].set(False)
             self._vars["sg_output"].set(False)
+            self._vars["sg_digital_rf"].set(False)
+            self._vars["sg_metadata"].set(False)
         finally:
             self._rec_trace_busy = False
 
