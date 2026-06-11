@@ -270,6 +270,24 @@ class MEPGui:
         self._vars["conjugate_policy"] = tk.StringVar(value="")
         self._vars["conjugate_actual"] = tk.StringVar(value="—")
 
+    def _add_tooltip(self, widget, text):
+        """Add a simple tooltip to a widget that shows on hover."""
+        def on_enter(event):
+            tooltip = tk.Toplevel(widget)
+            tooltip.wm_overrideredirect(True)
+            tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+            label = ttk.Label(tooltip, text=text, background="#ffffe0", relief="solid", borderwidth=1)
+            label.pack()
+            widget._tooltip = tooltip
+        
+        def on_leave(event):
+            if hasattr(widget, '_tooltip'):
+                widget._tooltip.destroy()
+                del widget._tooltip
+        
+        widget.bind("<Enter>", on_enter)
+        widget.bind("<Leave>", on_leave)
+
     # ------------------------------------------------------------------ #
     #  MQTT listener callbacks (called from MQTT thread → schedule to GUI)
     # ------------------------------------------------------------------ #
@@ -3840,23 +3858,23 @@ class MEPGui:
         row += 1
         ttk.Label(
             yaml_only_frame,
+            text="Configured chain:",
+            font=("TkDefaultFont", 9),
+        ).grid(row=0, column=0, sticky="w", padx=5, pady=(2, 0))
+        ttk.Label(
+            yaml_only_frame,
             textvariable=self._vars["calc_resamplers"],
             justify="left",
             wraplength=450,
             font=("TkDefaultFont", 9),
-        ).grid(row=0, column=0, sticky="w", padx=5, pady=(2, 2))
+        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 2))
         ttk.Label(
             yaml_only_frame,
-            text="pipeline.converter (int\u2192float): always enabled",
-            foreground="grey",
+            text="• pipeline.converter (int\u2192float): always enabled\n"
+                 "• pipeline.int_converter (float\u2192int before DRF sink): always enabled",
+            justify="left",
             font=("TkDefaultFont", 9),
-        ).grid(row=1, column=0, sticky="w", padx=5, pady=0)
-        ttk.Label(
-            yaml_only_frame,
-            text="pipeline.int_converter (float\u2192int before DRF sink): always enabled",
-            foreground="grey",
-            font=("TkDefaultFont", 9),
-        ).grid(row=2, column=0, sticky="w", padx=5, pady=(0, 4))
+        ).grid(row=2, column=0, sticky="w", padx=5, pady=(2, 4))
 
         # ===== DIGITAL RF IQ =====
         drf_frame = ttk.LabelFrame(scrollable_frame, text="DigitalRF IQ")
@@ -3865,73 +3883,125 @@ class MEPGui:
         row += 1
         self._vars["sg_digital_rf"] = tk.BooleanVar(value=False)
         self._vars["sg_metadata"] = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        self._drf_metadata_lock = False
+        
+        def _sync_drf_metadata(*_):
+            if self._drf_metadata_lock:
+                return
+            self._drf_metadata_lock = True
+            try:
+                val = self._vars["sg_digital_rf"].get()
+                self._vars["sg_metadata"].set(val)
+            finally:
+                self._drf_metadata_lock = False
+        
+        self._vars["sg_digital_rf"].trace_add("write", _sync_drf_metadata)
+        self._vars["sg_metadata"].trace_add("write", _sync_drf_metadata)
+        
+        cb_drf = ttk.Checkbutton(
             drf_frame,
-            text="pipeline.digital_rf (IQ recording to disk)",
+            text="IQ Recording",
             variable=self._vars["sg_digital_rf"],
-        ).grid(row=0, column=0, sticky="w", padx=5, pady=(4, 2))
-        ttk.Checkbutton(
+        )
+        cb_drf.grid(row=0, column=0, sticky="w", padx=5, pady=(4, 2))
+        self._add_tooltip(cb_drf, "pipeline.digital_rf (IQ recording to disk)")
+        
+        cb_metadata = ttk.Checkbutton(
             drf_frame,
-            text="pipeline.metadata (DRF metadata file alongside IQ)",
+            text="Metadata File",
             variable=self._vars["sg_metadata"],
-        ).grid(row=1, column=0, sticky="w", padx=5, pady=(0, 4))
+        )
+        cb_metadata.grid(row=1, column=0, sticky="w", padx=5, pady=(0, 4))
+        self._add_tooltip(cb_metadata, "pipeline.metadata (DRF metadata file alongside IQ)")
 
         # ===== SPECTROGRAMS =====
         disp_frame = ttk.LabelFrame(scrollable_frame, text="Spectrograms")
         disp_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
-        disp_frame.columnconfigure(1, weight=1)
+        disp_frame.columnconfigure(0, weight=1)
         disp_frame.columnconfigure(3, weight=1)
         row += 1
 
+        # Header row
+        ttk.Label(disp_frame, text="EDITABLE", font=("TkDefaultFont", 9, "bold")).grid(
+            row=0, column=0, sticky="w", padx=5, pady=(4, 2))
+        ttk.Label(disp_frame, text="CALCULATED", font=("TkDefaultFont", 9, "bold")).grid(
+            row=0, column=3, sticky="w", padx=5, pady=(4, 2))
+
+        # rows/output
+        row_i = 1
+        ttk.Label(disp_frame, text="rows/output").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(disp_frame, text="→").grid(row=row_i, column=2, padx=2)
         self._vars["calc_waterfall_formula"] = tk.StringVar(value="—")
-        ttk.Label(disp_frame, text="rows/output").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(disp_frame, textvariable=self._vars["calc_waterfall_formula"], justify="left").grid(
+            row=row_i, column=3, sticky="w", padx=5, pady=3)
+        row_i += 1
         self._vars["sg_spectra_per_output"] = tk.StringVar(value="")
         ttk.Entry(disp_frame, textvariable=self._vars["sg_spectra_per_output"], width=10).grid(
-            row=0, column=1, sticky="ew", padx=5, pady=3)
-        ttk.Label(disp_frame, text="→").grid(row=0, column=2, padx=2)
-        ttk.Label(disp_frame, textvariable=self._vars["calc_waterfall_formula"], justify="left").grid(
-            row=0, column=3, sticky="w", padx=5, pady=3)
+            row=row_i, column=0, sticky="ew", padx=5, pady=(0, 4))
 
-        ttk.Label(disp_frame, text="Color scale min (dB)").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        # Color scale min
+        row_i += 1
+        ttk.Label(disp_frame, text="Color scale min (dB)").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+        row_i += 1
         self._vars["sg_snr_min"] = tk.StringVar(value="")
         ttk.Entry(disp_frame, textvariable=self._vars["sg_snr_min"], width=10).grid(
-            row=1, column=1, sticky="ew", padx=5, pady=3)
+            row=row_i, column=0, sticky="ew", padx=5, pady=(0, 4))
 
-        ttk.Label(disp_frame, text="Color scale max (dB)").grid(row=1, column=2, sticky="w", padx=5, pady=3)
+        # Color scale max
+        row_i += 1
+        ttk.Label(disp_frame, text="Color scale max (dB)").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+        row_i += 1
         self._vars["sg_snr_max"] = tk.StringVar(value="")
         ttk.Entry(disp_frame, textvariable=self._vars["sg_snr_max"], width=10).grid(
-            row=1, column=3, sticky="ew", padx=5, pady=3)
+            row=row_i, column=0, sticky="ew", padx=5, pady=(0, 4))
 
-        ttk.Label(disp_frame, text="Colormap").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        # Colormap
+        row_i += 1
+        ttk.Label(disp_frame, text="Colormap").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+        row_i += 1
         self._vars["sg_cmap"] = tk.StringVar(value="")
         ttk.Combobox(disp_frame, textvariable=self._vars["sg_cmap"],
                      values=["viridis", "plasma", "inferno", "magma", "hot", "jet"], width=10, state="readonly").grid(
-            row=2, column=1, sticky="ew", padx=5, pady=3)
+            row=row_i, column=0, sticky="ew", padx=5, pady=(0, 4))
 
-        ttk.Label(disp_frame, text="DPI").grid(row=2, column=2, sticky="w", padx=5, pady=3)
+        # DPI
+        row_i += 1
+        ttk.Label(disp_frame, text="DPI").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+        row_i += 1
         self._vars["sg_dpi"] = tk.StringVar(value="")
         ttk.Entry(disp_frame, textvariable=self._vars["sg_dpi"], width=10).grid(
-            row=2, column=3, sticky="ew", padx=5, pady=3)
+            row=row_i, column=0, sticky="ew", padx=5, pady=(0, 4))
 
-        ttk.Label(disp_frame, text="Figure size (w,h inches)").grid(row=3, column=0, sticky="w", padx=5, pady=3)
+        # Figure size
+        row_i += 1
+        ttk.Label(disp_frame, text="Figure size (w,h inches)").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+        row_i += 1
         self._vars["sg_figsize"] = tk.StringVar(value="")
         ttk.Entry(disp_frame, textvariable=self._vars["sg_figsize"], width=10).grid(
-            row=3, column=1, columnspan=3, sticky="ew", padx=5, pady=3)
+            row=row_i, column=0, sticky="ew", padx=5, pady=(0, 4))
 
+        # Checkboxes
+        row_i += 1
         self._vars["sg_compute"] = tk.BooleanVar(value=False)
         self._vars["sg_mqtt"]    = tk.BooleanVar(value=False)
         self._vars["sg_output"]  = tk.BooleanVar(value=False)
         checks_frame = ttk.Frame(disp_frame)
-        checks_frame.grid(row=4, column=0, columnspan=4, sticky="w", padx=5, pady=2)
-        ttk.Checkbutton(checks_frame, text="Compute",
-                        variable=self._vars["sg_compute"]).grid(
-            row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Checkbutton(checks_frame, text="Stream MQTT",
-                        variable=self._vars["sg_mqtt"]).grid(
-            row=0, column=1, sticky="w", padx=(0, 8))
-        ttk.Checkbutton(checks_frame, text="Save to disk",
-                        variable=self._vars["sg_output"]).grid(
-            row=0, column=2, sticky="w")
+        checks_frame.grid(row=row_i, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+        
+        cb_compute = ttk.Checkbutton(checks_frame, text="Compute",
+                        variable=self._vars["sg_compute"])
+        cb_compute.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self._add_tooltip(cb_compute, "pipeline.compute")
+        
+        cb_mqtt = ttk.Checkbutton(checks_frame, text="Stream MQTT",
+                        variable=self._vars["sg_mqtt"])
+        cb_mqtt.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self._add_tooltip(cb_mqtt, "pipeline.mqtt")
+        
+        cb_output = ttk.Checkbutton(checks_frame, text="Save to disk",
+                        variable=self._vars["sg_output"])
+        cb_output.grid(row=0, column=2, sticky="w")
+        self._add_tooltip(cb_output, "pipeline.output")
 
         # ===== NEXT-RECORD ACTIONS =====
         action_frame = ttk.LabelFrame(scrollable_frame, text="REC Settings")
