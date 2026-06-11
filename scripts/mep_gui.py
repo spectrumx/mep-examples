@@ -3827,9 +3827,7 @@ class MEPGui:
         ent_batch_size.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
         self._add_tooltip(
             ent_batch_size,
-            "Packets processed per batch by the network receiver. In these presets, "
-            "this is part of the chunk-size relationship that determines how much data "
-            "moves through the recorder at once.",
+            "Packets processed per batch by the network receiver.",
         )
 
         throughput_row += 1
@@ -3898,9 +3896,17 @@ class MEPGui:
         ent_worker_threads.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
         self._add_tooltip(
             ent_worker_threads,
-            "Worker threads used by the event-based scheduler. Increasing this can "
-            "help if the graph is compute-bound rather than network-bound.",
+            "Worker threads used by the event-based scheduler.",
         )
+
+        self._vars["calc_throughput_formula"] = tk.StringVar(value="—")
+        ttk.Label(
+            throughput_frame,
+            textvariable=self._vars["calc_throughput_formula"],
+            wraplength=455,
+            justify="left",
+            font=("TkDefaultFont", 9),
+        ).grid(row=throughput_row, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 4))
 
         throughput_row += 1
         ttk.Label(
@@ -5286,7 +5292,8 @@ class MEPGui:
             self._vars["rec_draft_error"].set("")
             for key in (
                 "calc_freq_formula", "calc_hop_formula", "calc_segments",
-                "calc_cadence_formula", "calc_resamplers", "calc_waterfall_formula",
+                    "calc_cadence_formula", "calc_resamplers", "calc_waterfall_formula",
+                    "calc_throughput_formula",
             ):
                 self._vars[key].set("—")
             self._rec_stage_button.configure(state="disabled")
@@ -5324,6 +5331,18 @@ class MEPGui:
             "scan: {scan_time_s:.6g} s/row\n"
             "rate: {spectrum_rate_hz:,.6g} rows/s".format(**metrics)
         )
+        batch_size = int(model["values"]["batch_size"])
+        chunk_size = int(model["values"]["chunk_size"])
+        if batch_size > 0 and chunk_size % batch_size == 0:
+            samples_per_packet = chunk_size // batch_size
+            self._vars["calc_throughput_formula"].set(
+                f"Throughput relation: {batch_size:,} packets/batch × "
+                f"{samples_per_packet:,} samples/packet = {chunk_size:,} samples/chunk"
+            )
+        else:
+            self._vars["calc_throughput_formula"].set(
+                "Throughput relation: current batch size and chunk size do not divide exactly"
+            )
         stages = model.get("enabled_resamplers", [])
         stage_text = ", ".join(
             f"{stage['name']} {stage['up']}/{stage['down']}" for stage in stages
