@@ -322,6 +322,10 @@ def resolve_recorder_preset(
         waterfall_duration = scan_time * spectra_per_output
 
         values = {
+            "chunk_size": int(packet["num_samples"]),
+            "batch_capacity": int(packet.get("batch_capacity", 4)),
+            "buffer_size": int(packet.get("buffer_size", 4)),
+            "worker_thread_number": int(config["scheduler"].get("worker_thread_number", 8)),
             "nperseg": nperseg,
             "nfft": nfft,
             "noverlap": noverlap,
@@ -378,7 +382,24 @@ def recorder_draft_to_overrides(draft: dict[str, object]) -> dict[str, object]:
     if len(figsize) != 2 or any(value <= 0 for value in figsize):
         raise ValueError("Figure size must contain two positive values")
 
+    chunk_size = int(draft["chunk_size"])
+    batch_capacity = int(draft["batch_capacity"])
+    buffer_size = int(draft["buffer_size"])
+    worker_thread_number = int(draft["worker_thread_number"])
+    if chunk_size <= 0:
+        raise ValueError("Chunk size must be positive")
+    if batch_capacity <= 0:
+        raise ValueError("Batch capacity must be positive")
+    if buffer_size <= 0:
+        raise ValueError("Buffer size must be positive")
+    if worker_thread_number <= 0:
+        raise ValueError("Worker threads must be positive")
+
     overrides = {
+        "packet.num_samples": chunk_size,
+        "packet.batch_capacity": batch_capacity,
+        "packet.buffer_size": buffer_size,
+        "scheduler.worker_thread_number": worker_thread_number,
         "spectrogram.nperseg": int(draft["nperseg"]),
         "spectrogram.nfft": int(draft["nfft"]),
         "spectrogram.noverlap": int(draft["noverlap"]),

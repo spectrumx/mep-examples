@@ -3863,6 +3863,38 @@ class MEPGui:
             row=row_i, column=1, sticky="w", padx=5, pady=3)
 
         row_i += 1
+        ttk.Label(disp_frame, text="Chunk size (samples)").grid(
+            row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_chunk_size"] = tk.StringVar(value="")
+        ent_chunk_size = ttk.Entry(disp_frame, textvariable=self._vars["sg_chunk_size"], width=14)
+        ent_chunk_size.grid(row=row_i, column=1, sticky="w", padx=5, pady=3)
+        self._add_tooltip(ent_chunk_size, "packet.num_samples")
+
+        row_i += 1
+        ttk.Label(disp_frame, text="Batch capacity").grid(
+            row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_batch_capacity"] = tk.StringVar(value="")
+        ent_batch_capacity = ttk.Entry(disp_frame, textvariable=self._vars["sg_batch_capacity"], width=14)
+        ent_batch_capacity.grid(row=row_i, column=1, sticky="w", padx=5, pady=3)
+        self._add_tooltip(ent_batch_capacity, "packet.batch_capacity")
+
+        row_i += 1
+        ttk.Label(disp_frame, text="RX buffer size (chunks)").grid(
+            row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_buffer_size"] = tk.StringVar(value="")
+        ent_buffer_size = ttk.Entry(disp_frame, textvariable=self._vars["sg_buffer_size"], width=14)
+        ent_buffer_size.grid(row=row_i, column=1, sticky="w", padx=5, pady=3)
+        self._add_tooltip(ent_buffer_size, "packet.buffer_size")
+
+        row_i += 1
+        ttk.Label(disp_frame, text="Scheduler worker threads").grid(
+            row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_worker_threads"] = tk.StringVar(value="")
+        ent_worker_threads = ttk.Entry(disp_frame, textvariable=self._vars["sg_worker_threads"], width=14)
+        ent_worker_threads.grid(row=row_i, column=1, sticky="w", padx=5, pady=3)
+        self._add_tooltip(ent_worker_threads, "scheduler.worker_thread_number")
+
+        row_i += 1
         ttk.Label(disp_frame, text="Reduction op").grid(
             row=row_i, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_reduce_op"] = tk.StringVar(value="")
@@ -3960,7 +3992,8 @@ class MEPGui:
         ttk.Label(
             yaml_only_frame,
               text="• pipeline.converter (int\u2192float): Enabled\n"
-                  "• pipeline.int_converter (float\u2192int before DRF sink): Enabled when DigitalRF IQ is on",
+                  "• pipeline.int_converter (float\u2192int before DRF sink): Enabled when DigitalRF IQ is on\n"
+                  "• resampler chain and packet.batch_size",
             justify="left",
             font=("TkDefaultFont", 9),
         ).grid(row=2, column=0, sticky="w", padx=5, pady=(2, 4))
@@ -3999,7 +4032,8 @@ class MEPGui:
         self._vars["sample_rate_mhz"].trace_add("write", self._on_rec_sample_rate_change)
         for key in (
             "sg_nperseg", "sg_nfft", "sg_noverlap", "sg_window", "sg_reduce_op",
-            "sg_num_spectra_per_chunk", "sg_spectra_per_output", "sg_snr_min",
+            "sg_num_spectra_per_chunk", "sg_chunk_size", "sg_batch_capacity",
+            "sg_buffer_size", "sg_worker_threads", "sg_spectra_per_output", "sg_snr_min",
             "sg_snr_max", "sg_cmap", "sg_dpi", "sg_figsize", "sg_compute",
             "sg_mqtt", "sg_output", "sg_digital_rf", "sg_metadata",
         ):
@@ -5100,6 +5134,10 @@ class MEPGui:
     def _rec_collect_draft(self) -> dict:
         """Collect widget values only; recorder parsing belongs to start_mep_rx."""
         return {
+            "chunk_size": self._vars["sg_chunk_size"].get(),
+            "batch_capacity": self._vars["sg_batch_capacity"].get(),
+            "buffer_size": self._vars["sg_buffer_size"].get(),
+            "worker_thread_number": self._vars["sg_worker_threads"].get(),
             "nperseg": self._vars["sg_nperseg"].get(),
             "nfft": self._vars["sg_nfft"].get(),
             "noverlap": self._vars["sg_noverlap"].get(),
@@ -5123,6 +5161,10 @@ class MEPGui:
         self._rec_trace_busy = True
         try:
             field_map = {
+                "sg_chunk_size": "chunk_size",
+                "sg_batch_capacity": "batch_capacity",
+                "sg_buffer_size": "buffer_size",
+                "sg_worker_threads": "worker_thread_number",
                 "sg_nperseg": "nperseg",
                 "sg_nfft": "nfft",
                 "sg_noverlap": "noverlap",
@@ -5152,6 +5194,7 @@ class MEPGui:
         self._rec_trace_busy = True
         try:
             for key in (
+                "sg_chunk_size", "sg_batch_capacity", "sg_buffer_size", "sg_worker_threads",
                 "sg_nperseg", "sg_nfft", "sg_noverlap", "sg_window", "sg_reduce_op",
                 "sg_num_spectra_per_chunk", "sg_spectra_per_output", "sg_snr_min",
                 "sg_snr_max", "sg_cmap", "sg_dpi", "sg_figsize",
