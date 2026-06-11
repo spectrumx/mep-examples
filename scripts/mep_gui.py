@@ -3741,19 +3741,54 @@ class MEPGui:
             wraplength=455,
         ).grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 5))
 
-        # ===== PACKET CONJUGATE =====
-        conj_frame = ttk.LabelFrame(scrollable_frame, text="packet.apply_conjugate OVERRIDE")
-        conj_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
-        conj_frame.columnconfigure(1, weight=1)
+        # ===== DIGITAL RF IQ =====
+        drf_frame = ttk.LabelFrame(scrollable_frame, text="DigitalRF IQ")
+        drf_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
+        drf_frame.columnconfigure(1, weight=1)
         row += 1
 
-        ttk.Label(conj_frame, text="Policy").grid(
-            row=0, column=0, sticky="w", padx=5, pady=4)
-        
-        policy_frame = ttk.Frame(conj_frame)
-        policy_frame.grid(row=0, column=1, sticky="ew", padx=5, pady=4)
-        policy_frame.columnconfigure(3, weight=1)
+        self._vars["sg_digital_rf"] = tk.BooleanVar(value=False)
+        self._vars["sg_metadata"] = tk.BooleanVar(value=False)
+        self._drf_metadata_lock = False
 
+        def _sync_drf_metadata(*_):
+            if self._drf_metadata_lock:
+                return
+            self._drf_metadata_lock = True
+            try:
+                val = bool(self._vars["sg_digital_rf"].get())
+                self._vars["sg_digital_rf"].set(val)
+                self._vars["sg_metadata"].set(val)
+            finally:
+                self._drf_metadata_lock = False
+
+        self._vars["sg_digital_rf"].trace_add("write", _sync_drf_metadata)
+        self._vars["sg_metadata"].trace_add("write", _sync_drf_metadata)
+
+        cb_drf = ttk.Checkbutton(
+            drf_frame,
+            text="Save DigitalRF IQ to disk",
+            variable=self._vars["sg_digital_rf"],
+        )
+        cb_drf.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
+        self._add_tooltip(cb_drf, "pipeline.digital_rf")
+
+        cb_metadata = ttk.Checkbutton(
+            drf_frame,
+            text="Save DigitalRF metadata to disk",
+            variable=self._vars["sg_metadata"],
+        )
+        cb_metadata.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 4))
+        self._add_tooltip(cb_metadata, "pipeline.metadata")
+
+        ttk.Separator(drf_frame, orient="horizontal").grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 4)
+        )
+
+        ttk.Label(drf_frame, text="Apply conjugate").grid(
+            row=3, column=0, sticky="w", padx=5, pady=4)
+        policy_frame = ttk.Frame(drf_frame)
+        policy_frame.grid(row=3, column=1, sticky="w", padx=5, pady=4)
         policy_labels = {
             "auto": "Auto",
             "force_on": "Force On",
@@ -3768,88 +3803,142 @@ class MEPGui:
                 command=self._conjugate_policy_changed,
             ).grid(row=0, column=idx, sticky="w", padx=2)
 
-        ttk.Label(conj_frame, text="Actual state").grid(
-            row=1, column=0, sticky="w", padx=5, pady=4)
-        ttk.Entry(conj_frame, textvariable=self._vars["conjugate_actual"],
-                 state="readonly", width=12).grid(
-            row=1, column=1, sticky="ew", padx=5, pady=4)
+        ttk.Label(drf_frame, text="Actual state").grid(
+            row=4, column=0, sticky="w", padx=5, pady=4)
+        ttk.Entry(
+            drf_frame,
+            textvariable=self._vars["conjugate_actual"],
+            state="readonly",
+            width=14,
+        ).grid(row=4, column=1, sticky="w", padx=5, pady=4)
 
-        # ===== FREQUENCY RESOLUTION =====
-        fft_frame = ttk.LabelFrame(scrollable_frame, text="Frequency Resolution")
-        fft_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
-        fft_frame.columnconfigure(1, weight=1)
-        fft_frame.columnconfigure(3, weight=1)
+        # ===== SPECTROGRAMS =====
+        disp_frame = ttk.LabelFrame(scrollable_frame, text="Spectrograms")
+        disp_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
+        disp_frame.columnconfigure(2, weight=1)
         row += 1
 
+        # Keep derived values available for preview/status even if not all are displayed inline.
         self._vars["calc_freq_formula"] = tk.StringVar(value="—")
         self._vars["calc_hop_formula"] = tk.StringVar(value="—")
         self._vars["calc_segments"] = tk.StringVar(value="—")
-        ttk.Label(fft_frame, text="EDITABLE", font=("TkDefaultFont", 9, "bold")).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
-        ttk.Label(fft_frame, text="CALCULATED", font=("TkDefaultFont", 9, "bold")).grid(
-            row=0, column=3, sticky="w", padx=5, pady=(4, 2))
-
-        ttk.Label(fft_frame, text="nperseg").grid(row=1, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_nperseg"] = tk.StringVar(value="")
-        ttk.Entry(fft_frame, textvariable=self._vars["sg_nperseg"], width=10).grid(
-            row=1, column=1, sticky="ew", padx=5, pady=3)
-        ttk.Label(fft_frame, text="→").grid(row=1, column=2, padx=2)
-        ttk.Label(fft_frame, textvariable=self._vars["calc_segments"], justify="left").grid(
-            row=1, column=3, sticky="w", padx=5, pady=3)
-
-        ttk.Label(fft_frame, text="nfft").grid(row=2, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_nfft"] = tk.StringVar(value="")
-        ttk.Entry(fft_frame, textvariable=self._vars["sg_nfft"], width=10).grid(
-            row=2, column=1, sticky="ew", padx=5, pady=3)
-        ttk.Label(fft_frame, text="→").grid(row=2, column=2, padx=2)
-        ttk.Label(fft_frame, textvariable=self._vars["calc_freq_formula"], justify="left").grid(
-            row=2, column=3, sticky="w", padx=5, pady=3)
-
-        ttk.Label(fft_frame, text="noverlap").grid(row=3, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_noverlap"] = tk.StringVar(value="")
-        ttk.Entry(fft_frame, textvariable=self._vars["sg_noverlap"], width=10).grid(
-            row=3, column=1, sticky="ew", padx=5, pady=3)
-        ttk.Label(fft_frame, text="→").grid(row=3, column=2, padx=2)
-        ttk.Label(fft_frame, textvariable=self._vars["calc_hop_formula"], justify="left").grid(
-            row=3, column=3, sticky="w", padx=5, pady=3)
-
-        ttk.Label(fft_frame, text="window").grid(row=4, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_window"] = tk.StringVar(value="")
-        ttk.Combobox(fft_frame, textvariable=self._vars["sg_window"],
-                     values=["hann", "hamming", "blackman", "rectangular"], width=10, state="readonly").grid(
-            row=4, column=1, sticky="ew", padx=5, pady=3)
-
-        # ===== ROW CADENCE =====
-        cadence_frame = ttk.LabelFrame(scrollable_frame, text="Spectrum Row Cadence")
-        cadence_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
-        cadence_frame.columnconfigure(0, weight=0, minsize=170)
-        cadence_frame.columnconfigure(1, weight=0, minsize=20)
-        cadence_frame.columnconfigure(2, weight=1, minsize=280)
-        row += 1
-
         self._vars["calc_cadence_formula"] = tk.StringVar(value="—")
         self._vars["calc_resamplers"] = tk.StringVar(value="—")
-        ttk.Label(cadence_frame, text="EDITABLE", font=("TkDefaultFont", 9, "bold")).grid(
-            row=0, column=0, sticky="w", padx=5, pady=(4, 2))
-        ttk.Label(cadence_frame, text="DERIVED", font=("TkDefaultFont", 9, "bold")).grid(
-            row=0, column=2, sticky="w", padx=5, pady=(4, 2))
-        ttk.Label(cadence_frame, text="spectra/chunk").grid(row=1, column=0, sticky="w", padx=5, pady=(3, 0))
+        self._vars["calc_waterfall_formula"] = tk.StringVar(value="—")
+
+        row_i = 0
+        ttk.Label(disp_frame, text="nperseg").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_nperseg"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_nperseg"], width=14).grid(
+            row=row_i, column=1, sticky="w", padx=5, pady=3)
+
+        row_i += 1
+        ttk.Label(disp_frame, text="nfft").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_nfft"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_nfft"], width=14).grid(
+            row=row_i, column=1, sticky="w", padx=5, pady=3)
+
+        row_i += 1
+        ttk.Label(disp_frame, text="noverlap").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_noverlap"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_noverlap"], width=14).grid(
+            row=row_i, column=1, sticky="w", padx=5, pady=3)
+
+        row_i += 1
+        ttk.Label(disp_frame, text="window").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_window"] = tk.StringVar(value="")
+        ttk.Combobox(
+            disp_frame,
+            textvariable=self._vars["sg_window"],
+            values=["hann", "hamming", "blackman", "rectangular"],
+            width=14,
+            state="readonly",
+        ).grid(row=row_i, column=1, sticky="w", padx=5, pady=3)
+
+        row_i += 1
+        ttk.Label(disp_frame, text="Spectrum row cadence").grid(
+            row=row_i, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_num_spectra_per_chunk"] = tk.StringVar(value="")
-        ttk.Entry(cadence_frame, textvariable=self._vars["sg_num_spectra_per_chunk"], width=14).grid(
-            row=2, column=0, sticky="ew", padx=5, pady=(1, 4))
-        ttk.Label(cadence_frame, text="→").grid(row=2, column=1, sticky="n", padx=2, pady=(2, 0))
-        ttk.Label(
-            cadence_frame,
-            textvariable=self._vars["calc_cadence_formula"],
-            justify="left",
-            wraplength=250,
-            font=("TkDefaultFont", 9),
-        ).grid(row=1, column=2, rowspan=2, sticky="nw", padx=5, pady=3)
-        ttk.Label(cadence_frame, text="reduction").grid(row=3, column=0, sticky="w", padx=5, pady=(3, 0))
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_num_spectra_per_chunk"], width=14).grid(
+            row=row_i, column=1, sticky="w", padx=5, pady=3)
+
+        row_i += 1
+        ttk.Label(disp_frame, text="Reduction op").grid(
+            row=row_i, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_reduce_op"] = tk.StringVar(value="")
-        ttk.Combobox(cadence_frame, textvariable=self._vars["sg_reduce_op"],
-                     values=["max", "median", "mean"], width=14, state="readonly").grid(
-            row=4, column=0, sticky="ew", padx=5, pady=(1, 3))
+        ttk.Combobox(
+            disp_frame,
+            textvariable=self._vars["sg_reduce_op"],
+            values=["max", "median", "mean"],
+            width=14,
+            state="readonly",
+        ).grid(row=row_i, column=1, sticky="w", padx=5, pady=3)
+
+        row_i += 1
+        ttk.Label(disp_frame, text="rows/output").grid(
+            row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_spectra_per_output"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_spectra_per_output"], width=8).grid(
+            row=row_i, column=1, sticky="w", padx=5, pady=3)
+        ttk.Label(disp_frame, textvariable=self._vars["calc_waterfall_formula"], justify="left").grid(
+            row=row_i, column=2, sticky="w", padx=8, pady=3)
+
+        row_i += 1
+        ttk.Label(disp_frame, text="Color scale min (dB)").grid(
+            row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_snr_min"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_snr_min"], width=14).grid(
+            row=row_i, column=1, sticky="w", padx=5, pady=3)
+
+        row_i += 1
+        ttk.Label(disp_frame, text="Color scale max (dB)").grid(
+            row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_snr_max"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_snr_max"], width=14).grid(
+            row=row_i, column=1, sticky="w", padx=5, pady=3)
+
+        row_i += 1
+        ttk.Label(disp_frame, text="Colormap").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_cmap"] = tk.StringVar(value="")
+        ttk.Combobox(
+            disp_frame,
+            textvariable=self._vars["sg_cmap"],
+            values=["viridis", "plasma", "inferno", "magma", "hot", "jet"],
+            width=14,
+            state="readonly",
+        ).grid(row=row_i, column=1, sticky="w", padx=5, pady=3)
+
+        row_i += 1
+        ttk.Label(disp_frame, text="DPI").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_dpi"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_dpi"], width=14).grid(
+            row=row_i, column=1, sticky="w", padx=5, pady=3)
+
+        row_i += 1
+        ttk.Label(disp_frame, text="Figure size (w,h inches)").grid(
+            row=row_i, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_figsize"] = tk.StringVar(value="")
+        ttk.Entry(disp_frame, textvariable=self._vars["sg_figsize"], width=18).grid(
+            row=row_i, column=1, sticky="w", padx=5, pady=3)
+
+        row_i += 1
+        self._vars["sg_compute"] = tk.BooleanVar(value=False)
+        self._vars["sg_mqtt"] = tk.BooleanVar(value=False)
+        self._vars["sg_output"] = tk.BooleanVar(value=False)
+        checks_frame = ttk.Frame(disp_frame)
+        checks_frame.grid(row=row_i, column=0, columnspan=3, sticky="w", padx=5, pady=2)
+
+        cb_compute = ttk.Checkbutton(checks_frame, text="Compute", variable=self._vars["sg_compute"])
+        cb_compute.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self._add_tooltip(cb_compute, "pipeline.compute")
+
+        cb_mqtt = ttk.Checkbutton(checks_frame, text="Stream MQTT", variable=self._vars["sg_mqtt"])
+        cb_mqtt.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self._add_tooltip(cb_mqtt, "pipeline.mqtt")
+
+        cb_output = ttk.Checkbutton(checks_frame, text="Save to disk", variable=self._vars["sg_output"])
+        cb_output.grid(row=0, column=2, sticky="w")
+        self._add_tooltip(cb_output, "pipeline.output")
 
         # ===== YAML-ONLY SETTINGS =====
         yaml_only_frame = ttk.LabelFrame(scrollable_frame, text="Set via YAML only")
@@ -3858,7 +3947,7 @@ class MEPGui:
         row += 1
         ttk.Label(
             yaml_only_frame,
-            text="Configured chain:",
+            text="• Configured chain:",
             font=("TkDefaultFont", 9),
         ).grid(row=0, column=0, sticky="w", padx=5, pady=(2, 0))
         ttk.Label(
@@ -3870,138 +3959,11 @@ class MEPGui:
         ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 2))
         ttk.Label(
             yaml_only_frame,
-            text="• pipeline.converter (int\u2192float): always enabled\n"
-                 "• pipeline.int_converter (float\u2192int before DRF sink): always enabled",
+            text="• pipeline.converter (int\u2192float): Enabled\n"
+                 "• pipeline.int_converter (float\u2192int before DRF sink): Enabled",
             justify="left",
             font=("TkDefaultFont", 9),
         ).grid(row=2, column=0, sticky="w", padx=5, pady=(2, 4))
-
-        # ===== DIGITAL RF IQ =====
-        drf_frame = ttk.LabelFrame(scrollable_frame, text="DigitalRF IQ")
-        drf_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
-        drf_frame.columnconfigure(0, weight=1)
-        row += 1
-        self._vars["sg_digital_rf"] = tk.BooleanVar(value=False)
-        self._vars["sg_metadata"] = tk.BooleanVar(value=False)
-        self._drf_metadata_lock = False
-        
-        def _sync_drf_metadata(*_):
-            if self._drf_metadata_lock:
-                return
-            self._drf_metadata_lock = True
-            try:
-                val = self._vars["sg_digital_rf"].get()
-                self._vars["sg_metadata"].set(val)
-            finally:
-                self._drf_metadata_lock = False
-        
-        self._vars["sg_digital_rf"].trace_add("write", _sync_drf_metadata)
-        self._vars["sg_metadata"].trace_add("write", _sync_drf_metadata)
-        
-        cb_drf = ttk.Checkbutton(
-            drf_frame,
-            text="IQ Recording",
-            variable=self._vars["sg_digital_rf"],
-        )
-        cb_drf.grid(row=0, column=0, sticky="w", padx=5, pady=(4, 2))
-        self._add_tooltip(cb_drf, "pipeline.digital_rf (IQ recording to disk)")
-        
-        cb_metadata = ttk.Checkbutton(
-            drf_frame,
-            text="Metadata File",
-            variable=self._vars["sg_metadata"],
-        )
-        cb_metadata.grid(row=1, column=0, sticky="w", padx=5, pady=(0, 4))
-        self._add_tooltip(cb_metadata, "pipeline.metadata (DRF metadata file alongside IQ)")
-
-        # ===== SPECTROGRAMS =====
-        disp_frame = ttk.LabelFrame(scrollable_frame, text="Spectrograms")
-        disp_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
-        disp_frame.columnconfigure(0, weight=1)
-        disp_frame.columnconfigure(3, weight=1)
-        row += 1
-
-        # Header row
-        ttk.Label(disp_frame, text="EDITABLE", font=("TkDefaultFont", 9, "bold")).grid(
-            row=0, column=0, sticky="w", padx=5, pady=(4, 2))
-        ttk.Label(disp_frame, text="CALCULATED", font=("TkDefaultFont", 9, "bold")).grid(
-            row=0, column=3, sticky="w", padx=5, pady=(4, 2))
-
-        # rows/output
-        row_i = 1
-        ttk.Label(disp_frame, text="rows/output").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
-        ttk.Label(disp_frame, text="→").grid(row=row_i, column=2, padx=2)
-        self._vars["calc_waterfall_formula"] = tk.StringVar(value="—")
-        ttk.Label(disp_frame, textvariable=self._vars["calc_waterfall_formula"], justify="left").grid(
-            row=row_i, column=3, sticky="w", padx=5, pady=3)
-        row_i += 1
-        self._vars["sg_spectra_per_output"] = tk.StringVar(value="")
-        ttk.Entry(disp_frame, textvariable=self._vars["sg_spectra_per_output"], width=10).grid(
-            row=row_i, column=0, sticky="ew", padx=5, pady=(0, 4))
-
-        # Color scale min
-        row_i += 1
-        ttk.Label(disp_frame, text="Color scale min (dB)").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
-        row_i += 1
-        self._vars["sg_snr_min"] = tk.StringVar(value="")
-        ttk.Entry(disp_frame, textvariable=self._vars["sg_snr_min"], width=10).grid(
-            row=row_i, column=0, sticky="ew", padx=5, pady=(0, 4))
-
-        # Color scale max
-        row_i += 1
-        ttk.Label(disp_frame, text="Color scale max (dB)").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
-        row_i += 1
-        self._vars["sg_snr_max"] = tk.StringVar(value="")
-        ttk.Entry(disp_frame, textvariable=self._vars["sg_snr_max"], width=10).grid(
-            row=row_i, column=0, sticky="ew", padx=5, pady=(0, 4))
-
-        # Colormap
-        row_i += 1
-        ttk.Label(disp_frame, text="Colormap").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
-        row_i += 1
-        self._vars["sg_cmap"] = tk.StringVar(value="")
-        ttk.Combobox(disp_frame, textvariable=self._vars["sg_cmap"],
-                     values=["viridis", "plasma", "inferno", "magma", "hot", "jet"], width=10, state="readonly").grid(
-            row=row_i, column=0, sticky="ew", padx=5, pady=(0, 4))
-
-        # DPI
-        row_i += 1
-        ttk.Label(disp_frame, text="DPI").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
-        row_i += 1
-        self._vars["sg_dpi"] = tk.StringVar(value="")
-        ttk.Entry(disp_frame, textvariable=self._vars["sg_dpi"], width=10).grid(
-            row=row_i, column=0, sticky="ew", padx=5, pady=(0, 4))
-
-        # Figure size
-        row_i += 1
-        ttk.Label(disp_frame, text="Figure size (w,h inches)").grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
-        row_i += 1
-        self._vars["sg_figsize"] = tk.StringVar(value="")
-        ttk.Entry(disp_frame, textvariable=self._vars["sg_figsize"], width=10).grid(
-            row=row_i, column=0, sticky="ew", padx=5, pady=(0, 4))
-
-        # Checkboxes
-        row_i += 1
-        self._vars["sg_compute"] = tk.BooleanVar(value=False)
-        self._vars["sg_mqtt"]    = tk.BooleanVar(value=False)
-        self._vars["sg_output"]  = tk.BooleanVar(value=False)
-        checks_frame = ttk.Frame(disp_frame)
-        checks_frame.grid(row=row_i, column=0, columnspan=4, sticky="w", padx=5, pady=2)
-        
-        cb_compute = ttk.Checkbutton(checks_frame, text="Compute",
-                        variable=self._vars["sg_compute"])
-        cb_compute.grid(row=0, column=0, sticky="w", padx=(0, 8))
-        self._add_tooltip(cb_compute, "pipeline.compute")
-        
-        cb_mqtt = ttk.Checkbutton(checks_frame, text="Stream MQTT",
-                        variable=self._vars["sg_mqtt"])
-        cb_mqtt.grid(row=0, column=1, sticky="w", padx=(0, 8))
-        self._add_tooltip(cb_mqtt, "pipeline.mqtt")
-        
-        cb_output = ttk.Checkbutton(checks_frame, text="Save to disk",
-                        variable=self._vars["sg_output"])
-        cb_output.grid(row=0, column=2, sticky="w")
-        self._add_tooltip(cb_output, "pipeline.output")
 
         # ===== NEXT-RECORD ACTIONS =====
         action_frame = ttk.LabelFrame(scrollable_frame, text="REC Settings")
@@ -4019,7 +3981,7 @@ class MEPGui:
 
         def _bind_rec_copy_menus(container):
             for widget in container.winfo_children():
-                if isinstance(widget, (ttk.Entry, ttk.Combobox, ttk.Spinbox)):
+                if isinstance(widget, (tk.Entry, ttk.Entry, ttk.Combobox, tk.Spinbox, ttk.Spinbox)):
                     allow_paste = str(widget.cget("state")) not in ("readonly", "disabled")
                     self._bind_copy_menu(widget, allow_paste=allow_paste)
                 elif isinstance(widget, (tk.Label, ttk.Label)):
