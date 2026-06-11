@@ -200,6 +200,8 @@ class MEPGui:
         self._spec_wf_pil = None          # PIL Image wrapping the current buffer
         self._spec_wf_photo = None        # ImageTk.PhotoImage kept alive (Tk GC workaround)
         self._spec_wf_image_id = None     # canvas item id for the single image item
+        self._spec_wf_resize_after_id = None
+        self._spec_wf_target_size = None
         # Persistent canvas items (created once, updated via coords/itemconfig each
         # tick instead of delete-and-recreate — far fewer X11 requests per frame).
         self._spec_line_item = None
@@ -1538,7 +1540,7 @@ class MEPGui:
         self._spec_wf_canvas.grid(row=3, column=0, padx=4, pady=(2, 2), sticky="nsew")
         self._spec_wf_canvas.bind("<Motion>", lambda e: self._spec_cursor_update(e, from_waterfall=True))
         self._spec_wf_canvas.bind("<Button-1>", lambda e: self._spec_cursor_update(e, from_waterfall=True))
-        self._spec_wf_canvas.bind("<Configure>", lambda e: self._spec_wf_resize(e.width, e.height))
+        self._spec_wf_canvas.bind("<Configure>", lambda e: self._spec_wf_resize_request(e.width, e.height))
 
         self._vars["spec_summary"] = tk.StringVar(value="Paused. Press Stream to start SPEC updates")
         ttk.Label(frame, textvariable=self._vars["spec_summary"], foreground="grey",
@@ -1554,10 +1556,26 @@ class MEPGui:
             wraplength=420,
         )
 
+    def _spec_wf_resize_request(self, w: int, h: int):
+        """Debounce canvas resize events to avoid repeated buffer reallocations."""
+        self._spec_wf_target_size = (max(4, int(w)), max(4, int(h)))
+        if self._spec_wf_resize_after_id is not None:
+            return
+        self._spec_wf_resize_after_id = self.root.after(30, self._spec_wf_resize_commit)
+
+    def _spec_wf_resize_commit(self):
+        self._spec_wf_resize_after_id = None
+        if not self._spec_wf_target_size:
+            return
+        w, h = self._spec_wf_target_size
+        self._spec_wf_resize(w, h)
+
     def _spec_wf_resize(self, w: int, h: int):
         """Reallocate the pixel buffer on canvas resize and repaint stored rows."""
         w = max(4, w)
         h = max(4, h)
+        if self._spec_wf_pixels is not None and self._spec_wf_pixels.shape[:2] == (h, w):
+            return
         self._spec_wf_pixels = np.zeros((h, w, 3), dtype=np.uint8)
         self._spec_wf_fill = 0
         self._spec_wf_pil = _PILImage.fromarray(self._spec_wf_pixels, "RGB")
@@ -1755,36 +1773,42 @@ class MEPGui:
 
         canvas = self._spec_wf_canvas if from_waterfall else self._spec_line_canvas
         w = max(10, canvas.winfo_width())
-
-        row_latest = latest["row"]
-        n = len(row_latest)
-        if n <= 0:
-            return
-
         x = 0 if event.x < 0 else (w - 1 if event.x >= w else event.x)
-        idx = int(round(x * (n - 1) / max(1, w - 1)))
-        idx = 0 if idx < 0 else (n - 1 if idx >= n else idx)
-        f0, f1, is_hz = self._spec_freq_axis(latest, n)
-        axis_val = f0 + (f1 - f0) * (idx / max(1, n - 1))
-        flabel = self._spec_fmt_axis(axis_val, is_hz)
 
         if from_waterfall:
             if not rows:
                 return
             h = max(1, self._spec_wf_canvas.winfo_height())
             y = 0 if event.y < 0 else (h - 1 if event.y >= h else event.y)
-            row_offset = min(int(y), len(rows) - 1)
+            if self._spec_wf_fill <= 0 or int(y) >= self._spec_wf_fill:
+                if "spec_cursor" in self._vars:
+                    self._vars["spec_cursor"].set("Cursor: no data at this row")
+                return
+            row_offset = min(int(y), self._spec_wf_fill - 1, len(rows) - 1)
             entry = rows[-1 - row_offset]
             entry_row = entry["row"]
             entry_n = len(entry_row)
             if entry_n <= 0:
                 return
-            entry_idx = int(round(idx * (entry_n - 1) / max(1, n - 1)))
+            entry_idx = int(round(x * (entry_n - 1) / max(1, w - 1)))
             entry_idx = 0 if entry_idx < 0 else (entry_n - 1 if entry_idx >= entry_n else entry_idx)
+            f0, f1, is_hz = self._spec_freq_axis(entry, entry_n)
+            axis_val = f0 + (f1 - f0) * (entry_idx / max(1, entry_n - 1))
+            flabel = self._spec_fmt_axis(axis_val, is_hz)
             amp = float(entry_row[entry_idx])
             ts = entry.get("ts", "?")
         else:
-            amp = float(row_latest[idx])
+            row_latest = latest["row"]
+            display_row = row_latest if self._spec_bins is None else self._spec_resample(row_latest, self._spec_bins)
+            n = len(display_row)
+            if n <= 0:
+                return
+            idx = int(round(x * (n - 1) / max(1, w - 1)))
+            idx = 0 if idx < 0 else (n - 1 if idx >= n else idx)
+            f0, f1, is_hz = self._spec_freq_axis(latest, len(row_latest))
+            axis_val = f0 + (f1 - f0) * (idx / max(1, n - 1))
+            flabel = self._spec_fmt_axis(axis_val, is_hz)
+            amp = float(display_row[idx])
             ts = latest.get("ts", "?")
         label = f"Cursor: f={flabel}  t={ts}  pwr={self._spec_fmt_amp(amp)}"
 
