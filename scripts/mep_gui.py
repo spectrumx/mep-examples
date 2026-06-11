@@ -83,6 +83,12 @@ ADV_PANEL_WIDTH = 510
 DEFAULT_WIN_HEIGHT = 750
 MQTT_LOG_BUFFER_MAX_MESSAGES = 500
 MQTT_LOG_WIDGET_MAX_LINES = 10000
+APP_LOG_WIDGET_MAX_LINES = 5000
+APP_LOG_PENDING_MAX_MESSAGES = 1000
+# Max SPEC frames queued between render ticks. Bounds the MQTT->Tk handoff and
+# never exceeds a screen of catch-up (waterfall height), so it drops only the
+# oldest frames under sustained overrun, never silently coalesces fresh ones.
+SPEC_PENDING_MAX_ROWS = 256
 
 
 # ===== TEXT LOGGING HANDLER ===== #
@@ -90,10 +96,15 @@ MQTT_LOG_WIDGET_MAX_LINES = 10000
 class _TextHandler(logging.Handler):
     """Logging handler that appends records to a ScrolledText widget."""
 
-    def __init__(self, widget: scrolledtext.ScrolledText):
+    def __init__(
+        self,
+        widget: scrolledtext.ScrolledText,
+        max_lines: int = APP_LOG_WIDGET_MAX_LINES,
+    ):
         super().__init__()
         self.widget = widget
-        self._pending = queue.SimpleQueue()
+        self.max_lines = max_lines
+        self._pending = queue.Queue(maxsize=APP_LOG_PENDING_MAX_MESSAGES)
         self._closed = False
 
     def emit(self, record: logging.LogRecord):
@@ -104,7 +115,14 @@ class _TextHandler(logging.Handler):
         except Exception:
             self.handleError(record)
             return
-        self._pending.put(msg)
+        try:
+            self._pending.put_nowait(msg)
+        except queue.Full:
+            try:
+                self._pending.get_nowait()
+            except queue.Empty:
+                pass
+            self._pending.put_nowait(msg)
 
     def flush_pending(self):
         if self._closed:
@@ -124,6 +142,9 @@ class _TextHandler(logging.Handler):
             self.widget.configure(state="normal")
             for msg in messages:
                 self.widget.insert(tk.END, msg)
+            line_count = int(self.widget.index("end-1c").split(".")[0])
+            if line_count > self.max_lines:
+                self.widget.delete("1.0", f"{line_count - self.max_lines}.0")
             self.widget.see(tk.END)
             self.widget.configure(state="disabled")
         except tk.TclError:
@@ -132,6 +153,131 @@ class _TextHandler(logging.Handler):
     def close(self):
         self._closed = True
         super().close()
+
+
+# ===== SPECTRUM HELPERS ===== #
+
+def _spec_resample_1d(arr: np.ndarray, n_out: int) -> np.ndarray:
+    """Linearly resample a 1-D float32 array to n_out samples."""
+    n_in = len(arr)
+    if n_in == n_out:
+        return arr.astype(np.float32, copy=False)
+    if n_in == 0 or n_out == 0:
+        return np.zeros(n_out, dtype=np.float32)
+    xp = np.linspace(0.0, 1.0, n_in)
+    xq = np.linspace(0.0, 1.0, n_out)
+    return np.interp(xq, xp, arr).astype(np.float32)
+
+
+class SpectrumViewport:
+    """Screen-resolution waterfall ring buffer. Owned exclusively by the Tk thread.
+
+    Stores exactly ``height`` rows of ``width`` float32 dBFS values plus one
+    metadata dict per row. New rows overwrite the oldest as they arrive.
+    Capacity is always bounded by the visible canvas — no off-screen history.
+
+    Not thread-safe. All methods must be called from the Tk thread.
+    """
+
+    def __init__(self, width: int = 1, height: int = 1):
+        self._w = max(1, width)
+        self._h = max(1, height)
+        # Ring: _head is next write position. Newest row: (_head-1) % _h.
+        self._values = np.full((self._h, self._w), np.nan, dtype=np.float32)
+        self._meta: list = [None] * self._h
+        self._head = 0
+        self._count = 0  # valid rows: 0..height
+
+    @property
+    def width(self) -> int:
+        return self._w
+
+    @property
+    def height(self) -> int:
+        return self._h
+
+    @property
+    def valid_rows(self) -> int:
+        """Number of rows written so far (up to height)."""
+        return self._count
+
+    def accept_row(self, native_row: np.ndarray, meta: dict) -> bool:
+        """Resample native_row to viewport width and store it as the newest row.
+
+        meta keys expected: ts, center_frequency, fmin, fmax, scan_time, n.
+        Returns True on success, False if native_row is empty.
+        """
+        if native_row is None or len(native_row) == 0:
+            return False
+        row = _spec_resample_1d(native_row, self._w)
+        self._values[self._head] = row
+        self._meta[self._head] = meta or {}
+        self._head = (self._head + 1) % self._h
+        if self._count < self._h:
+            self._count += 1
+        return True
+
+    def row_at_offset(self, offset: int):
+        """Return (values_view, meta) for the row at offset from newest (0=newest).
+
+        values_view is a direct view into the ring buffer — do not modify.
+        Returns (None, None) if offset is out of range.
+        """
+        if offset < 0 or offset >= self._count:
+            return None, None
+        idx = (self._head - 1 - offset) % self._h
+        return self._values[idx], self._meta[idx]
+
+    def latest_meta(self):
+        """Return the metadata dict of the newest row, or None."""
+        if self._count == 0:
+            return None
+        return self._meta[(self._head - 1) % self._h]
+
+    def value_range(self):
+        """Return (min, max) across all valid finite values, or (None, None)."""
+        if self._count == 0:
+            return None, None
+        indices = [(self._head - 1 - i) % self._h for i in range(self._count)]
+        data = self._values[indices]
+        mask = np.isfinite(data)
+        if not np.any(mask):
+            return None, None
+        return float(np.min(data[mask])), float(np.max(data[mask]))
+
+    def clear(self):
+        """Reset all rows to empty."""
+        self._values[:] = np.nan
+        self._meta = [None] * self._h
+        self._head = 0
+        self._count = 0
+
+    def resize(self, width: int, height: int):
+        """Reallocate to (width, height), resampling and preserving recent rows."""
+        w = max(1, width)
+        h = max(1, height)
+        if w == self._w and h == self._h:
+            return
+        # Snapshot existing rows newest-first; keep only as many as fit
+        n_keep = min(self._count, h)
+        saved_rows = []
+        saved_meta = []
+        for i in range(n_keep):
+            idx = (self._head - 1 - i) % self._h
+            saved_rows.append(self._values[idx].copy())
+            saved_meta.append(self._meta[idx])
+        self._w = w
+        self._h = h
+        self._values = np.full((h, w), np.nan, dtype=np.float32)
+        self._meta = [None] * h
+        self._head = 0
+        self._count = 0
+        # Re-insert oldest-first, resampled to new width
+        for vals, meta in zip(reversed(saved_rows), reversed(saved_meta)):
+            self._values[self._head] = _spec_resample_1d(vals, w)
+            self._meta[self._head] = meta
+            self._head = (self._head + 1) % h
+            self._count += 1
 
 
 # ===== MAIN GUI CLASS ===== #
@@ -178,32 +324,29 @@ class MEPGui:
         
         # SPEC tab state
         self._spec_lock = threading.Lock()
-        self._spec_topic = ""  # populated from controller after lazy init
-        self._spec_stream_enabled = False
-        self._spec_latest = None
-        self._spec_rows = deque(maxlen=180)
-        self._spec_bins = None               # line-plot display resolution (None = native)
-        self._spec_render_interval_ms = 40   # fixed render cadence (~25 FPS over X11)
-        # Producer/consumer decoupling: the MQTT thread decodes frames and queues
-        # ready-to-draw dB rows here; the steady Tk render timer drains and blits
-        # them in one operation per tick. Bounded so a fast producer cannot grow
-        # memory without bound (surplus rows scroll off the waterfall anyway).
-        self._spec_pending = deque(maxlen=240)
+        # _spec_lock guards _spec_pending only (MQTT-to-Tk handoff).
+        # All other spec state is Tk-thread-only.
+        self._spec_topic = ""             # populated from bus after construction
+        self._spec_stream_requested = False   # user clicked Stream
+        self._spec_tab_visible = False        # SPEC tab is currently showing
+        self._spec_is_active = False          # derived: stream_requested AND tab_visible
+        self._spec_pending = deque(maxlen=SPEC_PENDING_MAX_ROWS)  # bounded MQTT->Tk frame queue
+        self._spec_latest_entry = None        # newest entry for line-plot native resolution
+        self._spec_viewport = SpectrumViewport()   # screen-resolution ring (Tk thread only)
+        self._spec_bins = None               # line-plot resolution override (None = native)
+        self._spec_render_interval_ms = 40   # render cadence (~25 FPS)
         self._spec_render_after_id = None
-        self._spec_force_render = False   # one-shot redraw request (color-scale controls)
-        self._spec_last_arrival = None    # monotonic ts of previous frame (jitter diagnostic)
-        self._spec_log_dt = False         # SPEC-tab toggle: log per-frame arrival dt
-        self._spec_wf_fill = 0            # count of real rows currently in the buffer
+        self._spec_force_render = False
+        self._spec_last_arrival = None
+        self._spec_log_dt = False
         self._spec_color_lut = self._spec_build_color_lut()
-        # PhotoImage-based waterfall (numpy/PIL fast path)
-        self._spec_wf_pixels = None       # np.ndarray (h, w, 3) uint8 rolling pixel buffer
-        self._spec_wf_pil = None          # PIL Image wrapping the current buffer
-        self._spec_wf_photo = None        # ImageTk.PhotoImage kept alive (Tk GC workaround)
-        self._spec_wf_image_id = None     # canvas item id for the single image item
+        # Waterfall image (Tk thread only)
+        self._spec_pixels = None             # (h, w, 3) uint8 pixel buffer
+        self._spec_photo = None              # one persistent ImageTk.PhotoImage
+        self._spec_wf_image_id = None        # canvas item id for the waterfall image
         self._spec_wf_resize_after_id = None
         self._spec_wf_target_size = None
-        # Persistent canvas items (created once, updated via coords/itemconfig each
-        # tick instead of delete-and-recreate — far fewer X11 requests per frame).
+        # Persistent canvas items (created once, updated via coords/itemconfig)
         self._spec_line_item = None
         self._spec_line_labels = {}
         self._spec_wf_labels = {}
@@ -242,7 +385,7 @@ class MEPGui:
         self.bus.on_status(AFE_HK_TOPIC, self._on_hk)
         self.bus.on_status(AFE_ANNOUNCE_TOPIC, self._on_afe_announce)
         self.bus.on_status(AFE_REGISTERS_TOPIC, self._on_afe_registers)
-        self.bus.on_status_pattern(self.bus.spec_topic, self._on_spec_data)
+        self.bus.on_status_pattern(self.bus.spec_topic, self._on_spec_data, subscribe=False)
 
         # Refresh status grid from any cached state.
         self._refresh_status_grid()
@@ -293,7 +436,13 @@ class MEPGui:
     # ------------------------------------------------------------------ #
 
     def _on_mqtt_message(self, topic: str, payload: bytes):
-        """Global listener: log every MQTT message in the MQTT tab."""
+        """Global listener: log every MQTT message in the MQTT tab.
+
+        No topic is dropped here — what the human sees is governed entirely by
+        the Suppress checkboxes (Announce / +/data/+ / Status) at display time
+        in _mqtt_flush_buffer_to_widget(). Spectrum frames match the '+/data/+'
+        suppression, so they are hidden by default without being special-cased.
+        """
         self._gui_call(self._mqtt_log_message, topic, payload)
 
     def _on_mqtt_connection_state(self, status: dict):
@@ -424,12 +573,7 @@ class MEPGui:
         logging.info("GUI: announce data applied to all dynamic widgets")
 
     def _on_spec_data(self, topic: str, data: dict):
-        """Listener for SPEC messages (radiohound/clients/data/+ pattern).
-
-        Runs the decode/transform directly on the MQTT thread (the producer
-        makes no Tk calls and only appends to a locked queue). Keeping this off
-        the GUI thread is what lets the render timer stay responsive.
-        """
+        """Pattern listener: MQTT thread → spectrum ingestion."""
         self._spec_handle_stream_message(topic, data)
 
     def _gui_call(self, func, *args, **kwargs):
@@ -1161,6 +1305,11 @@ class MEPGui:
         except Exception:
             return
         self._ensure_tab_built(tab_text)
+        # Keep SPEC subscription active only when the tab is actually showing
+        new_spec_visible = (tab_text == "SPEC")
+        if new_spec_visible != self._spec_tab_visible:
+            self._spec_tab_visible = new_spec_visible
+            self._spec_update_stream_state()
         if tab_text == "MQTT":
             self._mqtt_render_from_buffer()
 
@@ -1461,7 +1610,7 @@ class MEPGui:
 
         self._add_copyable_note(
             frame,
-            "Source: MQTT broker stream via wildcard subscription (#) on localhost:1883",
+            "Source: MQTT broker on localhost:1883 (subscribed status topics only; spectrum is opt-in via Stream)",
             row=3,
             wraplength=420,
         )
@@ -1589,59 +1738,98 @@ class MEPGui:
         self._spec_wf_resize(w, h)
 
     def _spec_wf_resize(self, w: int, h: int):
-        """Reallocate the pixel buffer on canvas resize and repaint stored rows."""
+        """Reallocate pixel buffer and viewport on canvas resize.
+
+        The viewport resamples and preserves as many rows as fit the new height.
+        The old PhotoImage is released after Tk has been given the new one.
+        """
         w = max(4, w)
         h = max(4, h)
-        if self._spec_wf_pixels is not None and self._spec_wf_pixels.shape[:2] == (h, w):
+        if self._spec_pixels is not None and self._spec_pixels.shape[:2] == (h, w):
             return
-        self._spec_wf_pixels = np.zeros((h, w, 3), dtype=np.uint8)
-        self._spec_wf_fill = 0
-        self._spec_wf_pil = _PILImage.fromarray(self._spec_wf_pixels, "RGB")
-        self._spec_wf_photo = _PILImageTk.PhotoImage(image=self._spec_wf_pil)
+        # Resize viewport (resamples existing rows to new width, trims to new height)
+        self._spec_viewport.resize(w, h)
+        # Allocate new pixel buffer
+        self._spec_pixels = np.zeros((h, w, 3), dtype=np.uint8)
+        # Allocate new PhotoImage, release old one after Tk has the new reference
+        pil = _PILImage.fromarray(self._spec_pixels, "RGB")
+        new_photo = _PILImageTk.PhotoImage(image=pil)
         if self._spec_wf_image_id is None:
             self._spec_wf_image_id = self._spec_wf_canvas.create_image(
-                0, 0, anchor="nw", image=self._spec_wf_photo
+                0, 0, anchor="nw", image=new_photo
             )
         else:
-            self._spec_wf_canvas.itemconfig(self._spec_wf_image_id, image=self._spec_wf_photo)
+            self._spec_wf_canvas.itemconfig(self._spec_wf_image_id, image=new_photo)
+        old_photo = self._spec_photo
+        self._spec_photo = new_photo
+        if old_photo is not None:
+            del old_photo
+        # Repaint from viewport if any data is present
         vmin, vmax = self._spec_color_range()
-        if vmin is not None:
-            self._spec_repaint_waterfall(vmin, vmax)
+        if vmin is not None and self._spec_viewport.valid_rows > 0:
+            self._spec_repaint_all(vmin, vmax)
 
-    def _spec_reset_display(self):
-        """Clear canvases and reset display state for a fresh SPEC stream."""
-        self._spec_rows.clear()
-        with self._spec_lock:
-            self._spec_pending.clear()
-            self._spec_latest = None
-        self._spec_wf_fill = 0
-        if self._spec_wf_pixels is not None:
-            self._spec_wf_pixels[:] = 0
-            self._spec_wf_pil = _PILImage.fromarray(self._spec_wf_pixels, "RGB")
-            self._spec_wf_photo.paste(self._spec_wf_pil)
+    def _spec_reset_canvas(self):
+        """Zero the pixel buffer and clear canvas overlay items.
+
+        Does not touch the viewport — call viewport.clear() separately when
+        a complete data reset is needed (e.g. Stream button press).
+        """
+        if self._spec_pixels is not None and self._spec_photo is not None:
+            self._spec_pixels[:] = 0
+            pil = _PILImage.fromarray(self._spec_pixels, "RGB")
+            self._spec_photo.paste(pil)
         for item in self._spec_wf_labels.values():
             self._spec_wf_canvas.delete(item)
         self._spec_wf_labels = {}
-        self._spec_line_canvas.delete("all")
-        self._spec_line_item = None
-        self._spec_line_labels = {}
+        if self._spec_line_item is not None:
+            self._spec_line_canvas.delete("all")
+            self._spec_line_item = None
+            self._spec_line_labels = {}
 
     def _spec_stream_on(self):
-        self._spec_reset_display()
-        self._spec_stream_enabled = True
-        if "spec_stream_state" in self._vars:
-            self._vars["spec_stream_state"].set("streaming")
-        if "spec_summary" in self._vars:
-            self._vars["spec_summary"].set(f"Listening on {self._spec_topic}")
-        self._spec_start_render_loop()
+        """User clicked Stream: reset display and request active streaming."""
+        self._spec_stream_requested = True
+        # Reset for a fresh stream start (user-initiated only)
+        self._spec_viewport.clear()
+        with self._spec_lock:
+            self._spec_pending.clear()
+        self._spec_latest_entry = None
+        self._spec_reset_canvas()
+        self._spec_update_stream_state()
 
     def _spec_stream_off(self):
-        self._spec_stream_enabled = False
-        self._spec_stop_render_loop()
-        if "spec_stream_state" in self._vars:
-            self._vars["spec_stream_state"].set("paused")
-        if "spec_summary" in self._vars:
-            self._vars["spec_summary"].set(f"Paused on {self._spec_topic}")
+        """User clicked Pause: freeze the current display and stop streaming."""
+        self._spec_stream_requested = False
+        self._spec_update_stream_state()
+
+    def _spec_update_stream_state(self):
+        """Derive effective stream state from user intent and tab visibility.
+
+        Subscribes and starts the render loop only when the user has requested
+        streaming AND the SPEC tab is currently visible. When either condition is
+        false, the display freezes at its last state without clearing.
+        """
+        should_be_active = self._spec_stream_requested and self._spec_tab_visible
+        if should_be_active == self._spec_is_active:
+            return
+        self._spec_is_active = should_be_active
+        if should_be_active:
+            self.bus.subscribe(self.bus.spec_topic)
+            self._spec_start_render_loop()
+            if "spec_stream_state" in self._vars:
+                self._vars["spec_stream_state"].set("streaming")
+            if "spec_summary" in self._vars:
+                self._vars["spec_summary"].set(f"Listening on {self._spec_topic}")
+        else:
+            self.bus.unsubscribe(self.bus.spec_topic)
+            self._spec_stop_render_loop()
+            with self._spec_lock:
+                self._spec_pending.clear()
+            if "spec_stream_state" in self._vars:
+                self._vars["spec_stream_state"].set("paused")
+            if not self._spec_stream_requested and "spec_summary" in self._vars:
+                self._vars["spec_summary"].set(f"Paused on {self._spec_topic}")
 
     def _spec_update_bin_button_states(self):
         if not hasattr(self, "_spec_bin_buttons"):
@@ -1680,22 +1868,6 @@ class MEPGui:
         if hasattr(self, "_spec_render_interval_label"):
             self._spec_render_interval_label.config(text=f"{ms} ms")
 
-    def _spec_decode_bins(self, data_b64: str):
-        """Decode a base64 little-endian float32 payload into a native numpy array."""
-        raw = base64.b64decode(data_b64)
-        n = len(raw) // 4
-        if n == 0:
-            return np.empty(0, dtype=np.float32)
-        return np.frombuffer(raw[: n * 4], dtype="<f4").astype(np.float32)
-
-    def _spec_resample(self, arr, n_out: int):
-        """Linearly resample a 1-D array to n_out samples (returns a numpy array)."""
-        if len(arr) == n_out:
-            return arr
-        xp = np.linspace(0.0, 1.0, len(arr))
-        xq = np.linspace(0.0, 1.0, n_out)
-        return np.interp(xq, xp, arr).astype(np.float32)
-
     def _spec_build_color_lut(self):
         """Build a (256, 3) uint8 numpy array: index → (R, G, B) colormap."""
         lut = np.zeros((256, 3), dtype=np.uint8)
@@ -1719,53 +1891,54 @@ class MEPGui:
         The native spectrum is resampled directly to the pixel width here — a
         single resampling step (no intermediate bin-count round-trip).
         """
-        vals = self._spec_resample(db_row, w)
+        vals = _spec_resample_1d(db_row, w)
         scale = 255.0 / (vmax - vmin)
         idx = np.clip((vals - vmin) * scale, 0, 255).astype(np.uint8)
         return self._spec_color_lut[idx]
 
-    def _spec_blit_waterfall_block(self, db_rows, vmin: float, vmax: float):
-        """Scroll the waterfall by len(db_rows) and write them all in one transfer.
+    def _spec_blit_new_rows(self, count: int, vmin: float, vmax: float):
+        """Scroll the pixel buffer down by ``count`` rows and paint the newest rows.
 
-        db_rows are native-resolution dB float32 arrays in arrival order (oldest
-        first). Each is colored under the current range, then a single PhotoImage
-        paste pushes the whole frame to X11 — one transfer per render tick
-        regardless of how many frames arrived since the last tick.
+        The ``count`` newest viewport rows (offset 0 = newest = top) are
+        colour-mapped and the whole buffer is pasted into the persistent
+        PhotoImage in a single X11 op, so catching up on a burst of frames costs
+        one blit regardless of how many rows arrived since the last tick.
         """
-        if not db_rows or self._spec_wf_pixels is None:
+        if self._spec_pixels is None or self._spec_photo is None or count <= 0:
             return
-        h, w, _ = self._spec_wf_pixels.shape
-        block = np.empty((len(db_rows), w, 3), dtype=np.uint8)
-        for i, row in enumerate(db_rows):
-            block[i] = self._spec_row_to_rgb(row, w, vmin, vmax)
-        block = block[::-1]  # newest row first (row 0 = top = most recent)
-        k = block.shape[0]
-        if k >= h:
-            self._spec_wf_pixels[:] = block[:h]
-        else:
-            self._spec_wf_pixels[k:] = self._spec_wf_pixels[:-k]
-            self._spec_wf_pixels[:k] = block
-        self._spec_wf_fill = min(h, self._spec_wf_fill + k)
-        self._spec_wf_pil = _PILImage.fromarray(self._spec_wf_pixels, "RGB")
-        self._spec_wf_photo.paste(self._spec_wf_pil)
+        h, w, _ = self._spec_pixels.shape
+        if count >= h:
+            # Every visible row is new — rebuild from the viewport at one scale.
+            self._spec_repaint_all(vmin, vmax)
+            return
+        # Shift existing rows down by ``count``. NumPy buffers the overlapping
+        # slice assignment, so the down-shift is correct.
+        self._spec_pixels[count:] = self._spec_pixels[:-count]
+        # Paint the ``count`` newest rows at the top (pixel row i = offset i).
+        for i in range(count):
+            row_vals, _ = self._spec_viewport.row_at_offset(i)  # 0 = newest
+            if row_vals is not None:
+                self._spec_pixels[i] = self._spec_row_to_rgb(row_vals, w, vmin, vmax)
+        pil = _PILImage.fromarray(self._spec_pixels, "RGB")
+        self._spec_photo.paste(pil)
 
-    def _spec_repaint_waterfall(self, vmin: float, vmax: float):
-        """Rebuild the entire pixel buffer from stored rows on one consistent scale.
+    def _spec_repaint_all(self, vmin: float, vmax: float):
+        """Rebuild the entire pixel buffer from viewport rows at a consistent scale.
 
-        Used whenever the color range changes (Autoscale button / sliders) or the
-        canvas is resized, so every visible row is colored under the same range —
-        this is what prevents color drift across the image.
+        Called on colour-range changes and canvas resize so every visible row
+        uses the same mapping — prevents colour drift across the image.
         """
-        if self._spec_wf_pixels is None:
+        if self._spec_pixels is None or self._spec_photo is None:
             return
-        h, w, _ = self._spec_wf_pixels.shape
-        rows = list(self._spec_rows)[-h:]          # oldest..newest, capped to height
-        self._spec_wf_pixels[:] = 0
-        for i, entry in enumerate(reversed(rows)):  # newest at row 0 (top)
-            self._spec_wf_pixels[i] = self._spec_row_to_rgb(entry["row"], w, vmin, vmax)
-        self._spec_wf_fill = len(rows)
-        self._spec_wf_pil = _PILImage.fromarray(self._spec_wf_pixels, "RGB")
-        self._spec_wf_photo.paste(self._spec_wf_pil)
+        h, w, _ = self._spec_pixels.shape
+        self._spec_pixels[:] = 0
+        n = min(self._spec_viewport.valid_rows, h)
+        for i in range(n):
+            row_vals, _ = self._spec_viewport.row_at_offset(i)  # 0=newest=top
+            if row_vals is not None:
+                self._spec_pixels[i] = self._spec_row_to_rgb(row_vals, w, vmin, vmax)
+        pil = _PILImage.fromarray(self._spec_pixels, "RGB")
+        self._spec_photo.paste(pil)
 
     def _spec_freq_axis(self, latest: dict, n_bins: int):
         """Return (lo, hi, is_hz). Absolute Hz when metadata is present, else bin indices."""
@@ -1783,78 +1956,77 @@ class MEPGui:
         return f"{float(amp):.2f} dBFS"
 
     def _spec_cursor_update(self, event, from_waterfall: bool):
-        with self._spec_lock:
-            latest = self._spec_latest
-        if latest is None:
-            return
-        rows = self._spec_rows
+        """Report Frequency, Time, and Intensity under the cursor.
 
+        Waterfall: reads numeric values directly from the viewport ring so the
+        reported intensity is the actual dBFS value, not a reverse-engineered
+        colour. Line plot: reads from the most recent native-resolution entry.
+        """
         canvas = self._spec_wf_canvas if from_waterfall else self._spec_line_canvas
         w = max(10, canvas.winfo_width())
-        x = 0 if event.x < 0 else (w - 1 if event.x >= w else event.x)
+        x = max(0, min(w - 1, event.x))
 
         if from_waterfall:
-            if not rows:
-                return
             h = max(1, self._spec_wf_canvas.winfo_height())
-            y = 0 if event.y < 0 else (h - 1 if event.y >= h else event.y)
-            if self._spec_wf_fill <= 0 or int(y) >= self._spec_wf_fill:
+            y = max(0, min(h - 1, event.y))
+            n_valid = self._spec_viewport.valid_rows
+            if n_valid == 0 or y >= n_valid:
                 if "spec_cursor" in self._vars:
                     self._vars["spec_cursor"].set("Cursor: no data at this row")
                 return
-            row_offset = min(int(y), self._spec_wf_fill - 1, len(rows) - 1)
-            entry = rows[-1 - row_offset]
-            entry_row = entry["row"]
-            entry_n = len(entry_row)
-            if entry_n <= 0:
+            # Viewport offset 0 = newest = pixel row 0 (top of waterfall)
+            row_vals, meta = self._spec_viewport.row_at_offset(y)
+            if row_vals is None or meta is None:
                 return
-            entry_idx = int(round(x * (entry_n - 1) / max(1, w - 1)))
-            entry_idx = 0 if entry_idx < 0 else (entry_n - 1 if entry_idx >= entry_n else entry_idx)
-            f0, f1, is_hz = self._spec_freq_axis(entry, entry_n)
-            axis_val = f0 + (f1 - f0) * (entry_idx / max(1, entry_n - 1))
-            flabel = self._spec_fmt_axis(axis_val, is_hz)
-            amp = float(entry_row[entry_idx])
-            ts = entry.get("ts", "?")
+            vw = self._spec_viewport.width
+            col = max(0, min(vw - 1, int(round(x * (vw - 1) / max(1, w - 1)))))
+            f0, f1, is_hz = self._spec_freq_axis(meta, vw)
+            freq = f0 + (f1 - f0) * (col / max(1, vw - 1))
+            amp = float(row_vals[col])
+            ts = meta.get("ts", "?")
+            label = (
+                f"Cursor: f={self._spec_fmt_axis(freq, is_hz)}"
+                f"  t={ts}  pwr={self._spec_fmt_amp(amp)}"
+            )
         else:
-            row_latest = latest["row"]
-            display_row = row_latest if self._spec_bins is None else self._spec_resample(row_latest, self._spec_bins)
-            n = len(display_row)
+            latest = self._spec_latest_entry
+            if latest is None:
+                return
+            native = latest["row"]
+            display = native if self._spec_bins is None else _spec_resample_1d(native, self._spec_bins)
+            n = len(display)
             if n <= 0:
                 return
             h = max(10, self._spec_line_canvas.winfo_height())
-            y = 0 if event.y < 0 else (h - 1 if event.y >= h else event.y)
-            idx = int(round(x * (n - 1) / max(1, w - 1)))
-            idx = 0 if idx < 0 else (n - 1 if idx >= n else idx)
-            f0, f1, is_hz = self._spec_freq_axis(latest, len(row_latest))
-            axis_val = f0 + (f1 - f0) * (idx / max(1, n - 1))
-            flabel = self._spec_fmt_axis(axis_val, is_hz)
-            trace_amp = float(display_row[idx])
+            y = max(0, min(h - 1, event.y))
+            idx = max(0, min(n - 1, int(round(x * (n - 1) / max(1, w - 1)))))
+            f0, f1, is_hz = self._spec_freq_axis(latest, len(native))
+            freq = f0 + (f1 - f0) * (idx / max(1, n - 1))
+            trace_amp = float(display[idx])
             vmin, vmax = self._spec_color_range()
             if vmin is None:
-                vmin = float(np.min(display_row))
-                vmax = float(np.max(display_row))
+                vmin = float(np.min(display))
+                vmax = float(np.max(display))
                 if vmax <= vmin:
                     vmax = vmin + 1.0
             amp = float(vmax - (y / max(1, h - 1)) * (vmax - vmin))
             ts = latest.get("ts", "?")
             label = (
-                f"Cursor: f={flabel}  t={ts}  pwr={self._spec_fmt_amp(amp)} "
-                f"(trace {self._spec_fmt_amp(trace_amp)})"
+                f"Cursor: f={self._spec_fmt_axis(freq, is_hz)}"
+                f"  t={ts}  pwr={self._spec_fmt_amp(amp)}"
+                f" (trace {self._spec_fmt_amp(trace_amp)})"
             )
-        if from_waterfall:
-            label = f"Cursor: f={flabel}  t={ts}  pwr={self._spec_fmt_amp(amp)}"
-
         if "spec_cursor" in self._vars:
             self._vars["spec_cursor"].set(label)
 
     def _spec_handle_stream_message(self, topic: str, data: dict):
-        """Producer (MQTT thread): normalize one frame and queue it.
+        """Producer (MQTT thread): decode frame and install in one-slot mailbox.
 
-        Runs entirely off the Tk thread and makes no widget calls. Payload
-        normalization (base64 decode + power->dBFS conversion) is delegated to
-        MEPBus so GUI remains presentation-focused.
+        Normalisation (base64 decode + dBFS conversion) runs here on the MQTT
+        thread so the Tk render loop only needs to insert the ready row into the
+        viewport — no I/O or array allocation on the UI thread.
         """
-        if not self._spec_stream_enabled:
+        if not self._spec_is_active:
             return
         entry = self.bus.normalize_spec_payload(data)
         if entry is None:
@@ -1889,35 +2061,49 @@ class MEPGui:
             self._spec_render_after_id = None
 
     def _spec_render(self):
-        """Consumer (Tk thread): drain queued frames and draw one coalesced tick."""
+        """Consumer (Tk thread): drain all pending frames, update viewport, render.
+
+        Every frame queued since the last tick is drained (oldest first) and
+        accepted into the viewport, then the waterfall is advanced by the number
+        of new rows in a single block blit. This catches up on bursts without
+        dropping fresh frames and without one PhotoImage paste per row.
+        """
         self._spec_render_after_id = None
         force = self._spec_force_render
         self._spec_force_render = False
 
-        # Drain everything the producer queued since the last tick. The lock only
-        # guards the producer/consumer handoff (_spec_pending, _spec_latest);
-        # _spec_rows is touched on the Tk thread only.
+        # Drain every frame queued since the last tick (oldest first).
         with self._spec_lock:
-            new_rows = list(self._spec_pending)
+            entries = list(self._spec_pending)
             self._spec_pending.clear()
-            if new_rows:
-                self._spec_latest = new_rows[-1]
-        for entry in new_rows:
-            self._spec_rows.append(entry)
-        latest = self._spec_latest
 
-        if latest is not None and self._is_adv_tab_selected("SPEC") and (new_rows or force):
+        new_count = 0
+        for entry in entries:
+            meta = {
+                "ts": entry.get("ts"),
+                "center_frequency": entry.get("center_frequency"),
+                "fmin": entry.get("fmin"),
+                "fmax": entry.get("fmax"),
+                "scan_time": entry.get("scan_time"),
+                "n": entry.get("n"),
+            }
+            if self._spec_viewport.accept_row(entry["row"], meta):
+                self._spec_latest_entry = entry
+                new_count += 1
+
+        latest = self._spec_latest_entry
+        if latest is not None and (new_count or force):
             vmin, vmax = self._spec_color_range()
             if vmin is not None:
-                if new_rows:
-                    self._spec_blit_waterfall_block(
-                        [e["row"] for e in new_rows], vmin, vmax
-                    )
+                if new_count:
+                    self._spec_blit_new_rows(new_count, vmin, vmax)
+                elif force:
+                    self._spec_repaint_all(vmin, vmax)
                 self._spec_update_line(latest, vmin, vmax)
                 self._spec_update_wf_labels(latest)
                 self._spec_update_summary(latest)
 
-        if self._spec_stream_enabled:
+        if self._spec_is_active:
             self._spec_render_after_id = self.root.after(
                 self._spec_render_interval_ms, self._spec_render
             )
@@ -1931,12 +2117,10 @@ class MEPGui:
         return vmin, vmax
 
     def _spec_autoscale_now(self):
-        """One-shot: fit the color range to the current waterfall history."""
-        rows = self._spec_rows
-        if not rows:
+        """Fit the colour range to all valid rows in the current viewport."""
+        vmin, vmax = self._spec_viewport.value_range()
+        if vmin is None:
             return
-        vmin = min(r["row_min"] for r in rows)
-        vmax = max(r["row_max"] for r in rows)
         if vmax <= vmin:
             vmax = vmin + 1.0
         self._vars["spec_vmin"].set(round(vmin, 1))
@@ -1952,7 +2136,7 @@ class MEPGui:
         vmin, vmax = self._spec_color_range()
         if vmin is None:
             return
-        self._spec_repaint_waterfall(vmin, vmax)
+        self._spec_repaint_all(vmin, vmax)
         self._spec_request_render()
 
     def _spec_ensure_line_items(self):
@@ -1976,7 +2160,7 @@ class MEPGui:
         c = self._spec_line_canvas
         self._spec_ensure_line_items()
         native = latest["row"]
-        vals = native if self._spec_bins is None else self._spec_resample(native, self._spec_bins)
+        vals = native if self._spec_bins is None else _spec_resample_1d(native, self._spec_bins)
         w = max(10, c.winfo_width())
         h = max(10, c.winfo_height())
         n = len(vals)
@@ -2027,7 +2211,7 @@ class MEPGui:
         c.coords(lbl["now"], w // 2, 6)
         scan_t = latest.get("scan_time")
         if isinstance(scan_t, (int, float)) and scan_t > 0:
-            span = scan_t * max(1, self._spec_wf_fill)
+            span = scan_t * max(1, self._spec_viewport.valid_rows)
             c.coords(lbl["span"], w // 2, h - 4)
             c.itemconfig(lbl["span"], text=f"-{span:.1f} s", state="normal")
         else:
@@ -5705,6 +5889,11 @@ def main():
                 app.capture.stop_recorder()
         except Exception as e:
             logging.debug(f"Exception stopping recorder during cleanup: {e}")
+        try:
+            app._spec_is_active = False
+            app._spec_stop_render_loop()
+        except Exception as e:
+            logging.debug(f"Exception stopping SPEC during cleanup: {e}")
         try:
             if getattr(app, "bus", None) is not None:
                 app.bus.disconnect()

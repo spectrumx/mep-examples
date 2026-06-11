@@ -1430,8 +1430,11 @@ class GPSDMonitor:
 class MEPBus:
     """Always-on MQTT connection, listener registry, and thin command publishers.
 
-    Created at startup (GUI or CLI). Subscribes to all topics (#) so callers
-    can register listeners for any status/data feed. Never None once constructed.
+    Created at startup (GUI or CLI). Subscribes only to the specific topics and
+    wildcard patterns that callers register listeners for (via on_status /
+    on_status_pattern / subscribe), never the broker-wide '#'. Callers may
+    subscribe and unsubscribe at runtime; the active set is restored on
+    reconnect. Never None once constructed.
 
     Thin publishers: rfsoc_reset(), tuner_*, recorder_*, afe_* — fire-and-forget
     MQTT commands. No sweep state, no sync waits, no subprocess calls.
@@ -1446,6 +1449,9 @@ class MEPBus:
         self._global_listeners: list[Callable] = []
         self._pattern_listeners: list[tuple[str, Callable]] = []
         self._connection_listeners: list[Callable[[dict], None]] = []
+        self._subscriptions: set[str] = set()
+        self._subscription_lock = threading.Lock()
+        self._registry_lock = threading.RLock()  # protects _listeners and _pattern_listeners
         self._status_cache: dict[str, dict] = {}
         self._cache_lock = threading.Lock()
 
@@ -1496,7 +1502,10 @@ class MEPBus:
         that arrived before the listener was registered), the callback is fired
         immediately on the calling thread.
         """
-        self._listeners.setdefault(topic, []).append(callback)
+        with self._registry_lock:
+            self._listeners.setdefault(topic, []).append(callback)
+        self.subscribe(topic)
+        # Emit any cached value that arrived before this listener was registered
         cached = self.get_cached_status(topic)
         if isinstance(cached, dict):
             try:
@@ -1505,10 +1514,16 @@ class MEPBus:
                 logging.warning("Status listener initial emit failed for %s: %s", topic, e)
 
     def on_message(self, callback: Callable[[str, bytes], None]):
-        """Register callback(topic, payload_bytes) for ALL MQTT messages."""
-        self._global_listeners.append(callback)
+        """Register callback(topic, payload_bytes) for subscribed MQTT messages."""
+        with self._registry_lock:
+            self._global_listeners.append(callback)
 
-    def on_status_pattern(self, pattern: str, callback: Callable[[str, dict], None]):
+    def on_status_pattern(
+        self,
+        pattern: str,
+        callback: Callable[[str, dict], None],
+        subscribe: bool = True,
+    ):
         """Register callback(topic, data) for JSON messages matching MQTT wildcard pattern.
         
         Supports MQTT wildcards:
@@ -1517,7 +1532,24 @@ class MEPBus:
         
         Example: on_status_pattern("radiohound/clients/data/+", handler)
         """
-        self._pattern_listeners.append((pattern, callback))
+        with self._registry_lock:
+            self._pattern_listeners.append((pattern, callback))
+        if subscribe:
+            self.subscribe(pattern)
+
+    def subscribe(self, topic: str):
+        """Keep a topic active across the current and future MQTT connections."""
+        with self._subscription_lock:
+            self._subscriptions.add(topic)
+        if self._connected:
+            self._client.subscribe(topic)
+
+    def unsubscribe(self, topic: str):
+        """Stop receiving a topic until it is explicitly subscribed again."""
+        with self._subscription_lock:
+            self._subscriptions.discard(topic)
+        if self._connected:
+            self._client.unsubscribe(topic)
 
     def on_connection_state(self, callback: Callable[[dict], None], emit_initial: bool = True):
         """Register callback(status_dict) for MQTT connection state changes."""
@@ -1601,7 +1633,10 @@ class MEPBus:
             self._last_error = None
             logging.info("MQTT connected")
             self._emit_connection_state()
-            client.subscribe("#")
+            with self._subscription_lock:
+                subscriptions = tuple(self._subscriptions)
+            for topic in subscriptions:
+                client.subscribe(topic)
         else:
             self._connected = False
             self._last_error = f"rc={rc}"
@@ -1609,9 +1644,35 @@ class MEPBus:
             self._emit_connection_state()
 
     def _on_message(self, client, userdata, msg):
-        # Fire global listeners (raw bytes — for MQTT log tab)
-        for cb in self._global_listeners:
-            cb(msg.topic, msg.payload)
+        # Fire global listeners (raw bytes — for MQTT log tab). Snapshot the
+        # whole registry once under the lock so we can both deliver raw bytes
+        # and decide below whether any functional listener will consume this
+        # message. Failures are isolated so one bad listener cannot abort the
+        # rest of the dispatch.
+        with self._registry_lock:
+            global_cbs = list(self._global_listeners)
+            exact_cbs = list(self._listeners.get(msg.topic, []))
+            pattern_cbs = list(self._pattern_listeners)
+        for cb in global_cbs:
+            try:
+                cb(msg.topic, msg.payload)
+            except Exception:
+                logging.exception("Global MQTT listener failed for topic %s", msg.topic)
+
+        # Smart decode: only parse JSON when something will actually consume it.
+        # The global (raw-bytes) listeners above already saw every message, so
+        # the whole-bus monitor stays complete without forcing the MQTT thread
+        # to JSON/base64-decode high-rate traffic (e.g. spectrum frames) that no
+        # functional listener is registered for. This keeps decode cost
+        # proportional to what the UI uses, even under a broad subscription.
+        matching_pattern_cbs = [
+            (pattern, cb)
+            for pattern, cb in pattern_cbs
+            if self.topic_matches(msg.topic, pattern)
+        ]
+        is_announce = msg.topic == AFE_ANNOUNCE_TOPIC
+        if not (exact_cbs or matching_pattern_cbs or is_announce):
+            return
 
         # Parse JSON
         try:
@@ -1619,25 +1680,36 @@ class MEPBus:
         except Exception:
             return
 
-        # Update status cache
-        if isinstance(data, dict):
+        # Cache only topics that have a registered exact-match listener. The
+        # status grid reads exactly those topics via get_cached_status(); caching
+        # every distinct topic seen would grow unbounded with device/topic
+        # cardinality (especially under a wildcard subscription). Pattern/spectrum
+        # traffic is consumed directly by its listeners and never needs caching.
+        if exact_cbs and isinstance(data, dict):
             with self._cache_lock:
                 self._status_cache[msg.topic] = data
 
         # Intercept afe/announce (retained) — cache full schema
-        if msg.topic == AFE_ANNOUNCE_TOPIC and isinstance(data, dict):
+        if is_announce and isinstance(data, dict):
             self.afe_announce = data
             logging.info(f"AFE announce received: v{data.get('version', '?')}")
 
         # Fire exact-match topic-specific listeners
-        for cb in self._listeners.get(msg.topic, []):
-            cb(data)
-        
-        # Fire pattern-match listeners
+        for cb in exact_cbs:
+            try:
+                cb(data)
+            except Exception:
+                logging.exception("Listener callback failed for topic %s", msg.topic)
+
+        # Fire pattern-match listeners (only meaningful for dict payloads)
         if isinstance(data, dict):
-            for pattern, cb in self._pattern_listeners:
-                if self.topic_matches(msg.topic, pattern):
+            for pattern, cb in matching_pattern_cbs:
+                try:
                     cb(msg.topic, data)
+                except Exception:
+                    logging.exception(
+                        "Pattern listener callback failed for pattern %s", pattern
+                    )
 
     def _on_disconnect(self, client, userdata, rc):
         self._connected = False
