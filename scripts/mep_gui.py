@@ -3812,6 +3812,51 @@ class MEPGui:
             width=14,
         ).grid(row=4, column=1, sticky="w", padx=5, pady=4)
 
+        # ===== THROUGHPUT CONTROLS =====
+        throughput_frame = ttk.LabelFrame(scrollable_frame, text="Throughput Controls")
+        throughput_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
+        row += 1
+
+        throughput_row = 0
+        ttk.Label(throughput_frame, text="Chunk size (samples)").grid(
+            row=throughput_row, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_chunk_size"] = tk.StringVar(value="")
+        ent_chunk_size = ttk.Entry(
+            throughput_frame, textvariable=self._vars["sg_chunk_size"], width=14
+        )
+        ent_chunk_size.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
+        self._add_tooltip(ent_chunk_size, "packet.num_samples")
+
+        throughput_row += 1
+        ttk.Label(throughput_frame, text="Batch capacity").grid(
+            row=throughput_row, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_batch_capacity"] = tk.StringVar(value="")
+        ent_batch_capacity = ttk.Entry(
+            throughput_frame, textvariable=self._vars["sg_batch_capacity"], width=14
+        )
+        ent_batch_capacity.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
+        self._add_tooltip(ent_batch_capacity, "packet.batch_capacity")
+
+        throughput_row += 1
+        ttk.Label(throughput_frame, text="RX buffer size (chunks)").grid(
+            row=throughput_row, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_buffer_size"] = tk.StringVar(value="")
+        ent_buffer_size = ttk.Entry(
+            throughput_frame, textvariable=self._vars["sg_buffer_size"], width=14
+        )
+        ent_buffer_size.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
+        self._add_tooltip(ent_buffer_size, "packet.buffer_size")
+
+        throughput_row += 1
+        ttk.Label(throughput_frame, text="Scheduler worker threads").grid(
+            row=throughput_row, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_worker_threads"] = tk.StringVar(value="")
+        ent_worker_threads = ttk.Entry(
+            throughput_frame, textvariable=self._vars["sg_worker_threads"], width=14
+        )
+        ent_worker_threads.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
+        self._add_tooltip(ent_worker_threads, "scheduler.worker_thread_number")
+
         # ===== SPECTROGRAMS =====
         disp_frame = ttk.LabelFrame(scrollable_frame, text="Spectrograms")
         disp_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
@@ -3861,38 +3906,6 @@ class MEPGui:
         self._vars["sg_num_spectra_per_chunk"] = tk.StringVar(value="")
         ttk.Entry(disp_frame, textvariable=self._vars["sg_num_spectra_per_chunk"], width=14).grid(
             row=row_i, column=1, sticky="w", padx=5, pady=3)
-
-        row_i += 1
-        ttk.Label(disp_frame, text="Chunk size (samples)").grid(
-            row=row_i, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_chunk_size"] = tk.StringVar(value="")
-        ent_chunk_size = ttk.Entry(disp_frame, textvariable=self._vars["sg_chunk_size"], width=14)
-        ent_chunk_size.grid(row=row_i, column=1, sticky="w", padx=5, pady=3)
-        self._add_tooltip(ent_chunk_size, "packet.num_samples")
-
-        row_i += 1
-        ttk.Label(disp_frame, text="Batch capacity").grid(
-            row=row_i, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_batch_capacity"] = tk.StringVar(value="")
-        ent_batch_capacity = ttk.Entry(disp_frame, textvariable=self._vars["sg_batch_capacity"], width=14)
-        ent_batch_capacity.grid(row=row_i, column=1, sticky="w", padx=5, pady=3)
-        self._add_tooltip(ent_batch_capacity, "packet.batch_capacity")
-
-        row_i += 1
-        ttk.Label(disp_frame, text="RX buffer size (chunks)").grid(
-            row=row_i, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_buffer_size"] = tk.StringVar(value="")
-        ent_buffer_size = ttk.Entry(disp_frame, textvariable=self._vars["sg_buffer_size"], width=14)
-        ent_buffer_size.grid(row=row_i, column=1, sticky="w", padx=5, pady=3)
-        self._add_tooltip(ent_buffer_size, "packet.buffer_size")
-
-        row_i += 1
-        ttk.Label(disp_frame, text="Scheduler worker threads").grid(
-            row=row_i, column=0, sticky="w", padx=5, pady=3)
-        self._vars["sg_worker_threads"] = tk.StringVar(value="")
-        ent_worker_threads = ttk.Entry(disp_frame, textvariable=self._vars["sg_worker_threads"], width=14)
-        ent_worker_threads.grid(row=row_i, column=1, sticky="w", padx=5, pady=3)
-        self._add_tooltip(ent_worker_threads, "scheduler.worker_thread_number")
 
         row_i += 1
         ttk.Label(disp_frame, text="Reduction op").grid(
