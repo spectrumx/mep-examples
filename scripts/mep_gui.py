@@ -3818,6 +3818,26 @@ class MEPGui:
         row += 1
 
         throughput_row = 0
+        ttk.Label(throughput_frame, text="Batch size (packets)").grid(
+            row=throughput_row, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_batch_size"] = tk.StringVar(value="")
+        ent_batch_size = ttk.Entry(
+            throughput_frame, textvariable=self._vars["sg_batch_size"], width=14
+        )
+        ent_batch_size.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
+        self._add_tooltip(ent_batch_size, "packet.batch_size")
+
+        throughput_row += 1
+        ttk.Label(throughput_frame, text="Max packet size (bytes)").grid(
+            row=throughput_row, column=0, sticky="w", padx=5, pady=3)
+        self._vars["sg_max_packet_size"] = tk.StringVar(value="")
+        ent_max_packet_size = ttk.Entry(
+            throughput_frame, textvariable=self._vars["sg_max_packet_size"], width=14
+        )
+        ent_max_packet_size.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
+        self._add_tooltip(ent_max_packet_size, "packet.max_packet_size")
+
+        throughput_row += 1
         ttk.Label(throughput_frame, text="Chunk size (samples)").grid(
             row=throughput_row, column=0, sticky="w", padx=5, pady=3)
         self._vars["sg_chunk_size"] = tk.StringVar(value="")
@@ -5147,6 +5167,8 @@ class MEPGui:
     def _rec_collect_draft(self) -> dict:
         """Collect widget values only; recorder parsing belongs to start_mep_rx."""
         return {
+            "batch_size": self._vars["sg_batch_size"].get(),
+            "max_packet_size": self._vars["sg_max_packet_size"].get(),
             "chunk_size": self._vars["sg_chunk_size"].get(),
             "batch_capacity": self._vars["sg_batch_capacity"].get(),
             "buffer_size": self._vars["sg_buffer_size"].get(),
@@ -5174,6 +5196,8 @@ class MEPGui:
         self._rec_trace_busy = True
         try:
             field_map = {
+                "sg_batch_size": "batch_size",
+                "sg_max_packet_size": "max_packet_size",
                 "sg_chunk_size": "chunk_size",
                 "sg_batch_capacity": "batch_capacity",
                 "sg_buffer_size": "buffer_size",
@@ -5207,7 +5231,8 @@ class MEPGui:
         self._rec_trace_busy = True
         try:
             for key in (
-                "sg_chunk_size", "sg_batch_capacity", "sg_buffer_size", "sg_worker_threads",
+                "sg_batch_size", "sg_max_packet_size", "sg_chunk_size",
+                "sg_batch_capacity", "sg_buffer_size", "sg_worker_threads",
                 "sg_nperseg", "sg_nfft", "sg_noverlap", "sg_window", "sg_reduce_op",
                 "sg_num_spectra_per_chunk", "sg_spectra_per_output", "sg_snr_min",
                 "sg_snr_max", "sg_cmap", "sg_dpi", "sg_figsize",

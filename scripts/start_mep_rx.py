@@ -322,6 +322,8 @@ def resolve_recorder_preset(
         waterfall_duration = scan_time * spectra_per_output
 
         values = {
+            "batch_size": int(packet.get("batch_size", 0)),
+            "max_packet_size": int(packet.get("max_packet_size", 0)),
             "chunk_size": int(packet["num_samples"]),
             "batch_capacity": int(packet.get("batch_capacity", 4)),
             "buffer_size": int(packet.get("buffer_size", 4)),
@@ -382,10 +384,16 @@ def recorder_draft_to_overrides(draft: dict[str, object]) -> dict[str, object]:
     if len(figsize) != 2 or any(value <= 0 for value in figsize):
         raise ValueError("Figure size must contain two positive values")
 
+    batch_size = int(draft["batch_size"])
+    max_packet_size = int(draft["max_packet_size"])
     chunk_size = int(draft["chunk_size"])
     batch_capacity = int(draft["batch_capacity"])
     buffer_size = int(draft["buffer_size"])
     worker_thread_number = int(draft["worker_thread_number"])
+    if batch_size <= 0:
+        raise ValueError("Batch size must be positive")
+    if max_packet_size <= 0:
+        raise ValueError("Max packet size must be positive")
     if chunk_size <= 0:
         raise ValueError("Chunk size must be positive")
     if batch_capacity <= 0:
@@ -396,6 +404,8 @@ def recorder_draft_to_overrides(draft: dict[str, object]) -> dict[str, object]:
         raise ValueError("Worker threads must be positive")
 
     overrides = {
+        "packet.batch_size": batch_size,
+        "packet.max_packet_size": max_packet_size,
         "packet.num_samples": chunk_size,
         "packet.batch_capacity": batch_capacity,
         "packet.buffer_size": buffer_size,
