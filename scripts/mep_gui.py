@@ -3959,8 +3959,8 @@ class MEPGui:
         ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 2))
         ttk.Label(
             yaml_only_frame,
-            text="• pipeline.converter (int\u2192float): Enabled\n"
-                 "• pipeline.int_converter (float\u2192int before DRF sink): Enabled",
+              text="• pipeline.converter (int\u2192float): Enabled\n"
+                  "• pipeline.int_converter (float\u2192int before DRF sink): Enabled when DigitalRF IQ is on",
             justify="left",
             font=("TkDefaultFont", 9),
         ).grid(row=2, column=0, sticky="w", padx=5, pady=(2, 4))

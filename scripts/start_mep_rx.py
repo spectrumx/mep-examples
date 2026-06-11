@@ -220,6 +220,18 @@ def recorder_preset_path(sample_rate_mhz: int, config_dir: str = None) -> tuple[
     return deployed_path, "unavailable"
 
 
+def _normalize_recorder_pipeline(config: dict) -> None:
+    """Enforce recorder pipeline dependencies for safe runtime graph construction."""
+    pipeline = config.get("pipeline")
+    if not isinstance(pipeline, dict):
+        return
+
+    # int_converter and metadata only make sense when DigitalRF sink is active.
+    if not bool(pipeline.get("digital_rf", False)):
+        pipeline["int_converter"] = False
+        pipeline["metadata"] = False
+
+
 def resolve_recorder_preset(
     sample_rate_mhz: int,
     overrides: dict[str, object] = None,
@@ -246,6 +258,7 @@ def resolve_recorder_preset(
         config = copy.deepcopy(_load_yaml_mapping(path))
         for key, value in (overrides or {}).items():
             _set_dotted_value(config, key, value)
+        _normalize_recorder_pipeline(config)
 
         packet = config["packet"]
         pipeline = config["pipeline"]
@@ -365,7 +378,7 @@ def recorder_draft_to_overrides(draft: dict[str, object]) -> dict[str, object]:
     if len(figsize) != 2 or any(value <= 0 for value in figsize):
         raise ValueError("Figure size must contain two positive values")
 
-    return {
+    overrides = {
         "spectrogram.nperseg": int(draft["nperseg"]),
         "spectrogram.nfft": int(draft["nfft"]),
         "spectrogram.noverlap": int(draft["noverlap"]),
@@ -384,6 +397,11 @@ def recorder_draft_to_overrides(draft: dict[str, object]) -> dict[str, object]:
         "pipeline.digital_rf": bool(draft["digital_rf"]),
         "pipeline.metadata": bool(draft["metadata"]),
     }
+
+    if not bool(draft["digital_rf"]):
+        overrides["pipeline.int_converter"] = False
+
+    return overrides
 
 
 def preview_recorder_settings(
