@@ -3825,7 +3825,12 @@ class MEPGui:
             throughput_frame, textvariable=self._vars["sg_batch_size"], width=14
         )
         ent_batch_size.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
-        self._add_tooltip(ent_batch_size, "packet.batch_size")
+        self._add_tooltip(
+            ent_batch_size,
+            "Packets processed per batch by the network receiver. In these presets, "
+            "this is part of the chunk-size relationship that determines how much data "
+            "moves through the recorder at once.",
+        )
 
         throughput_row += 1
         ttk.Label(throughput_frame, text="Max packet size (bytes)").grid(
@@ -3835,7 +3840,11 @@ class MEPGui:
             throughput_frame, textvariable=self._vars["sg_max_packet_size"], width=14
         )
         ent_max_packet_size.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
-        self._add_tooltip(ent_max_packet_size, "packet.max_packet_size")
+        self._add_tooltip(
+            ent_max_packet_size,
+            "Maximum payload size expected from the sender. This should match the "
+            "packet format; it is not a tuning knob for the spectrogram pipeline.",
+        )
 
         throughput_row += 1
         ttk.Label(throughput_frame, text="Chunk size (samples)").grid(
@@ -3845,7 +3854,11 @@ class MEPGui:
             throughput_frame, textvariable=self._vars["sg_chunk_size"], width=14
         )
         ent_chunk_size.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
-        self._add_tooltip(ent_chunk_size, "packet.num_samples")
+        self._add_tooltip(
+            ent_chunk_size,
+            "Number of samples per recorder chunk. The preset chunk size is the "
+            "main throughput unit that flows through the recorder graph.",
+        )
 
         throughput_row += 1
         ttk.Label(throughput_frame, text="Batch capacity").grid(
@@ -3855,7 +3868,11 @@ class MEPGui:
             throughput_frame, textvariable=self._vars["sg_batch_capacity"], width=14
         )
         ent_batch_capacity.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
-        self._add_tooltip(ent_batch_capacity, "packet.batch_capacity")
+        self._add_tooltip(
+            ent_batch_capacity,
+            "Number of packet batches that can queue before the receiver starts "
+            "to apply backpressure or drop old work.",
+        )
 
         throughput_row += 1
         ttk.Label(throughput_frame, text="RX buffer size (chunks)").grid(
@@ -3865,7 +3882,11 @@ class MEPGui:
             throughput_frame, textvariable=self._vars["sg_buffer_size"], width=14
         )
         ent_buffer_size.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
-        self._add_tooltip(ent_buffer_size, "packet.buffer_size")
+        self._add_tooltip(
+            ent_buffer_size,
+            "Number of recorder chunks that can be buffered. Larger values give "
+            "more headroom for bursts, at the cost of more memory.",
+        )
 
         throughput_row += 1
         ttk.Label(throughput_frame, text="Scheduler worker threads").grid(
@@ -3875,7 +3896,18 @@ class MEPGui:
             throughput_frame, textvariable=self._vars["sg_worker_threads"], width=14
         )
         ent_worker_threads.grid(row=throughput_row, column=1, sticky="w", padx=5, pady=3)
-        self._add_tooltip(ent_worker_threads, "scheduler.worker_thread_number")
+        self._add_tooltip(
+            ent_worker_threads,
+            "Worker threads used by the event-based scheduler. Increasing this can "
+            "help if the graph is compute-bound rather than network-bound.",
+        )
+
+        throughput_row += 1
+        ttk.Label(
+            throughput_frame,
+            text="Chunk relation: batch_size × packet samples per packet = chunk size",
+            wraplength=455,
+        ).grid(row=throughput_row, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 4))
 
         # ===== SPECTROGRAMS =====
         disp_frame = ttk.LabelFrame(scrollable_frame, text="Spectrograms")
@@ -4026,7 +4058,8 @@ class MEPGui:
             yaml_only_frame,
               text="• pipeline.converter (int\u2192float): Enabled\n"
                   "• pipeline.int_converter (float\u2192int before DRF sink): Enabled when DigitalRF IQ is on\n"
-                  "• resampler chain and packet.batch_size",
+                  "• resampler chain can change effective chunk size\n"
+                  "• num_spectra_per_chunk must divide the effective chunk",
             justify="left",
             font=("TkDefaultFont", 9),
         ).grid(row=2, column=0, sticky="w", padx=5, pady=(2, 4))
