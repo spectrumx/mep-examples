@@ -21,7 +21,6 @@ import math
 import json
 import base64
 import time
-import socket
 import subprocess
 import queue
 import threading
@@ -44,6 +43,7 @@ from start_mep_rx import (
     preview_recorder_settings,
     resolve_injection,
     sync_ntp_on_rfsoc,
+    get_local_hostname,
     get_primary_network_info,
     get_primary_network_info_detailed,
     get_thermal_info_detailed,
@@ -140,7 +140,7 @@ class MEPGui:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("MEP Control App")
+        self.root.title(f"{get_local_hostname()} MEP Control App")
         self.root.resizable(True, True)
 
         self._sweep_thread: threading.Thread = None
@@ -1803,14 +1803,28 @@ class MEPGui:
             n = len(display_row)
             if n <= 0:
                 return
+            h = max(10, self._spec_line_canvas.winfo_height())
+            y = 0 if event.y < 0 else (h - 1 if event.y >= h else event.y)
             idx = int(round(x * (n - 1) / max(1, w - 1)))
             idx = 0 if idx < 0 else (n - 1 if idx >= n else idx)
             f0, f1, is_hz = self._spec_freq_axis(latest, len(row_latest))
             axis_val = f0 + (f1 - f0) * (idx / max(1, n - 1))
             flabel = self._spec_fmt_axis(axis_val, is_hz)
-            amp = float(display_row[idx])
+            trace_amp = float(display_row[idx])
+            vmin, vmax = self._spec_color_range()
+            if vmin is None:
+                vmin = float(np.min(display_row))
+                vmax = float(np.max(display_row))
+                if vmax <= vmin:
+                    vmax = vmin + 1.0
+            amp = float(vmax - (y / max(1, h - 1)) * (vmax - vmin))
             ts = latest.get("ts", "?")
-        label = f"Cursor: f={flabel}  t={ts}  pwr={self._spec_fmt_amp(amp)}"
+            label = (
+                f"Cursor: f={flabel}  t={ts}  pwr={self._spec_fmt_amp(amp)} "
+                f"(trace {self._spec_fmt_amp(trace_amp)})"
+            )
+        if from_waterfall:
+            label = f"Cursor: f={flabel}  t={ts}  pwr={self._spec_fmt_amp(amp)}"
 
         if "spec_cursor" in self._vars:
             self._vars["spec_cursor"].set(label)

@@ -487,6 +487,17 @@ def sync_ntp_on_rfsoc(scripts_dir: str = None) -> bool:
         return False
 
 
+def get_local_hostname() -> str:
+    """Return a short local hostname for UI display."""
+    try:
+        host = socket.gethostname().strip()
+    except Exception:
+        host = ""
+    if not host:
+        return "unknown-host"
+    return host.split(".", 1)[0] or "unknown-host"
+
+
 def get_primary_network_info_detailed() -> dict:
     """Query primary network interface info with structured diagnostics.
 
