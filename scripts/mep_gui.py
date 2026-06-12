@@ -5770,15 +5770,57 @@ class MEPGui:
 
     def _profile_holoscan_click(self):
         """Trigger holoscan profiling via CaptureController."""
-        if self.capture is None:
-            self._configure_mep()
-        if self.capture is None:
-            messagebox.showerror("Profiling", "CaptureController not available")
-            return
-
         try:
+            # Validate required GUI state variables exist
+            required_vars = ["tuner", "channel", "adc_if_mhz", "injection_mode",
+                           "prof_trace", "prof_duration", "prof_output_path", 
+                           "prof_cudabacktrace", "prof_force_overwrite", "prof_status"]
+            for var_name in required_vars:
+                if var_name not in self._vars:
+                    messagebox.showerror("Profiling", f"Missing GUI variable: {var_name}")
+                    return
+
+            # Initialize CaptureController if not already done
+            if self.capture is None:
+                try:
+                    tuner = self._vars["tuner"].get()
+                    adc_if = self._vars["adc_if_mhz"].get()
+                    try:
+                        adc_if_mhz = float(adc_if) if adc_if and tuner != "None" else None
+                    except (ValueError, TypeError):
+                        adc_if_mhz = None
+                    
+                    sr_mhz = self._rec_sample_rate_mhz()
+                    if sr_mhz is None or sr_mhz <= 0:
+                        messagebox.showerror("Profiling", "Invalid sample rate")
+                        return
+                    
+                    self.capture = CaptureController(self.bus)
+                    self.capture.configure_sweep(
+                        channel=self._vars["channel"].get() or "A",
+                        sample_rate_mhz=sr_mhz,
+                        tuner=tuner or "None",
+                        adc_if_mhz=adc_if_mhz,
+                        injection=self._vars["injection_mode"].get() or "low",
+                        capture_name="profiling",
+                    )
+                    self.capture.set_recorder_overrides(self._rec_pending_overrides)
+                    if self._conjugate_policy_user_override:
+                        policy = self._vars.get("conjugate_policy", {}).get() or CONJUGATE_POLICY_DEFAULT
+                        if policy in CONJUGATE_POLICY_OPTIONS:
+                            self.capture.conjugate_policy = policy
+                except Exception as e:
+                    logging.exception("CaptureController init failed")
+                    messagebox.showerror("Profiling", f"Failed to initialize: {e}")
+                    return
+
+            if self.capture is None:
+                messagebox.showerror("Profiling", "CaptureController not available")
+                return
+
+            # Collect and validate profiling parameters
             trace = self._vars["prof_trace"].get().strip()
-            duration = int(self._vars["prof_duration"].get().strip())
+            duration_str = self._vars["prof_duration"].get().strip()
             output_path = self._vars["prof_output_path"].get().strip()
             cudabacktrace = self._vars["prof_cudabacktrace"].get().strip()
             force_overwrite = self._vars["prof_force_overwrite"].get()
@@ -5786,14 +5828,29 @@ class MEPGui:
             if not trace:
                 messagebox.showerror("Profiling", "Trace flags cannot be empty")
                 return
-            if duration <= 0:
-                messagebox.showerror("Profiling", "Duration must be > 0")
+            if not duration_str:
+                messagebox.showerror("Profiling", "Duration cannot be empty")
                 return
             if not output_path:
                 messagebox.showerror("Profiling", "Output path cannot be empty")
                 return
 
-            self._prof_button.configure(state="disabled")
+            try:
+                duration = int(duration_str)
+            except ValueError:
+                messagebox.showerror("Profiling", f"Invalid duration: {duration_str}")
+                return
+
+            if duration <= 0:
+                messagebox.showerror("Profiling", "Duration must be > 0")
+                return
+
+            # Disable button and update status
+            try:
+                self._prof_button.configure(state="disabled")
+            except tk.TclError:
+                pass  # Button may not exist if not built yet
+            
             self._vars["prof_status"].set("Starting profiling...")
             self.root.update_idletasks()
 
@@ -5806,7 +5863,9 @@ class MEPGui:
                         force_overwrite=force_overwrite,
                         cudabacktrace=cudabacktrace,
                     )
-                    self._gui_call(lambda: self._vars["prof_status"].set(result.get("status", "Completed")))
+                    status = result.get("status", "Profiling complete")
+                    self._gui_call(lambda: self._vars["prof_status"].set(status))
+                    
                     if result.get("success"):
                         output_file = result.get("output_file", "unknown")
                         self._gui_call(lambda: messagebox.showinfo(
@@ -5820,16 +5879,22 @@ class MEPGui:
                         logging.error(f"Profiling failed: {error}")
                 except Exception as e:
                     msg = str(e)
+                    self._gui_call(lambda: self._vars["prof_status"].set(f"Error: {msg}"))
                     self._gui_call(lambda: messagebox.showerror("Profiling Error", msg))
-                    logging.exception("Profiling exception")
+                    logging.exception("Profiling thread exception")
                 finally:
-                    self._gui_call(lambda: self._prof_button.configure(state="normal"))
+                    try:
+                        self._gui_call(lambda: self._prof_button.configure(state="normal"))
+                    except (tk.TclError, AttributeError):
+                        pass
 
-            thread = threading.Thread(target=_run_profiling, daemon=True)
+            thread = threading.Thread(target=_run_profiling, daemon=True, name="profiler")
             thread.start()
+            logging.info("Profiler thread started")
 
-        except ValueError as e:
-            messagebox.showerror("Profiling", f"Invalid input: {e}")
+        except Exception as e:
+            logging.exception("Profile button handler exception")
+            messagebox.showerror("Profiling", f"Error: {e}")
 
     # ------------------------------------------------------------------ #
     #  Tuner trace

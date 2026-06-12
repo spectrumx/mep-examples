@@ -2758,58 +2758,67 @@ class CaptureController:
         Returns:
             dict with keys: success (bool), status (str), output_file (str), error (str)
         """
+        yaml_path = None
         try:
+            # Validate MQTT connection
             if not self._require_mqtt("profile holoscan"):
                 return {"success": False, "error": "MQTT not connected"}
 
-            # Get the staged recorder model (preset + GUI overrides)
+            # Get staged recorder model and extract config dict
             model = self.get_staged_recorder_model()
             if not model.get("available"):
-                return {"success": False, "error": "Recorder model not available"}
+                return {"success": False, "error": "Recorder preset not available"}
+            
+            # Extract only the config-relevant parts (not UI/status fields)
+            config_dict = model.get("config", {})
+            if not isinstance(config_dict, dict):
+                config_dict = model
 
-            # Generate temp YAML from model
+            # Import YAML library (try standard first, fallback to ruamel)
+            yaml_lib = None
             try:
                 import yaml
+                yaml_lib = yaml
+                use_ruamel = False
             except ImportError:
                 try:
-                    from ruamel.yaml import YAML as YAMLLib
-                    yaml = YAMLLib()
+                    from ruamel.yaml import YAML
+                    yaml_lib = YAML()
+                    use_ruamel = True
                 except ImportError:
                     return {"success": False, "error": "YAML library not available"}
 
-            with tempfile.NamedTemporaryFile(
-                mode='w', suffix='.yaml', delete=False, prefix='prof_'
-            ) as tmp_yaml:
-                yaml_path = tmp_yaml.name
-                try:
-                    if hasattr(yaml, 'dump'):
-                        yaml.dump(model, tmp_yaml)
+            # Write config to temp YAML file
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode='w', suffix='.yaml', delete=False, prefix='prof_', dir='/tmp'
+                ) as tmp_file:
+                    yaml_path = tmp_file.name
+                    if use_ruamel:
+                        yaml_lib.dump(config_dict, tmp_file)
                     else:
-                        yaml.default_flow_style = False
-                        yaml.dump(model, tmp_yaml)
-                    logging.info(f"Generated temp YAML: {yaml_path}")
-                except Exception as e:
-                    logging.error(f"Failed to write YAML: {e}")
-                    return {"success": False, "error": f"YAML write failed: {e}"}
+                        yaml_lib.dump(config_dict, tmp_file, default_flow_style=False)
+                logging.info(f"Generated temp YAML: {yaml_path}")
+            except Exception as e:
+                logging.error(f"Failed to write YAML: {e}")
+                return {"success": False, "error": f"YAML write failed: {e}"}
 
-            # Start RFSoC UDP stream (capture on next PPS)
+            # Start RFSoC UDP stream
             try:
                 logging.info("Starting RFSoC capture for profiling...")
                 self.bus.rfsoc_capture_now()
-                time.sleep(1)  # Brief wait for capture to start
+                time.sleep(1)
             except Exception as e:
-                logging.warning(f"RFSoC capture start warning: {e}")
+                logging.warning(f"RFSoC capture start: {e}")
 
-            # Build nsys command
-            # nsys path in docker is typically /opt/nvidia/nsys/bin/nsys
-            # Holoscan app is /app/mep_recorder.py
+            # Build docker compose exec command with nsys
+            compose_file = "/opt/radiohound/docker/docker-compose.yaml"
+            if not os.path.exists(compose_file):
+                return {"success": False, "error": f"Docker compose file not found: {compose_file}"}
+
             force_flag = "--force-overwrite=true" if force_overwrite else "--force-overwrite=false"
 
-            cmd_parts = [
-                "docker", "compose", "-f", "/opt/radiohound/docker/docker-compose.yaml",
-                "exec", "-T", "recorder", "bash", "-c",
-            ]
-
+            # Note: yaml_path is on host; inside container it's mounted at same path via /tmp
             nsys_cmd = (
                 f"cd /app && "
                 f"HOLOSCAN_ENABLE_PROFILE=1 "
@@ -2825,69 +2834,68 @@ class CaptureController:
                 f"--output_path /data/captures/preview/data"
             )
 
-            cmd_parts.append(nsys_cmd)
+            cmd = [
+                "docker", "compose", "-f", compose_file,
+                "exec", "-T", "recorder", "bash", "-c", nsys_cmd
+            ]
 
-            logging.info(f"Launching nsys profile: {' '.join(cmd_parts[:5])} ... (command length: {len(nsys_cmd)})")
+            logging.info(f"Launching profiling: timeout={duration + 30}s")
 
-            # Execute in subprocess, capture output
+            # Execute profiler
             try:
                 result = subprocess.run(
-                    cmd_parts,
+                    cmd,
                     capture_output=True,
                     text=True,
-                    timeout=duration + 30,  # Allow 30s overhead beyond profile duration
+                    timeout=duration + 30,
                 )
-                stdout = result.stdout
-                stderr = result.stderr
-                returncode = result.returncode
 
-                logging.info(f"nsys process exited with code {returncode}")
-                if stdout:
-                    logging.info(f"nsys stdout:\n{stdout}")
-                if stderr:
-                    logging.info(f"nsys stderr:\n{stderr}")
-
-                if returncode != 0:
+                if result.returncode != 0:
+                    stderr_short = result.stderr[:500] if result.stderr else "(no stderr)"
+                    logging.error(f"nsys failed: {result.returncode}\n{result.stderr}")
                     return {
                         "success": False,
-                        "error": f"nsys failed with code {returncode}: {stderr[:200]}",
+                        "error": f"nsys exited with code {result.returncode}: {stderr_short}",
                         "status": "Failed",
                     }
 
-                # Determine output file (nsys typically creates .sqlite and .csv/.qdstrm files)
-                # Try to infer from output_path
+                # Log output for debugging
+                if result.stdout:
+                    logging.info(f"nsys stdout: {result.stdout[:500]}")
+                if result.stderr:
+                    logging.info(f"nsys stderr: {result.stderr[:500]}")
+
                 output_file = f"{output_path}.sqlite"
                 status_msg = f"Profile saved to {output_file}"
 
+                logging.info(f"Profiling complete: {output_file}")
                 return {
                     "success": True,
                     "status": status_msg,
                     "output_file": output_file,
-                    "stdout": stdout,
-                    "stderr": stderr,
                 }
 
             except subprocess.TimeoutExpired:
-                return {
-                    "success": False,
-                    "error": f"nsys timed out after {duration + 30}s",
-                    "status": "Timeout",
-                }
+                msg = f"nsys timeout after {duration + 30}s"
+                logging.error(msg)
+                return {"success": False, "error": msg, "status": "Timeout"}
             except Exception as e:
-                return {
-                    "success": False,
-                    "error": f"Subprocess error: {e}",
-                    "status": "Error",
-                }
+                msg = f"Subprocess failed: {e}"
+                logging.error(msg)
+                return {"success": False, "error": msg, "status": "Error"}
 
+        except Exception as e:
+            msg = f"Profile error: {e}"
+            logging.exception(msg)
+            return {"success": False, "error": msg, "status": "Error"}
         finally:
-            # Clean up temp YAML file
-            if 'yaml_path' in locals() and os.path.exists(yaml_path):
+            # Clean up temp YAML
+            if yaml_path and os.path.exists(yaml_path):
                 try:
                     os.unlink(yaml_path)
-                    logging.info(f"Cleaned up temp YAML: {yaml_path}")
+                    logging.info(f"Cleaned up: {yaml_path}")
                 except Exception as e:
-                    logging.warning(f"Failed to clean up {yaml_path}: {e}")
+                    logging.warning(f"Cleanup failed: {e}")
 
     # ------------------------------------------------------------------ #
     #  Tune and Arm recipe (from "Tune and Capture" flowchart)             #
