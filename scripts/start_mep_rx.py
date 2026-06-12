@@ -2742,6 +2742,13 @@ class CaptureController:
 
         self.bus.rfsoc_reset()
 
+        # Set channel immediately after reset, before any frequency writes.
+        # freq_IF and freq_metadata write to whichever channel is currently
+        # active in the FPGA — if channel is set after freq commands the
+        # metadata ends up on the old channel's registers.
+        self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"channel {self.channel}"})
+        time.sleep(0.05)
+
         injection_mode = (self.injection or "").lower()
 
         if self.tuner is None:
@@ -2777,9 +2784,9 @@ class CaptureController:
                 else:
                     logging.warning("No tuner lock status response received")
 
-        # Common tail: metadata → channel → capture → TLM
+        # Common tail: metadata → capture → TLM
+        # (channel was already set right after reset above)
         self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_metadata {f_hz}"})
-        self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"channel {self.channel}"})
         self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "capture_next_pps"})
 
         tlm = self.get_tlm()
