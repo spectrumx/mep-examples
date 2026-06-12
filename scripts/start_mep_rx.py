@@ -2848,6 +2848,27 @@ class CaptureController:
                 "--output_path", "/data/captures/preview/data",
             ]
 
+            # Log a human-readable, copy-pasteable equivalent of the command. The real
+            # cmd passes the config as a huge inline JSON blob, so for reproducibility we
+            # reference the resolved YAML we save next to the report (written below).
+            yaml_file = f"{output_path}.yaml"
+            reproducible_cmd = (
+                "HOLOSCAN_ENABLE_PROFILE=1 nsys profile \\\n"
+                f"  --trace={trace} \\\n"
+                f"  --cudabacktrace={cudabacktrace} \\\n"
+                f"  --duration={duration} \\\n"
+                f"  --output={output_path} \\\n"
+                f"  {force_flag} \\\n"
+                "  python3 /app/mep_recorder.py \\\n"
+                f"  --config {yaml_file} \\\n"
+                "  --ram_ringbuffer_path /ramdisk \\\n"
+                "  --output_path /data/captures/preview/data"
+            )
+            logging.info(
+                "Profiling command (run inside the 'recorder' container to reproduce):\n%s",
+                reproducible_cmd,
+            )
+
             logging.info(f"Launching nsys profiling: duration={duration}s, output={output_path}")
 
             # Execute the profiler and wait for it to finish.
@@ -2872,27 +2893,54 @@ class CaptureController:
             if result.stderr:
                 logging.info(f"nsys stderr:\n{result.stderr}")
 
-            # nsys with --duration stops the target by sending SIGTERM when the
-            # collection window expires, so the recorder exits with 143 (128+SIGTERM).
-            # That is the normal completion path for duration-based profiling, not a
-            # failure: the report is still written. Treat 0 and 143 as success.
-            SIGTERM_EXIT = 143
-            if result.returncode not in (0, SIGTERM_EXIT):
+            # Success is judged by nsys's own report output from THIS run, not the exit
+            # code and not a file-existence check (which a stale report could spoof).
+            # When nsys writes the report it prints "Generated:\n  <path>.nsys-rep" to
+            # stdout/stderr — that line is the authoritative signal that this invocation
+            # produced a report. We only inspect the output captured from this process.
+            output_file = f"{output_path}.nsys-rep"
+            combined_output = f"{result.stdout or ''}\n{result.stderr or ''}"
+            report_generated = (
+                "Generated:" in combined_output and ".nsys-rep" in combined_output
+            )
+
+            if not report_generated:
                 stderr_short = (result.stderr or "(no stderr)").strip()[:1000]
-                logging.error(f"nsys failed with code {result.returncode}")
+                logging.error(
+                    f"nsys did not report a generated file (exit {result.returncode})"
+                )
                 return {
                     "success": False,
-                    "error": f"nsys exited with code {result.returncode}: {stderr_short}",
+                    "error": f"No report generated (nsys exit {result.returncode}): {stderr_short}",
                     "status": "Failed",
                 }
 
-            output_file = f"{output_path}.nsys-rep"
-            logging.info(f"Profiling complete (exit code {result.returncode}): {output_file}")
+            # The recorder's teardown is racy: it may exit 0, 143 (128+SIGTERM, the normal
+            # duration-stop path), or 139 (128+SIGSEGV, a segfault during shutdown). The
+            # report is already written by then, so none of these are profiler failures —
+            # but the exit code is always reported so a crash is visible.
+            rc = result.returncode
+            if rc == 0:
+                status = f"Profile saved to {output_file}, exit code 0 (clean exit)"
+            elif rc == 143:
+                status = (
+                    f"Profile saved to {output_file}, exit code 143 "
+                    f"(recorder stopped by SIGTERM at duration limit)"
+                )
+            elif rc == 139:
+                status = (
+                    f"Profile saved to {output_file}, exit code 139 "
+                    f"(recorder crashed with segfault)"
+                )
+            else:
+                status = f"Profile saved to {output_file}, exit code {rc}"
+            logging.info(
+                f"Profiling complete (nsys reported a generated report, exit {rc}): {output_file}"
+            )
 
             # Save the exact resolved config as YAML next to the report so the run is
             # reproducible. Written inside the container (where output_path lives) via
             # tee, so it lands in the same directory as the .nsys-rep file.
-            yaml_file = f"{output_path}.yaml"
             try:
                 yaml_text = _dump_yaml_text(config)
                 write_cmd = [
@@ -2912,8 +2960,9 @@ class CaptureController:
 
             return {
                 "success": True,
-                "status": f"Profile saved to {output_file}",
+                "status": status,
                 "output_file": output_file,
+                "returncode": result.returncode,
             }
 
         except Exception as e:
