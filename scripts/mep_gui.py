@@ -4347,6 +4347,52 @@ class MEPGui:
             font=("TkDefaultFont", 9),
         ).grid(row=2, column=0, sticky="w", padx=5, pady=(2, 4))
 
+        # ===== HOLOSCAN PROFILING =====
+        profile_frame = ttk.LabelFrame(scrollable_frame, text="Holoscan Profiling")
+        profile_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
+        profile_frame.columnconfigure(1, weight=1)
+        row += 1
+
+        # Trace
+        ttk.Label(profile_frame, text="Trace flags").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["prof_trace"] = tk.StringVar(value="cuda,nvtx,osrt")
+        ttk.Entry(profile_frame, textvariable=self._vars["prof_trace"], width=40).grid(
+            row=0, column=1, sticky="w", padx=5, pady=3)
+
+        # Duration
+        ttk.Label(profile_frame, text="Duration (seconds)").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        self._vars["prof_duration"] = tk.StringVar(value="60")
+        ttk.Entry(profile_frame, textvariable=self._vars["prof_duration"], width=10).grid(
+            row=1, column=1, sticky="w", padx=5, pady=3)
+
+        # Output path
+        ttk.Label(profile_frame, text="Output path").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        self._vars["prof_output_path"] = tk.StringVar(value="/data/captures/holoscan_profile")
+        ttk.Entry(profile_frame, textvariable=self._vars["prof_output_path"], width=40).grid(
+            row=2, column=1, sticky="w", padx=5, pady=3)
+
+        # cudabacktrace
+        ttk.Label(profile_frame, text="CUDA backtrace").grid(row=3, column=0, sticky="w", padx=5, pady=3)
+        self._vars["prof_cudabacktrace"] = tk.StringVar(value="all")
+        ttk.Entry(profile_frame, textvariable=self._vars["prof_cudabacktrace"], width=10).grid(
+            row=3, column=1, sticky="w", padx=5, pady=3)
+
+        # Force overwrite checkbox
+        self._vars["prof_force_overwrite"] = tk.BooleanVar(value=True)
+        ttk.Checkbutton(profile_frame, text="Force overwrite output", variable=self._vars["prof_force_overwrite"]).grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
+
+        # Status display
+        self._vars["prof_status"] = tk.StringVar(value="Ready")
+        ttk.Label(profile_frame, text="Status:").grid(row=5, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(profile_frame, textvariable=self._vars["prof_status"]).grid(row=5, column=1, sticky="w", padx=5, pady=3)
+
+        # Profile button
+        self._prof_button = ttk.Button(
+            profile_frame, text="Profile Holoscan", command=self._profile_holoscan_click
+        )
+        self._prof_button.grid(row=6, column=0, columnspan=2, padx=4, pady=6, sticky="ew")
+
         # ===== NEXT-RECORD ACTIONS =====
         action_frame = ttk.LabelFrame(scrollable_frame, text="REC Settings")
         action_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
@@ -5721,6 +5767,67 @@ class MEPGui:
     def _rec_status_ui_update(self, data: dict):
         """Update REC tab widgets from recorder status (only called after tab is built)."""
         self._vars["rec_status"].set(data.get("state", "—"))
+
+    def _profile_holoscan_click(self):
+        """Trigger holoscan profiling via CaptureController."""
+        if self.capture is None:
+            messagebox.showerror("Profiling", "CaptureController not available")
+            return
+
+        try:
+            trace = self._vars["prof_trace"].get().strip()
+            duration = int(self._vars["prof_duration"].get().strip())
+            output_path = self._vars["prof_output_path"].get().strip()
+            cudabacktrace = self._vars["prof_cudabacktrace"].get().strip()
+            force_overwrite = self._vars["prof_force_overwrite"].get()
+
+            if not trace:
+                messagebox.showerror("Profiling", "Trace flags cannot be empty")
+                return
+            if duration <= 0:
+                messagebox.showerror("Profiling", "Duration must be > 0")
+                return
+            if not output_path:
+                messagebox.showerror("Profiling", "Output path cannot be empty")
+                return
+
+            self._prof_button.configure(state="disabled")
+            self._vars["prof_status"].set("Starting profiling...")
+            self.root.update_idletasks()
+
+            def _run_profiling():
+                try:
+                    result = self.capture.profile_holoscan(
+                        trace=trace,
+                        duration=duration,
+                        output_path=output_path,
+                        force_overwrite=force_overwrite,
+                        cudabacktrace=cudabacktrace,
+                    )
+                    self._gui_call(lambda: self._vars["prof_status"].set(result.get("status", "Completed")))
+                    if result.get("success"):
+                        output_file = result.get("output_file", "unknown")
+                        self._gui_call(lambda: messagebox.showinfo(
+                            "Profiling Complete",
+                            f"Profile saved to:\n{output_file}",
+                        ))
+                        logging.info(f"Profiling complete: {output_file}")
+                    else:
+                        error = result.get("error", "Unknown error")
+                        self._gui_call(lambda: messagebox.showerror("Profiling Failed", error))
+                        logging.error(f"Profiling failed: {error}")
+                except Exception as e:
+                    msg = str(e)
+                    self._gui_call(lambda: messagebox.showerror("Profiling Error", msg))
+                    logging.exception("Profiling exception")
+                finally:
+                    self._gui_call(lambda: self._prof_button.configure(state="normal"))
+
+            thread = threading.Thread(target=_run_profiling, daemon=True)
+            thread.start()
+
+        except ValueError as e:
+            messagebox.showerror("Profiling", f"Invalid input: {e}")
 
     # ------------------------------------------------------------------ #
     #  Tuner trace

@@ -36,6 +36,7 @@ import socket
 import subprocess
 import queue
 import copy
+import tempfile
 from fractions import Fraction
 from collections import deque
 from datetime import datetime
@@ -2728,6 +2729,165 @@ class CaptureController:
         logging.info("Stopping recorder")
         self.bus.recorder_disable()
         self._recorder_running = False
+
+    def profile_holoscan(
+        self,
+        trace: str = "cuda,nvtx,osrt",
+        duration: int = 60,
+        output_path: str = "/data/captures/holoscan_profile",
+        force_overwrite: bool = True,
+        cudabacktrace: str = "all",
+    ) -> dict:
+        """
+        Profile the Holoscan recorder with nsys.
+        
+        This method:
+        1. Generates a temp YAML config from current GUI state
+        2. Starts RFSoC UDP stream
+        3. Launches nsys profile in docker container
+        4. Monitors and streams output
+        5. Returns result dict with success status and output file path
+        
+        Args:
+            trace: Comma-separated trace categories (cuda,nvtx,osrt)
+            duration: Profile duration in seconds
+            output_path: Output file path prefix (will be .sqlite, .csv, etc.)
+            force_overwrite: If True, use --force-overwrite in nsys
+            cudabacktrace: cudabacktrace depth (e.g., "all", "32")
+        
+        Returns:
+            dict with keys: success (bool), status (str), output_file (str), error (str)
+        """
+        try:
+            if not self._require_mqtt("profile holoscan"):
+                return {"success": False, "error": "MQTT not connected"}
+
+            # Get the staged recorder model (preset + GUI overrides)
+            model = self.get_staged_recorder_model()
+            if not model.get("available"):
+                return {"success": False, "error": "Recorder model not available"}
+
+            # Generate temp YAML from model
+            try:
+                import yaml
+            except ImportError:
+                try:
+                    from ruamel.yaml import YAML as YAMLLib
+                    yaml = YAMLLib()
+                except ImportError:
+                    return {"success": False, "error": "YAML library not available"}
+
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.yaml', delete=False, prefix='prof_'
+            ) as tmp_yaml:
+                yaml_path = tmp_yaml.name
+                try:
+                    if hasattr(yaml, 'dump'):
+                        yaml.dump(model, tmp_yaml)
+                    else:
+                        yaml.default_flow_style = False
+                        yaml.dump(model, tmp_yaml)
+                    logging.info(f"Generated temp YAML: {yaml_path}")
+                except Exception as e:
+                    logging.error(f"Failed to write YAML: {e}")
+                    return {"success": False, "error": f"YAML write failed: {e}"}
+
+            # Start RFSoC UDP stream (capture on next PPS)
+            try:
+                logging.info("Starting RFSoC capture for profiling...")
+                self.bus.rfsoc_capture_now()
+                time.sleep(1)  # Brief wait for capture to start
+            except Exception as e:
+                logging.warning(f"RFSoC capture start warning: {e}")
+
+            # Build nsys command
+            # nsys path in docker is typically /opt/nvidia/nsys/bin/nsys
+            # Holoscan app is /app/mep_recorder.py
+            force_flag = "--force-overwrite=true" if force_overwrite else "--force-overwrite=false"
+
+            cmd_parts = [
+                "docker", "compose", "-f", "/opt/radiohound/docker/docker-compose.yaml",
+                "exec", "-T", "recorder", "bash", "-c",
+            ]
+
+            nsys_cmd = (
+                f"cd /app && "
+                f"HOLOSCAN_ENABLE_PROFILE=1 "
+                f"nsys profile "
+                f"--trace={trace} "
+                f"--cudabacktrace={cudabacktrace} "
+                f"--duration={duration} "
+                f"--output={output_path} "
+                f"{force_flag} "
+                f"python3 /app/mep_recorder.py "
+                f"--config {yaml_path} "
+                f"--ram_ringbuffer_path /ramdisk "
+                f"--output_path /data/captures/preview/data"
+            )
+
+            cmd_parts.append(nsys_cmd)
+
+            logging.info(f"Launching nsys profile: {' '.join(cmd_parts[:5])} ... (command length: {len(nsys_cmd)})")
+
+            # Execute in subprocess, capture output
+            try:
+                result = subprocess.run(
+                    cmd_parts,
+                    capture_output=True,
+                    text=True,
+                    timeout=duration + 30,  # Allow 30s overhead beyond profile duration
+                )
+                stdout = result.stdout
+                stderr = result.stderr
+                returncode = result.returncode
+
+                logging.info(f"nsys process exited with code {returncode}")
+                if stdout:
+                    logging.info(f"nsys stdout:\n{stdout}")
+                if stderr:
+                    logging.info(f"nsys stderr:\n{stderr}")
+
+                if returncode != 0:
+                    return {
+                        "success": False,
+                        "error": f"nsys failed with code {returncode}: {stderr[:200]}",
+                        "status": "Failed",
+                    }
+
+                # Determine output file (nsys typically creates .sqlite and .csv/.qdstrm files)
+                # Try to infer from output_path
+                output_file = f"{output_path}.sqlite"
+                status_msg = f"Profile saved to {output_file}"
+
+                return {
+                    "success": True,
+                    "status": status_msg,
+                    "output_file": output_file,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }
+
+            except subprocess.TimeoutExpired:
+                return {
+                    "success": False,
+                    "error": f"nsys timed out after {duration + 30}s",
+                    "status": "Timeout",
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Subprocess error: {e}",
+                    "status": "Error",
+                }
+
+        finally:
+            # Clean up temp YAML file
+            if 'yaml_path' in locals() and os.path.exists(yaml_path):
+                try:
+                    os.unlink(yaml_path)
+                    logging.info(f"Cleaned up temp YAML: {yaml_path}")
+                except Exception as e:
+                    logging.warning(f"Failed to clean up {yaml_path}: {e}")
 
     # ------------------------------------------------------------------ #
     #  Tune and Arm recipe (from "Tune and Capture" flowchart)             #
