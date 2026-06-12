@@ -726,7 +726,7 @@ def get_docker_status() -> dict:
 
     try:
         compose_output = subprocess.run(
-            ["docker", "compose", "-f", "/opt/radiohound/docker/docker-compose.yaml", "ps", "--format=json"],
+            ["docker", "compose", "-f", "/opt/radiohound/docker/compose.yaml", "ps", "--format=json"],
             capture_output=True, text=True, timeout=5,
         )
         if compose_output.returncode == 0:
@@ -2812,7 +2812,7 @@ class CaptureController:
                 logging.warning(f"RFSoC capture start: {e}")
 
             # Build docker compose exec command with nsys
-            compose_file = "/opt/radiohound/docker/docker-compose.yaml"
+            compose_file = "/opt/radiohound/docker/compose.yaml"
             if not os.path.exists(compose_file):
                 return {"success": False, "error": f"Docker compose file not found: {compose_file}"}
 
