@@ -2748,6 +2748,7 @@ class CaptureController:
 
     def profile_holoscan(
         self,
+        freq_hz: float,
         trace: str = "cuda,nvtx,osrt",
         duration: int = 60,
         output_path: str = "/data/captures/holoscan_profile",
@@ -2763,11 +2764,16 @@ class CaptureController:
         as separate linked arguments. The whole thing is wrapped by ``nsys profile`` and run
         inside the recorder container via ``docker compose exec``.
 
+        Before launching, the RFSoC is tuned and armed via ``tune_and_arm(freq_hz)`` exactly
+        like a normal main-tab capture, so the profiled pipeline ingests the same RF the
+        operator selected (frequency, tuner, channel, injection) rather than stale FPGA state.
+
         No temp file is written: the previous file-based approach was broken because the
         file lived on the host while nsys runs inside the container, so the path did not
         exist there and jsonargparse printed its usage and exited with code 2.
 
         Args:
+            freq_hz: Center/RF frequency to tune and arm before profiling (Hz)
             trace: Comma-separated trace categories (e.g. "cuda,nvtx,osrt")
             duration: Profile duration in seconds
             output_path: nsys report output prefix (inside the container)
@@ -2820,13 +2826,24 @@ class CaptureController:
             # Serialize config as inline JSON (jsonargparse parses JSON as YAML).
             config_json = json.dumps(config)
 
-            # Start the RFSoC UDP stream so the recorder has data to process.
+            # Tune and arm the RFSoC exactly like a main-tab capture (reset → channel →
+            # frequency/tuner → metadata → capture) so the profiled pipeline ingests the
+            # operator-selected RF instead of whatever the FPGA was last left at.
             try:
-                logging.info("Starting RFSoC capture for profiling...")
-                self.bus.rfsoc_capture_now()
+                logging.info(f"Tuning and arming RFSoC for profiling at {freq_hz / 1e6:.2f} MHz...")
+                if not self.tune_and_arm(freq_hz):
+                    return {
+                        "success": False,
+                        "error": "RFSoC tune/arm failed; aborting profile",
+                        "status": "Failed",
+                    }
                 time.sleep(1)
             except Exception as e:
-                logging.warning(f"RFSoC capture start: {e}")
+                return {
+                    "success": False,
+                    "error": f"RFSoC tune/arm error: {e}",
+                    "status": "Failed",
+                }
 
             # Build the docker compose exec command. No shell, no temp file: the config
             # travels as a single argv element so there are no quoting/path problems.

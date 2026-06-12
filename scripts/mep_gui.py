@@ -5769,52 +5769,44 @@ class MEPGui:
     def _profile_holoscan_click(self):
         """Trigger holoscan profiling via CaptureController."""
         try:
-            # Validate required GUI state variables exist
-            required_vars = ["tuner", "channel", "adc_if_mhz", "injection_mode",
-                           "prof_trace", "prof_duration", "prof_output_path", 
+            # Validate required profiling GUI state variables exist
+            required_vars = ["prof_trace", "prof_duration", "prof_output_path",
                            "prof_cudabacktrace", "prof_force_overwrite", "prof_status"]
             for var_name in required_vars:
                 if var_name not in self._vars:
                     logging.error("Profiling: missing GUI variable: %s", var_name)
                     return
 
-            # Initialize CaptureController if not already done
-            if self.capture is None:
-                try:
-                    tuner = self._vars["tuner"].get()
-                    adc_if = self._vars["adc_if_mhz"].get()
-                    try:
-                        adc_if_mhz = float(adc_if) if adc_if and tuner != "None" else None
-                    except (ValueError, TypeError):
-                        adc_if_mhz = None
-                    
-                    sr_mhz = self._rec_sample_rate_mhz()
-                    if sr_mhz is None or sr_mhz <= 0:
-                        self._vars["prof_status"].set("Invalid sample rate")
-                        return
-                    
-                    self.capture = CaptureController(self.bus)
-                    self.capture.configure_sweep(
-                        channel=self._vars["channel"].get() or "A",
-                        sample_rate_mhz=sr_mhz,
-                        tuner=tuner or "None",
-                        adc_if_mhz=adc_if_mhz,
-                        injection=self._vars["injection_mode"].get() or "low",
-                        capture_name="profiling",
-                    )
-                    self.capture.set_recorder_overrides(self._rec_pending_overrides)
-                    if self._conjugate_policy_user_override:
-                        policy = self._vars.get("conjugate_policy", {}).get() or CONJUGATE_POLICY_DEFAULT
-                        if policy in CONJUGATE_POLICY_OPTIONS:
-                            self.capture.conjugate_policy = policy
-                except Exception as e:
-                    logging.exception("CaptureController init failed")
-                    self._vars["prof_status"].set(f"Failed to initialize: {e}")
-                    return
+            # Parse and apply the main-tab capture settings exactly like Start does, so
+            # profiling arms the RFSoC with the same frequency, tuner, channel, injection,
+            # and sample rate the operator selected on the main tab.
+            #
+            # Two main-tab fields are deliberately NOT used for profiling:
+            #   - dwell time: profiling length is governed by the REC tab Duration
+            #     (nsys --duration), not the main-tab dwell.
+            #   - capture name: profiling always writes to the preview data path, so no
+            #     main-tab capture name is adopted into controller state.
+            try:
+                params = self._parse_single_params()
+            except ValueError as e:
+                self._vars["prof_status"].set(f"Invalid capture settings: {e}")
+                return
+
+            params["dwell"] = None
+            params["capture_name"] = None
+
+            try:
+                self._configure_mep(params)
+            except Exception as e:
+                logging.exception("CaptureController init failed")
+                self._vars["prof_status"].set(f"Failed to initialize: {e}")
+                return
 
             if self.capture is None:
                 self._vars["prof_status"].set("CaptureController not available")
                 return
+
+            freq_hz = int(params["freq_start"] * 1e6)
 
             # Collect and validate profiling parameters
             trace = self._vars["prof_trace"].get().strip()
@@ -5855,6 +5847,7 @@ class MEPGui:
             def _run_profiling():
                 try:
                     result = self.capture.profile_holoscan(
+                        freq_hz=freq_hz,
                         trace=trace,
                         duration=duration,
                         output_path=output_path,
