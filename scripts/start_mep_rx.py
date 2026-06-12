@@ -2858,7 +2858,6 @@ class CaptureController:
                 "nsys", "profile",
                 f"--trace={trace}",
                 f"--cudabacktrace={cudabacktrace}",
-                "--python-backtrace=cuda",
                 f"--duration={duration}",
                 f"--output={output_path}",
                 force_flag,
@@ -2876,7 +2875,6 @@ class CaptureController:
                 "HOLOSCAN_ENABLE_PROFILE=1 nsys profile \\\n"
                 f"  --trace={trace} \\\n"
                 f"  --cudabacktrace={cudabacktrace} \\\n"
-                "  --python-backtrace=cuda \\\n"
                 f"  --duration={duration} \\\n"
                 f"  --output={output_path} \\\n"
                 f"  {force_flag} \\\n"
