@@ -42,7 +42,6 @@ from start_mep_rx import (
     resolve_recorder_preset,
     preview_recorder_settings,
     resolve_injection,
-    sync_ntp_on_rfsoc,
     get_local_hostname,
     get_primary_network_info,
     get_primary_network_info_detailed,
@@ -413,13 +412,16 @@ class MEPGui:
         self._vars["conjugate_policy"] = tk.StringVar(value="")
         self._vars["conjugate_actual"] = tk.StringVar(value="—")
 
-    def _add_tooltip(self, widget, text):
+    def _add_tooltip(self, widget, text, wraplength=320):
         """Add a simple tooltip to a widget that shows on hover."""
         def on_enter(event):
             tooltip = tk.Toplevel(widget)
             tooltip.wm_overrideredirect(True)
             tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
-            label = ttk.Label(tooltip, text=text, background="#ffffe0", relief="solid", borderwidth=1)
+            label = ttk.Label(
+                tooltip, text=text, background="#ffffe0", relief="solid",
+                borderwidth=1, wraplength=wraplength, justify="left",
+            )
             label.pack()
             widget._tooltip = tooltip
         
@@ -641,10 +643,6 @@ class MEPGui:
                     self.capture.close()
                 except Exception as e:
                     logging.warning(f"Failed to close capture controller: {e}")
-
-            if self._vars.get("sync_ntp") and self._vars["sync_ntp"].get():
-                logging.info("Syncing NTP on RFSoC...")
-                sync_ntp_on_rfsoc(os.path.dirname(os.path.abspath(__file__)))
 
             logging.info("Creating capture controller")
             self.capture = CaptureController(self.bus)
@@ -3110,59 +3108,154 @@ class MEPGui:
                 ttk.Label(parent, text=unit, foreground="grey").grid(
                     row=row, column=2, sticky="w")
 
-        st_f = ttk.LabelFrame(frame, text="RFSoC Status")
+        # ── Status ────────────────────────────────────────────────────────
+        # Read-only. Auto-refreshed whenever the RFSoC publishes to rfsoc/status.
+        st_f = ttk.LabelFrame(frame, text="Status  (live from rfsoc/status)")
         st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
         st_f.columnconfigure(1, weight=1)
-        _ro_row(st_f, 0, "State",       "soc_state")
-        _ro_row(st_f, 1, "Center Frequency Metadata", "soc_fc",  "MHz")
-        _ro_row(st_f, 2, "RFSoC IF Tuned Frequency",  "soc_fif", "MHz")
-        _ro_row(st_f, 3, "Sample Rate", "soc_fs",       "MHz")
-        _ro_row(st_f, 4, "PPS Count",   "soc_pps")
-        _ro_row(st_f, 5, "Channels",    "soc_channels")
+        _ro_row(st_f, 0, "State",                "soc_state")
+        _ro_row(st_f, 1, "Center Freq Metadata", "soc_fc",  "MHz")
+        _ro_row(st_f, 2, "NCO Frequency (IF)",   "soc_fif", "MHz")
+        _ro_row(st_f, 3, "Sample Rate",          "soc_fs",  "MHz")
+        _ro_row(st_f, 4, "PPS Count",            "soc_pps")
+        _ro_row(st_f, 5, "Active Channels",      "soc_channels")
+        refresh_btn = ttk.Button(st_f, text="Refresh Status", command=self._soc_refresh)
+        refresh_btn.grid(row=6, column=0, columnspan=3, sticky="w", padx=5, pady=(4, 4))
+        self._add_tooltip(
+            refresh_btn,
+            "MQTT: {\"task_name\": \"get\", \"arguments\": [\"tlm\"]}\n\n"
+            "Requests the RFSoC to re-publish its current state to rfsoc/status. "
+            "Status also auto-updates on every RFSoC event.",
+        )
 
-        cfg_f = ttk.LabelFrame(frame, text="Settings")
-        cfg_f.grid(row=1, column=0, padx=4, pady=(2, 4), sticky="ew")
-        cfg_f.columnconfigure(0, weight=1)
-        self._vars["sync_ntp"] = tk.BooleanVar(value=False)
-        ttk.Checkbutton(cfg_f, text="Sync NTP on connect",
-                        variable=self._vars["sync_ntp"]).grid(
-            row=0, column=0, sticky="w", padx=6, pady=4)
+        # ── UDP Stream ────────────────────────────────────────────────────
+        # Controls whether the FPGA ADC-to-UDP IP cores are streaming packets.
+        udp_f = ttk.LabelFrame(frame, text="UDP Stream")
+        udp_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        udp_f.columnconfigure(0, weight=1)
+        udp_f.columnconfigure(1, weight=1)
 
-        tst_f = ttk.LabelFrame(frame, text="Manual Control")
-        tst_f.grid(row=2, column=0, padx=4, pady=(0, 4), sticky="ew")
-        tst_f.columnconfigure(1, weight=1)
-        ttk.Label(tst_f, text="IF (MHz)").grid(
-            row=0, column=0, sticky="w", padx=5, pady=3)
-        self._vars["soc_if_test"] = tk.StringVar(value="1090")
-        ttk.Entry(tst_f, textvariable=self._vars["soc_if_test"], width=12).grid(
-            row=0, column=1, sticky="ew", padx=5, pady=3)
-        ttk.Button(tst_f, text="Set IF", command=self._soc_set_if_test).grid(
-            row=0, column=2, padx=5, pady=3, sticky="ew")
+        self._vars["soc_start_mode"] = tk.StringVar(value="pps")
+        mode_row = ttk.Frame(udp_f)
+        mode_row.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(6, 2))
+        ttk.Radiobutton(
+            mode_row, text="PPS Sync",
+            variable=self._vars["soc_start_mode"], value="pps",
+        ).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(
+            mode_row, text="Immediate",
+            variable=self._vars["soc_start_mode"], value="immediate",
+        ).pack(side="left")
         ttk.Label(
-            tst_f,
-            text="Warning: do not change IF during an active capture/sweep.",
-            foreground="grey",
-            font=("TkDefaultFont", 8),
-        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 3))
+            mode_row, text="← start mode",
+            foreground="grey", font=("TkDefaultFont", 8),
+        ).pack(side="left", padx=(8, 0))
 
-        btn_f = ttk.Frame(frame)
-        btn_f.grid(row=3, column=0, padx=4, pady=(0, 6), sticky="ew")
-        btn_f.columnconfigure(0, weight=1)
-        btn_f.columnconfigure(1, weight=1)
-        btn_f.columnconfigure(2, weight=1)
-        ttk.Button(btn_f, text="Reset RFSoC",
-                   command=self._rfsoc_reset).grid(
-            row=0, column=0, padx=(0, 2), sticky="ew")
-        ttk.Button(btn_f, text="Refresh TLM",
-                   command=self._soc_refresh).grid(
-            row=0, column=1, padx=(2, 0), sticky="ew")
-        ttk.Button(btn_f, text="Arm Next PPS",
-                   command=self._soc_arm_next_pps).grid(
-            row=0, column=2, padx=(2, 0), sticky="ew")
+        start_btn = ttk.Button(udp_f, text="Start", command=self._soc_start_stream)
+        start_btn.grid(row=1, column=0, padx=(5, 2), pady=(2, 6), sticky="ew")
+        self._add_tooltip(
+            start_btn,
+            "PPS Sync — MQTT: {\"task_name\": \"capture_next_pps\"}\n"
+            "Arms the FPGA to begin streaming on the next GPS PPS pulse. "
+            "Calculates sample index offset for the next UTC second boundary. "
+            "Requires GPS lock for accurate timestamps.\n\n"
+            "Immediate — MQTT: {\"task_name\": \"capture\"}\n"
+            "Starts streaming instantly with sample index offset = 0. "
+            "Use when GPS/PPS is unavailable.",
+        )
+        stop_btn = ttk.Button(udp_f, text="Stop", command=self._soc_stop_stream)
+        stop_btn.grid(row=1, column=1, padx=(2, 5), pady=(2, 6), sticky="ew")
+        self._add_tooltip(
+            stop_btn,
+            "MQTT: {\"task_name\": \"reset\"}\n\n"
+            "Writes CTRL=RESET to all active FPGA ADC-to-UDP IP cores. "
+            "Stops packet output immediately. Does not affect the recorder.",
+        )
 
-        # Register tab-specific MQTT → UI. Emit-cached fires inline if data exists.
+        # ── Frequency Control ─────────────────────────────────────────────
+        freq_f = ttk.LabelFrame(frame, text="Frequency")
+        freq_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="ew")
+        freq_f.columnconfigure(1, weight=1)
+
+        ttk.Label(freq_f, text="NCO Frequency (MHz)").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["soc_if_test"] = tk.StringVar(value="1090")
+        ttk.Entry(freq_f, textvariable=self._vars["soc_if_test"], width=12).grid(
+            row=0, column=1, sticky="ew", padx=5, pady=3)
+        nco_btn = ttk.Button(freq_f, text="Set", command=self._soc_set_if_test)
+        nco_btn.grid(row=0, column=2, padx=5, pady=3, sticky="ew")
+        self._add_tooltip(
+            nco_btn,
+            "MQTT: {\"task_name\": \"set\", \"arguments\": \"freq_IF <MHz>\"}\n\n"
+            "Tunes the ADC digital mixer (NCO) on all tiles to -freq_IF. "
+            "Also updates the sample rate metadata register. "
+            "Avoid changing during an active sweep.",
+        )
+
+        ttk.Label(freq_f, text="Freq Metadata (MHz)").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        self._vars["soc_freq_metadata"] = tk.StringVar(value="")
+        ttk.Entry(freq_f, textvariable=self._vars["soc_freq_metadata"], width=12).grid(
+            row=1, column=1, sticky="ew", padx=5, pady=3)
+        meta_btn = ttk.Button(freq_f, text="Set", command=self._soc_set_freq_metadata)
+        meta_btn.grid(row=1, column=2, padx=5, pady=3, sticky="ew")
+        self._add_tooltip(
+            meta_btn,
+            "MQTT: {\"task_name\": \"set\", \"arguments\": \"freq_metadata <Hz>\"}\n\n"
+            "Updates the frequency tag written into UDP packet headers, "
+            "independently of the NCO. Used when an external tuner shifts "
+            "the true RF center frequency. Enter MHz; converted to Hz before sending.",
+        )
+        ttk.Label(
+            freq_f,
+            text="\u26a0 Do not change frequency during an active sweep.",
+            foreground="grey", font=("TkDefaultFont", 8),
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
+
+        # ── Channel Control ───────────────────────────────────────────────
+        ch_f = ttk.LabelFrame(frame, text="Active Channels")
+        ch_f.grid(row=3, column=0, padx=4, pady=(2, 2), sticky="ew")
+        ch_f.columnconfigure(0, weight=1)
+
+        self._vars["soc_ch_A"] = tk.BooleanVar(value=False)
+        self._vars["soc_ch_B"] = tk.BooleanVar(value=False)
+        self._vars["soc_ch_C"] = tk.BooleanVar(value=False)
+        self._vars["soc_ch_D"] = tk.BooleanVar(value=False)
+        cb_row = ttk.Frame(ch_f)
+        cb_row.grid(row=0, column=0, sticky="w", padx=5, pady=(6, 2))
+        for ch in ("A", "B", "C", "D"):
+            ttk.Checkbutton(cb_row, text=f"  {ch}  ", variable=self._vars[f"soc_ch_{ch}"]).pack(
+                side="left", padx=4)
+        ch_apply_btn = ttk.Button(ch_f, text="Apply Channels", command=self._soc_set_channels)
+        ch_apply_btn.grid(row=1, column=0, sticky="w", padx=5, pady=(2, 2))
+        self._add_tooltip(
+            ch_apply_btn,
+            "MQTT: {\"task_name\": \"set\", \"arguments\": \"channel <A,B,...>\"}\n\n"
+            "Sets which ADC channels stream UDP packets. Multiple channels are "
+            "supported (e.g. A,B). Sending this command resets the FPGA control "
+            "register — restart the UDP stream after applying.",
+        )
+        ttk.Label(
+            ch_f,
+            text="Checkboxes reflect last received status. Applying resets stream — restart after.",
+            foreground="grey", font=("TkDefaultFont", 8),
+        ).grid(row=2, column=0, sticky="w", padx=5, pady=(0, 4))
+
+        # ── Clock Source (informational) ──────────────────────────────────
+        clk_f = ttk.LabelFrame(frame, text="Clock Source")
+        clk_f.grid(row=4, column=0, padx=4, pady=(2, 6), sticky="ew")
+        ttk.Label(
+            clk_f,
+            text=(
+                "Clock source (internal / external) is configured at RFSoC service "
+                "startup via CLI arguments and is not readable or changeable via "
+                "MQTT with the current firmware. Check the rfsoc service launch "
+                "arguments to verify clock configuration."
+            ),
+            foreground="grey", font=("TkDefaultFont", 8), justify="left", wraplength=380,
+        ).pack(padx=8, pady=6, anchor="w")
+
+        # Register MQTT → UI
         self.bus.on_status(RFSOC_STATUS_TOPIC,
-                          lambda data: self._gui_call(self._soc_apply, data))
+                           lambda data: self._gui_call(self._soc_apply, data))
 
     # ---- TX tab ---- #
 
@@ -5158,30 +5251,74 @@ class MEPGui:
         self._vars["soc_fif"].set(f"{float(tlm.get('f_if_hz', 0))/1e6:.3f}")
         self._vars["soc_fs"].set(f"{float(tlm.get('f_s', 0))/1e6:.3f}")
         self._vars["soc_pps"].set(str(tlm.get("pps_count", "—")))
-        self._vars["soc_channels"].set(str(tlm.get("channels", "—")))
+        channels = tlm.get("channels", [])
+        self._vars["soc_channels"].set(",".join(channels) if channels else "—")
+        # Sync channel checkboxes to reflect actual hardware state
+        for ch in ("A", "B", "C", "D"):
+            key = f"soc_ch_{ch}"
+            if key in self._vars:
+                self._vars[key].set(ch in channels)
 
-    def _rfsoc_reset(self):
+    def _soc_refresh(self):
+        if not self._require_mqtt("refresh RFSoC status"):
+            return
+        self.bus.rfsoc_get_tlm()
+        tlm = self.bus.get_cached_status(RFSOC_STATUS_TOPIC)
+        if tlm is None:
+            logging.warning("SOC: no telemetry response")
+            return
+        self._gui_call(self._soc_apply, tlm)
+
+    def _soc_start_stream(self):
+        if not self._require_mqtt("start UDP stream"):
+            return
+        mode = self._vars["soc_start_mode"].get()
+        if mode == "pps":
+            self.bus.rfsoc_capture_next_pps()
+            logging.info("SOC: capture_next_pps sent — will start on next GPS PPS pulse")
+        else:
+            self.bus.rfsoc_capture_now()
+            logging.info("SOC: capture sent — streaming started immediately")
+
+    def _soc_stop_stream(self):
+        if not self._require_mqtt("stop UDP stream"):
+            return
         self.bus.rfsoc_reset()
-        logging.info("RFSoC reset sent")
-
-    def _soc_arm_next_pps(self):
-        self.bus.rfsoc_capture_next_pps()
-        logging.info("SOC: capture_next_pps sent (cancel by Reset RFSoC)")
+        logging.info("SOC: reset sent — UDP stream stopped")
 
     def _soc_set_if_test(self):
         try:
             if_mhz = float(self._vars["soc_if_test"].get().strip())
         except ValueError:
-            logging.error("SOC: invalid IF frequency value")
+            logging.error("SOC: invalid NCO frequency value")
             return
-
         sweep_active = self._sweep_thread and self._sweep_thread.is_alive()
         recorder_running = bool(self.capture is not None and self.capture._recorder_running)
         if sweep_active or recorder_running:
-            logging.warning("SOC: setting IF during active capture/sweep can disrupt capture")
-
+            logging.warning("SOC: setting NCO frequency during active capture/sweep can disrupt capture")
         self.bus.rfsoc_set_if(if_mhz)
         logging.info(f"SOC: set freq_IF {if_mhz:.3f} MHz sent")
+
+    def _soc_set_freq_metadata(self):
+        try:
+            freq_mhz = float(self._vars["soc_freq_metadata"].get().strip())
+        except ValueError:
+            logging.error("SOC: invalid frequency metadata value")
+            return
+        freq_hz = freq_mhz * 1e6
+        self.bus.rfsoc_set_freq_metadata(freq_hz)
+        logging.info(f"SOC: set freq_metadata {freq_hz:.0f} Hz sent")
+
+    def _soc_set_channels(self):
+        if not self._require_mqtt("set channels"):
+            return
+        selected = [ch for ch in ("A", "B", "C", "D") if self._vars[f"soc_ch_{ch}"].get()]
+        if not selected:
+            logging.warning("SOC: no channels selected — at least one channel required")
+            return
+        channel_str = ",".join(selected)
+        self.bus.rfsoc_set_channel(channel_str)
+        logging.info(f"SOC: set channel {channel_str} sent — restart UDP stream to apply")
 
     # ------------------------------------------------------------------ #
     #  TX helpers

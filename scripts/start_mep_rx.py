@@ -1802,6 +1802,18 @@ class MEPBus:
         """Arm capture on next PPS edge."""
         self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "capture_next_pps"})
 
+    def rfsoc_capture_now(self):
+        """Start capture immediately (no PPS sync)."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "capture"})
+
+    def rfsoc_set_channel(self, channels: str):
+        """Set active RX channels (e.g. 'A', 'B', 'A,B'). Resets FPGA control register."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"channel {channels}"})
+
+    def rfsoc_set_freq_metadata(self, freq_hz: float):
+        """Set the frequency metadata tag written into UDP packet headers (Hz)."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_metadata {freq_hz}"})
+
     def rfsoc_set_if(self, if_mhz: float):
         """Set RFSoC IF frequency in MHz."""
         self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {if_mhz}"})
