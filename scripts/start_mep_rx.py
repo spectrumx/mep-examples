@@ -2783,6 +2783,7 @@ class CaptureController:
         Returns:
             dict with keys: success (bool), status (str), output_file (str), error (str)
         """
+        armed = False
         try:
             # Validate MQTT connection
             if not self._require_mqtt("profile holoscan"):
@@ -2837,6 +2838,7 @@ class CaptureController:
                         "error": "RFSoC tune/arm failed; aborting profile",
                         "status": "Failed",
                     }
+                armed = True
                 time.sleep(1)
             except Exception as e:
                 return {
@@ -2985,6 +2987,16 @@ class CaptureController:
         except Exception as e:
             logging.exception("Profile error")
             return {"success": False, "error": str(e), "status": "Error"}
+        finally:
+            # nsys only stops the recorder; the RFSoC keeps streaming UDP. Mirror the
+            # normal capture lifecycle (arm before, reset after) so profiling always
+            # leaves the hardware idle, regardless of how the run ended.
+            if armed:
+                try:
+                    logging.info("Stopping RFSoC UDP stream after profiling...")
+                    self.bus.rfsoc_reset()
+                except Exception as e:
+                    logging.warning(f"Could not reset RFSoC after profiling: {e}")
 
     # ------------------------------------------------------------------ #
     #  Tune and Arm recipe (from "Tune and Capture" flowchart)             #
