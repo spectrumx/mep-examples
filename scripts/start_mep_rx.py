@@ -2845,7 +2845,12 @@ class CaptureController:
             if result.stderr:
                 logging.info(f"nsys stderr:\n{result.stderr}")
 
-            if result.returncode != 0:
+            # nsys with --duration stops the target by sending SIGTERM when the
+            # collection window expires, so the recorder exits with 143 (128+SIGTERM).
+            # That is the normal completion path for duration-based profiling, not a
+            # failure: the report is still written. Treat 0 and 143 as success.
+            SIGTERM_EXIT = 143
+            if result.returncode not in (0, SIGTERM_EXIT):
                 stderr_short = (result.stderr or "(no stderr)").strip()[:1000]
                 logging.error(f"nsys failed with code {result.returncode}")
                 return {
@@ -2855,7 +2860,7 @@ class CaptureController:
                 }
 
             output_file = f"{output_path}.nsys-rep"
-            logging.info(f"Profiling complete: {output_file}")
+            logging.info(f"Profiling complete (exit code {result.returncode}): {output_file}")
             return {
                 "success": True,
                 "status": f"Profile saved to {output_file}",
