@@ -2749,9 +2749,9 @@ class CaptureController:
         5. Returns result dict with success status and output file path
         
         Args:
-            trace: Comma-separated trace categories (cuda,nvtx,osrt)
+            trace: Comma-separated trace categories
             duration: Profile duration in seconds
-            output_path: Output file path prefix (will be .sqlite, .csv, etc.)
+            output_path: Output file path prefix
             force_overwrite: If True, use --force-overwrite in nsys
             cudabacktrace: cudabacktrace depth (e.g., "all", "32")
         
@@ -2765,14 +2765,24 @@ class CaptureController:
                 return {"success": False, "error": "MQTT not connected"}
 
             # Get staged recorder model and extract config dict
-            model = self.get_staged_recorder_model()
-            if not model.get("available"):
-                return {"success": False, "error": "Recorder preset not available"}
-            
-            # Extract only the config-relevant parts (not UI/status fields)
-            config_dict = model.get("config", {})
-            if not isinstance(config_dict, dict):
-                config_dict = model
+            preset_path, source = recorder_preset_path(self.sample_rate_mhz)
+            if source == "unavailable":
+                return {"success": False, "error": f"Recorder preset not found: {preset_path}"}
+
+            try:
+                config = copy.deepcopy(_load_yaml_mapping(preset_path))
+            except Exception as e:
+                return {"success": False, "error": f"Failed to load config: {e}"}
+
+            # Apply recorder overrides to config
+            for key, value in self.recorder_overrides.items():
+                _set_dotted_value(config, key, value)
+
+            # Normalize the config
+            try:
+                _normalize_recorder_pipeline(config)
+            except Exception as e:
+                return {"success": False, "error": f"Config validation failed: {e}"}
 
             # Import YAML library (try standard first, fallback to ruamel)
             yaml_lib = None
@@ -2795,9 +2805,9 @@ class CaptureController:
                 ) as tmp_file:
                     yaml_path = tmp_file.name
                     if use_ruamel:
-                        yaml_lib.dump(config_dict, tmp_file)
+                        yaml_lib.dump(config, tmp_file)
                     else:
-                        yaml_lib.dump(config_dict, tmp_file, default_flow_style=False)
+                        yaml_lib.dump(config, tmp_file, default_flow_style=False)
                 logging.info(f"Generated temp YAML: {yaml_path}")
             except Exception as e:
                 logging.error(f"Failed to write YAML: {e}")
@@ -2813,8 +2823,6 @@ class CaptureController:
 
             # Build docker compose exec command with nsys
             compose_file = "/opt/radiohound/docker/compose.yaml"
-            if not os.path.exists(compose_file):
-                return {"success": False, "error": f"Docker compose file not found: {compose_file}"}
 
             force_flag = "--force-overwrite=true" if force_overwrite else "--force-overwrite=false"
 
@@ -2851,8 +2859,8 @@ class CaptureController:
                 )
 
                 if result.returncode != 0:
-                    stderr_short = result.stderr[:500] if result.stderr else "(no stderr)"
-                    logging.error(f"nsys failed: {result.returncode}\n{result.stderr}")
+                    stderr_short = result.stderr[:1000] if result.stderr else "(no stderr)"
+                    logging.error(f"nsys failed with code {result.returncode}:\n{result.stderr}")
                     return {
                         "success": False,
                         "error": f"nsys exited with code {result.returncode}: {stderr_short}",
@@ -2865,13 +2873,11 @@ class CaptureController:
                 if result.stderr:
                     logging.info(f"nsys stderr: {result.stderr[:500]}")
 
+                logging.info("Profiling completed successfully")
                 output_file = f"{output_path}.sqlite"
-                status_msg = f"Profile saved to {output_file}"
-
-                logging.info(f"Profiling complete: {output_file}")
                 return {
                     "success": True,
-                    "status": status_msg,
+                    "status": f"Profile saved to {output_file}",
                     "output_file": output_file,
                 }
 
@@ -2885,9 +2891,8 @@ class CaptureController:
                 return {"success": False, "error": msg, "status": "Error"}
 
         except Exception as e:
-            msg = f"Profile error: {e}"
-            logging.exception(msg)
-            return {"success": False, "error": msg, "status": "Error"}
+            logging.exception(f"Profile error: {e}")
+            return {"success": False, "error": str(e), "status": "Error"}
         finally:
             # Clean up temp YAML
             if yaml_path and os.path.exists(yaml_path):
