@@ -2780,10 +2780,20 @@ class CaptureController:
 
             # Enforce pipeline dependencies, then apply channel-specific runtime settings
             # so the recorder actually listens to the active channel's UDP stream.
+            # This mirrors start_recorder() exactly: absolute preview channel_dir + a
+            # pre-created preview data directory so the DigitalRF / metadata sinks can
+            # create their HDF5 files (a relative dir or missing parent crashes dmd_sink).
             _normalize_recorder_pipeline(config)
-            if self.channel in RECORDER_CHANNEL_PORTS:
-                _set_dotted_value(config, "basic_network.dst_port", RECORDER_CHANNEL_PORTS[self.channel])
-                _set_dotted_value(config, "drf_sink.channel_dir", f"preview/data/ch{self.channel}")
+            if self.channel not in RECORDER_CHANNEL_PORTS:
+                return {"success": False, "error": f"Invalid channel: {self.channel}"}
+
+            self._clear_preview_data_dir()
+            channel_dir = f"{PREVIEW_DATA_DIR}/ch{self.channel}"
+            spectrogram_subdir = f"preview/data/ch{self.channel}/spectrograms"
+            _set_dotted_value(config, "basic_network.dst_port", RECORDER_CHANNEL_PORTS[self.channel])
+            _set_dotted_value(config, "drf_sink.channel_dir", channel_dir)
+            _set_dotted_value(config, "spectrogram_output.plot_subdir", spectrogram_subdir)
+            _set_dotted_value(config, "packet.freq_idx_offset", 0)
             try:
                 conj_state = self.get_conjugate_state()
                 _set_dotted_value(config, "packet.apply_conjugate", bool(conj_state["apply_conjugate"]))
