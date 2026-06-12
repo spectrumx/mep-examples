@@ -197,6 +197,23 @@ def _load_yaml_mapping(path: str) -> dict:
     return data
 
 
+def _dump_yaml_text(mapping: dict) -> str:
+    """Serialize a config mapping to YAML text (ruamel or PyYAML)."""
+    try:
+        import io
+        from ruamel.yaml import YAML
+
+        buf = io.StringIO()
+        yml = YAML(typ="safe")
+        yml.default_flow_style = False
+        yml.dump(mapping, buf)
+        return buf.getvalue()
+    except ImportError:
+        import yaml
+
+        return yaml.safe_dump(mapping, default_flow_style=False, sort_keys=False)
+
+
 def _set_dotted_value(mapping: dict, key: str, value):
     """Apply recorder-service-style dotted configuration replacement."""
     parts = key.split(".")
@@ -2871,6 +2888,28 @@ class CaptureController:
 
             output_file = f"{output_path}.nsys-rep"
             logging.info(f"Profiling complete (exit code {result.returncode}): {output_file}")
+
+            # Save the exact resolved config as YAML next to the report so the run is
+            # reproducible. Written inside the container (where output_path lives) via
+            # tee, so it lands in the same directory as the .nsys-rep file.
+            yaml_file = f"{output_path}.yaml"
+            try:
+                yaml_text = _dump_yaml_text(config)
+                write_cmd = [
+                    "docker", "compose", "-f", compose_file, "exec", "-T",
+                    "recorder", "tee", yaml_file,
+                ]
+                subprocess.run(
+                    write_cmd,
+                    input=yaml_text,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                logging.info(f"Saved profiling config: {yaml_file}")
+            except Exception as e:
+                logging.warning(f"Could not save profiling config YAML: {e}")
+
             return {
                 "success": True,
                 "status": f"Profile saved to {output_file}",

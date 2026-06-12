@@ -4384,8 +4384,14 @@ class MEPGui:
 
         # Status display
         self._vars["prof_status"] = tk.StringVar(value="Ready")
-        ttk.Label(profile_frame, text="Status:").grid(row=5, column=0, sticky="w", padx=5, pady=3)
-        ttk.Label(profile_frame, textvariable=self._vars["prof_status"]).grid(row=5, column=1, sticky="w", padx=5, pady=3)
+        ttk.Label(profile_frame, text="Status:").grid(row=5, column=0, sticky="nw", padx=5, pady=3)
+        ttk.Label(
+            profile_frame,
+            textvariable=self._vars["prof_status"],
+            font=("TkDefaultFont", 7),
+            wraplength=320,
+            justify="left",
+        ).grid(row=5, column=1, sticky="w", padx=5, pady=3)
 
         # Profile button
         self._prof_button = ttk.Button(
@@ -4394,18 +4400,16 @@ class MEPGui:
         self._prof_button.grid(row=6, column=0, columnspan=2, padx=4, pady=6, sticky="ew")
 
         # ===== NEXT-RECORD ACTIONS =====
-        action_frame = ttk.LabelFrame(scrollable_frame, text="REC Settings")
+        action_frame = ttk.LabelFrame(scrollable_frame, text="APPLY changes")
         action_frame.grid(row=row, column=0, padx=4, pady=6, sticky="ew")
-        for column in range(3):
+        for column in range(2):
             action_frame.columnconfigure(column, weight=1)
         self._rec_stage_button = ttk.Button(
             action_frame, text="Apply On Next Record", command=self._stage_rec_settings
         )
         self._rec_stage_button.grid(row=0, column=0, padx=4, pady=6, sticky="ew")
-        ttk.Button(action_frame, text="Undo Changes", command=self._rec_discard_draft).grid(
-            row=0, column=1, padx=4, pady=6, sticky="ew")
         ttk.Button(action_frame, text="Reset to Config File", command=self._rec_reset_config).grid(
-            row=0, column=2, padx=4, pady=6, sticky="ew")
+            row=0, column=1, padx=4, pady=6, sticky="ew")
 
         def _bind_rec_copy_menus(container):
             for widget in container.winfo_children():
@@ -5751,12 +5755,6 @@ class MEPGui:
         self._rec_render_model(model)
         logging.info("REC: settings will apply on next recorder start")
 
-    def _rec_discard_draft(self):
-        model = resolve_recorder_preset(
-            self._rec_sample_rate_mhz(), self._rec_pending_overrides
-        )
-        self._rec_render_model(model, load_values=bool(model.get("available")))
-
     def _rec_reset_config(self):
         self._rec_pending_overrides.clear()
         if self.capture is not None:
@@ -5777,7 +5775,7 @@ class MEPGui:
                            "prof_cudabacktrace", "prof_force_overwrite", "prof_status"]
             for var_name in required_vars:
                 if var_name not in self._vars:
-                    messagebox.showerror("Profiling", f"Missing GUI variable: {var_name}")
+                    logging.error("Profiling: missing GUI variable: %s", var_name)
                     return
 
             # Initialize CaptureController if not already done
@@ -5792,7 +5790,7 @@ class MEPGui:
                     
                     sr_mhz = self._rec_sample_rate_mhz()
                     if sr_mhz is None or sr_mhz <= 0:
-                        messagebox.showerror("Profiling", "Invalid sample rate")
+                        self._vars["prof_status"].set("Invalid sample rate")
                         return
                     
                     self.capture = CaptureController(self.bus)
@@ -5811,11 +5809,11 @@ class MEPGui:
                             self.capture.conjugate_policy = policy
                 except Exception as e:
                     logging.exception("CaptureController init failed")
-                    messagebox.showerror("Profiling", f"Failed to initialize: {e}")
+                    self._vars["prof_status"].set(f"Failed to initialize: {e}")
                     return
 
             if self.capture is None:
-                messagebox.showerror("Profiling", "CaptureController not available")
+                self._vars["prof_status"].set("CaptureController not available")
                 return
 
             # Collect and validate profiling parameters
@@ -5826,23 +5824,23 @@ class MEPGui:
             force_overwrite = self._vars["prof_force_overwrite"].get()
 
             if not trace:
-                messagebox.showerror("Profiling", "Trace flags cannot be empty")
+                self._vars["prof_status"].set("Trace flags cannot be empty")
                 return
             if not duration_str:
-                messagebox.showerror("Profiling", "Duration cannot be empty")
+                self._vars["prof_status"].set("Duration cannot be empty")
                 return
             if not output_path:
-                messagebox.showerror("Profiling", "Output path cannot be empty")
+                self._vars["prof_status"].set("Output path cannot be empty")
                 return
 
             try:
                 duration = int(duration_str)
             except ValueError:
-                messagebox.showerror("Profiling", f"Invalid duration: {duration_str}")
+                self._vars["prof_status"].set(f"Invalid duration: {duration_str}")
                 return
 
             if duration <= 0:
-                messagebox.showerror("Profiling", "Duration must be > 0")
+                self._vars["prof_status"].set("Duration must be > 0")
                 return
 
             # Disable button and update status
@@ -5865,22 +5863,19 @@ class MEPGui:
                     )
                     status = result.get("status", "Profiling complete")
                     self._gui_call(lambda: self._vars["prof_status"].set(status))
-                    
+
                     if result.get("success"):
                         output_file = result.get("output_file", "unknown")
-                        self._gui_call(lambda: messagebox.showinfo(
-                            "Profiling Complete",
-                            f"Profile saved to:\n{output_file}",
-                        ))
+                        self._gui_call(lambda: self._vars["prof_status"].set(
+                            f"Done. Saved: {output_file}"))
                         logging.info(f"Profiling complete: {output_file}")
                     else:
                         error = result.get("error", "Unknown error")
-                        self._gui_call(lambda: messagebox.showerror("Profiling Failed", error))
+                        self._gui_call(lambda: self._vars["prof_status"].set(f"Failed: {error}"))
                         logging.error(f"Profiling failed: {error}")
                 except Exception as e:
                     msg = str(e)
                     self._gui_call(lambda: self._vars["prof_status"].set(f"Error: {msg}"))
-                    self._gui_call(lambda: messagebox.showerror("Profiling Error", msg))
                     logging.exception("Profiling thread exception")
                 finally:
                     try:
@@ -5894,7 +5889,10 @@ class MEPGui:
 
         except Exception as e:
             logging.exception("Profile button handler exception")
-            messagebox.showerror("Profiling", f"Error: {e}")
+            try:
+                self._vars["prof_status"].set(f"Error: {e}")
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     #  Tuner trace
