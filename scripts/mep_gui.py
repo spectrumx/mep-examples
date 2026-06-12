@@ -5243,15 +5243,27 @@ class MEPGui:
                 logging.warning("SOC: no telemetry response")
                 return
             self._gui_call(self._soc_apply, tlm)
+
         threading.Thread(target=_query, daemon=True).start()
 
     def _soc_apply(self, tlm: dict):
         self._vars["soc_state"].set(tlm.get("state", "—"))
-        self._vars["soc_fc"].set(f"{float(tlm.get('f_c_hz', 0))/1e6:.3f}")
-        self._vars["soc_fif"].set(f"{float(tlm.get('f_if_hz', 0))/1e6:.3f}")
-        self._vars["soc_fs"].set(f"{float(tlm.get('f_s', 0))/1e6:.3f}")
+        f_c_hz = self._safe_float(tlm.get("f_c_hz"), 0.0)
+        f_if_hz = self._safe_float(tlm.get("f_if_hz"), 0.0)
+        f_s_hz = self._safe_float(tlm.get("f_s"), 0.0)
+        self._vars["soc_fc"].set(f"{f_c_hz/1e6:.3f}")
+        self._vars["soc_fif"].set(f"{f_if_hz/1e6:.3f}")
+        self._vars["soc_fs"].set(f"{f_s_hz/1e6:.3f}")
         self._vars["soc_pps"].set(str(tlm.get("pps_count", "—")))
-        channels = tlm.get("channels", [])
+
+        raw_channels = tlm.get("channels", [])
+        if isinstance(raw_channels, str):
+            channels = [ch.strip() for ch in raw_channels.split(",") if ch.strip()]
+        elif isinstance(raw_channels, (list, tuple, set)):
+            channels = [str(ch).strip() for ch in raw_channels if str(ch).strip()]
+        else:
+            channels = []
+
         self._vars["soc_channels"].set(",".join(channels) if channels else "—")
         # Sync channel checkboxes to reflect actual hardware state
         for ch in ("A", "B", "C", "D"):
@@ -5259,19 +5271,7 @@ class MEPGui:
             if key in self._vars:
                 self._vars[key].set(ch in channels)
 
-    def _soc_refresh(self):
-        if not self._require_mqtt("refresh RFSoC status"):
-            return
-        self.bus.rfsoc_get_tlm()
-        tlm = self.bus.get_cached_status(RFSOC_STATUS_TOPIC)
-        if tlm is None:
-            logging.warning("SOC: no telemetry response")
-            return
-        self._gui_call(self._soc_apply, tlm)
-
     def _soc_start_stream(self):
-        if not self._require_mqtt("start UDP stream"):
-            return
         mode = self._vars["soc_start_mode"].get()
         if mode == "pps":
             self.bus.rfsoc_capture_next_pps()
@@ -5281,8 +5281,6 @@ class MEPGui:
             logging.info("SOC: capture sent — streaming started immediately")
 
     def _soc_stop_stream(self):
-        if not self._require_mqtt("stop UDP stream"):
-            return
         self.bus.rfsoc_reset()
         logging.info("SOC: reset sent — UDP stream stopped")
 
@@ -5310,8 +5308,6 @@ class MEPGui:
         logging.info(f"SOC: set freq_metadata {freq_hz:.0f} Hz sent")
 
     def _soc_set_channels(self):
-        if not self._require_mqtt("set channels"):
-            return
         selected = [ch for ch in ("A", "B", "C", "D") if self._vars[f"soc_ch_{ch}"].get()]
         if not selected:
             logging.warning("SOC: no channels selected — at least one channel required")
