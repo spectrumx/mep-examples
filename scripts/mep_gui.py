@@ -5771,6 +5771,8 @@ class MEPGui:
     def _profile_holoscan_click(self):
         """Trigger holoscan profiling via CaptureController."""
         if self.capture is None:
+            self._configure_mep()
+        if self.capture is None:
             messagebox.showerror("Profiling", "CaptureController not available")
             return
 
