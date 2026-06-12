@@ -36,7 +36,6 @@ import socket
 import subprocess
 import queue
 import copy
-import tempfile
 from fractions import Fraction
 from collections import deque
 from datetime import datetime
@@ -2740,80 +2739,61 @@ class CaptureController:
     ) -> dict:
         """
         Profile the Holoscan recorder with nsys.
-        
-        This method:
-        1. Generates a temp YAML config from current GUI state
-        2. Starts RFSoC UDP stream
-        3. Launches nsys profile in docker container
-        4. Monitors and streams output
-        5. Returns result dict with success status and output file path
-        
+
+        Replicates the production launch contract used by recorder_service.run_recorder:
+        the recorder config is passed to ``--config`` as an inline JSON string (jsonargparse
+        accepts JSON as YAML), and ``--ram_ringbuffer_path`` / ``--output_path`` are passed
+        as separate linked arguments. The whole thing is wrapped by ``nsys profile`` and run
+        inside the recorder container via ``docker compose exec``.
+
+        No temp file is written: the previous file-based approach was broken because the
+        file lived on the host while nsys runs inside the container, so the path did not
+        exist there and jsonargparse printed its usage and exited with code 2.
+
         Args:
-            trace: Comma-separated trace categories
+            trace: Comma-separated trace categories (e.g. "cuda,nvtx,osrt")
             duration: Profile duration in seconds
-            output_path: Output file path prefix
-            force_overwrite: If True, use --force-overwrite in nsys
+            output_path: nsys report output prefix (inside the container)
+            force_overwrite: If True, pass --force-overwrite=true to nsys
             cudabacktrace: cudabacktrace depth (e.g., "all", "32")
-        
+
         Returns:
             dict with keys: success (bool), status (str), output_file (str), error (str)
         """
-        yaml_path = None
         try:
             # Validate MQTT connection
             if not self._require_mqtt("profile holoscan"):
                 return {"success": False, "error": "MQTT not connected"}
 
-            # Get staged recorder model and extract config dict
+            # Load the authoritative recorder preset for the current sample rate.
             preset_path, source = recorder_preset_path(self.sample_rate_mhz)
             if source == "unavailable":
                 return {"success": False, "error": f"Recorder preset not found: {preset_path}"}
-
             try:
                 config = copy.deepcopy(_load_yaml_mapping(preset_path))
             except Exception as e:
                 return {"success": False, "error": f"Failed to load config: {e}"}
 
-            # Apply recorder overrides to config
+            # Apply staged GUI overrides (dotted keys), exactly like the live recorder path.
             for key, value in self.recorder_overrides.items():
                 _set_dotted_value(config, key, value)
 
-            # Normalize the config
+            # Enforce pipeline dependencies, then apply channel-specific runtime settings
+            # so the recorder actually listens to the active channel's UDP stream.
+            _normalize_recorder_pipeline(config)
+            if self.channel in RECORDER_CHANNEL_PORTS:
+                _set_dotted_value(config, "basic_network.dst_port", RECORDER_CHANNEL_PORTS[self.channel])
+                _set_dotted_value(config, "drf_sink.channel_dir", f"preview/data/ch{self.channel}")
             try:
-                _normalize_recorder_pipeline(config)
+                conj_state = self.get_conjugate_state()
+                _set_dotted_value(config, "packet.apply_conjugate", bool(conj_state["apply_conjugate"]))
             except Exception as e:
-                return {"success": False, "error": f"Config validation failed: {e}"}
+                logging.warning(f"Could not resolve conjugate state for profiling: {e}")
 
-            # Import YAML library (try standard first, fallback to ruamel)
-            yaml_lib = None
-            try:
-                import yaml
-                yaml_lib = yaml
-                use_ruamel = False
-            except ImportError:
-                try:
-                    from ruamel.yaml import YAML
-                    yaml_lib = YAML()
-                    use_ruamel = True
-                except ImportError:
-                    return {"success": False, "error": "YAML library not available"}
+            # Serialize config as inline JSON (jsonargparse parses JSON as YAML).
+            config_json = json.dumps(config)
 
-            # Write config to temp YAML file
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode='w', suffix='.yaml', delete=False, prefix='prof_', dir='/tmp'
-                ) as tmp_file:
-                    yaml_path = tmp_file.name
-                    if use_ruamel:
-                        yaml_lib.dump(config, tmp_file)
-                    else:
-                        yaml_lib.dump(config, tmp_file, default_flow_style=False)
-                logging.info(f"Generated temp YAML: {yaml_path}")
-            except Exception as e:
-                logging.error(f"Failed to write YAML: {e}")
-                return {"success": False, "error": f"YAML write failed: {e}"}
-
-            # Start RFSoC UDP stream
+            # Start the RFSoC UDP stream so the recorder has data to process.
             try:
                 logging.info("Starting RFSoC capture for profiling...")
                 self.bus.rfsoc_capture_now()
@@ -2821,68 +2801,38 @@ class CaptureController:
             except Exception as e:
                 logging.warning(f"RFSoC capture start: {e}")
 
-            # Build docker compose exec command with nsys
+            # Build the docker compose exec command. No shell, no temp file: the config
+            # travels as a single argv element so there are no quoting/path problems.
             compose_file = "/opt/radiohound/docker/compose.yaml"
-
             force_flag = "--force-overwrite=true" if force_overwrite else "--force-overwrite=false"
-
-            # Note: yaml_path is on host; inside container it's mounted at same path via /tmp
-            nsys_cmd = (
-                f"cd /app && "
-                f"HOLOSCAN_ENABLE_PROFILE=1 "
-                f"nsys profile "
-                f"--trace={trace} "
-                f"--cudabacktrace={cudabacktrace} "
-                f"--duration={duration} "
-                f"--output={output_path} "
-                f"{force_flag} "
-                f"python3 /app/mep_recorder.py "
-                f"--config {yaml_path} "
-                f"--ram_ringbuffer_path /ramdisk "
-                f"--output_path /data/captures/preview/data"
-            )
-
             cmd = [
-                "docker", "compose", "-f", compose_file,
-                "exec", "-T", "recorder", "bash", "-c", nsys_cmd
+                "docker", "compose", "-f", compose_file, "exec", "-T",
+                "-e", "HOLOSCAN_ENABLE_PROFILE=1",
+                "recorder",
+                "nsys", "profile",
+                f"--trace={trace}",
+                f"--cudabacktrace={cudabacktrace}",
+                f"--duration={duration}",
+                f"--output={output_path}",
+                force_flag,
+                "python3", "/app/mep_recorder.py",
+                "--config", config_json,
+                "--ram_ringbuffer_path", "/ramdisk",
+                "--output_path", "/data/captures/preview/data",
             ]
 
-            logging.info(f"Launching profiling: timeout={duration + 30}s")
+            logging.info(f"Launching nsys profiling: duration={duration}s, output={output_path}")
 
-            # Execute profiler
+            # Execute the profiler and wait for it to finish.
             try:
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
                     text=True,
-                    timeout=duration + 30,
+                    timeout=duration + 60,
                 )
-
-                if result.returncode != 0:
-                    stderr_short = result.stderr[:1000] if result.stderr else "(no stderr)"
-                    logging.error(f"nsys failed with code {result.returncode}:\n{result.stderr}")
-                    return {
-                        "success": False,
-                        "error": f"nsys exited with code {result.returncode}: {stderr_short}",
-                        "status": "Failed",
-                    }
-
-                # Log output for debugging
-                if result.stdout:
-                    logging.info(f"nsys stdout: {result.stdout[:500]}")
-                if result.stderr:
-                    logging.info(f"nsys stderr: {result.stderr[:500]}")
-
-                logging.info("Profiling completed successfully")
-                output_file = f"{output_path}.sqlite"
-                return {
-                    "success": True,
-                    "status": f"Profile saved to {output_file}",
-                    "output_file": output_file,
-                }
-
             except subprocess.TimeoutExpired:
-                msg = f"nsys timeout after {duration + 30}s"
+                msg = f"nsys timed out after {duration + 60}s"
                 logging.error(msg)
                 return {"success": False, "error": msg, "status": "Timeout"}
             except Exception as e:
@@ -2890,17 +2840,31 @@ class CaptureController:
                 logging.error(msg)
                 return {"success": False, "error": msg, "status": "Error"}
 
+            if result.stdout:
+                logging.info(f"nsys stdout:\n{result.stdout}")
+            if result.stderr:
+                logging.info(f"nsys stderr:\n{result.stderr}")
+
+            if result.returncode != 0:
+                stderr_short = (result.stderr or "(no stderr)").strip()[:1000]
+                logging.error(f"nsys failed with code {result.returncode}")
+                return {
+                    "success": False,
+                    "error": f"nsys exited with code {result.returncode}: {stderr_short}",
+                    "status": "Failed",
+                }
+
+            output_file = f"{output_path}.nsys-rep"
+            logging.info(f"Profiling complete: {output_file}")
+            return {
+                "success": True,
+                "status": f"Profile saved to {output_file}",
+                "output_file": output_file,
+            }
+
         except Exception as e:
-            logging.exception(f"Profile error: {e}")
+            logging.exception("Profile error")
             return {"success": False, "error": str(e), "status": "Error"}
-        finally:
-            # Clean up temp YAML
-            if yaml_path and os.path.exists(yaml_path):
-                try:
-                    os.unlink(yaml_path)
-                    logging.info(f"Cleaned up: {yaml_path}")
-                except Exception as e:
-                    logging.warning(f"Cleanup failed: {e}")
 
     # ------------------------------------------------------------------ #
     #  Tune and Arm recipe (from "Tune and Capture" flowchart)             #
