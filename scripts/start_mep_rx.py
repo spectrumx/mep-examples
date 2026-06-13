@@ -2754,6 +2754,7 @@ class CaptureController:
         output_path: str = "/data/captures/holoscan_profile",
         force_overwrite: bool = True,
         cudabacktrace: str = "all",
+        flush_on_cudaprofilerstop: bool = False,
     ) -> dict:
         """
         Profile the Holoscan recorder with nsys.
@@ -2858,7 +2859,7 @@ class CaptureController:
                 "nsys", "profile",
                 f"--trace={trace}",
                 f"--cudabacktrace={cudabacktrace}",
-                "--flush-on-cudaprofilerstop=false",
+                f"--flush-on-cudaprofilerstop={'true' if flush_on_cudaprofilerstop else 'false'}",
                 f"--duration={duration}",
                 f"--output={output_path}",
                 force_flag,
@@ -2876,7 +2877,7 @@ class CaptureController:
                 "HOLOSCAN_ENABLE_PROFILE=1 nsys profile \\\n"
                 f"  --trace={trace} \\\n"
                 f"  --cudabacktrace={cudabacktrace} \\\n"
-                "  --flush-on-cudaprofilerstop=false \\\n"
+                f"  --flush-on-cudaprofilerstop={'true' if flush_on_cudaprofilerstop else 'false'} \\\n"
                 f"  --duration={duration} \\\n"
                 f"  --output={output_path} \\\n"
                 f"  {force_flag} \\\n"

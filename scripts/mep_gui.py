@@ -4382,22 +4382,27 @@ class MEPGui:
         ttk.Checkbutton(profile_frame, text="Force overwrite output", variable=self._vars["prof_force_overwrite"]).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
 
+        # Flush on CUDA profiler stop checkbox
+        self._vars["prof_flush_on_cudaprofilerstop"] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(profile_frame, text="Flush on CUDA profiler stop", variable=self._vars["prof_flush_on_cudaprofilerstop"]).grid(
+            row=5, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 2))
+
         # Status display
         self._vars["prof_status"] = tk.StringVar(value="Ready")
-        ttk.Label(profile_frame, text="Status:").grid(row=5, column=0, sticky="nw", padx=5, pady=3)
+        ttk.Label(profile_frame, text="Status:").grid(row=6, column=0, sticky="nw", padx=5, pady=3)
         ttk.Label(
             profile_frame,
             textvariable=self._vars["prof_status"],
             font=("TkDefaultFont", 7),
             wraplength=320,
             justify="left",
-        ).grid(row=5, column=1, sticky="w", padx=5, pady=3)
+        ).grid(row=6, column=1, sticky="w", padx=5, pady=3)
 
         # Profile button
         self._prof_button = ttk.Button(
             profile_frame, text="Profile Holoscan", command=self._profile_holoscan_click
         )
-        self._prof_button.grid(row=6, column=0, columnspan=2, padx=4, pady=6, sticky="ew")
+        self._prof_button.grid(row=7, column=0, columnspan=2, padx=4, pady=6, sticky="ew")
 
         # ===== NEXT-RECORD ACTIONS =====
         action_frame = ttk.LabelFrame(scrollable_frame, text="APPLY changes")
@@ -5771,7 +5776,8 @@ class MEPGui:
         try:
             # Validate required profiling GUI state variables exist
             required_vars = ["prof_trace", "prof_duration", "prof_output_path",
-                           "prof_cudabacktrace", "prof_force_overwrite", "prof_status"]
+                           "prof_cudabacktrace", "prof_force_overwrite",
+                           "prof_flush_on_cudaprofilerstop", "prof_status"]
             for var_name in required_vars:
                 if var_name not in self._vars:
                     logging.error("Profiling: missing GUI variable: %s", var_name)
@@ -5814,6 +5820,7 @@ class MEPGui:
             output_path = self._vars["prof_output_path"].get().strip()
             cudabacktrace = self._vars["prof_cudabacktrace"].get().strip()
             force_overwrite = self._vars["prof_force_overwrite"].get()
+            flush_on_cudaprofilerstop = self._vars["prof_flush_on_cudaprofilerstop"].get()
 
             if not trace:
                 self._vars["prof_status"].set("Trace flags cannot be empty")
@@ -5853,6 +5860,7 @@ class MEPGui:
                         output_path=output_path,
                         force_overwrite=force_overwrite,
                         cudabacktrace=cudabacktrace,
+                        flush_on_cudaprofilerstop=flush_on_cudaprofilerstop,
                     )
                     status = result.get("status", "Profiling complete")
                     self._gui_call(lambda: self._vars["prof_status"].set(status))
