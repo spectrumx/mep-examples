@@ -2746,6 +2746,39 @@ class CaptureController:
         self.bus.recorder_disable()
         self._recorder_running = False
 
+    def _build_recorder_config(self) -> dict:
+        """
+        Resolve the recorder configuration for the active channel.
+
+        Loads the authoritative preset for the current sample rate, applies the staged
+        GUI overrides, enforces pipeline dependencies, and sets the channel-specific
+        runtime keys (UDP port, DigitalRF channel directory, spectrogram subdir, conjugate
+        policy). This is the same config the live recorder path resolves; the profiler
+        serializes it to inline JSON and hands it to ``mep_recorder.py``.
+
+        Returns the resolved config mapping. Pure: no MQTT, no filesystem side effects.
+        """
+        preset_path, source = recorder_preset_path(self.sample_rate_mhz)
+        if source == "unavailable":
+            raise FileNotFoundError(f"Recorder preset not found: {preset_path}")
+
+        config = copy.deepcopy(_load_yaml_mapping(preset_path))
+
+        for key, value in self.recorder_overrides.items():
+            _set_dotted_value(config, key, value)
+
+        _normalize_recorder_pipeline(config)
+
+        _set_dotted_value(config, "basic_network.dst_port", RECORDER_CHANNEL_PORTS[self.channel])
+        _set_dotted_value(config, "drf_sink.channel_dir", f"{PREVIEW_DATA_DIR}/ch{self.channel}")
+        _set_dotted_value(config, "spectrogram_output.plot_subdir", f"preview/data/ch{self.channel}/spectrograms")
+        _set_dotted_value(config, "packet.freq_idx_offset", 0)
+
+        conj_state = self.get_conjugate_state()
+        _set_dotted_value(config, "packet.apply_conjugate", bool(conj_state["apply_conjugate"]))
+
+        return config
+
     def profile_holoscan(
         self,
         freq_hz: float,
@@ -2759,19 +2792,19 @@ class CaptureController:
         """
         Profile the Holoscan recorder with nsys.
 
-        Replicates the production launch contract used by recorder_service.run_recorder:
-        the recorder config is passed to ``--config`` as an inline JSON string (jsonargparse
-        accepts JSON as YAML), and ``--ram_ringbuffer_path`` / ``--output_path`` are passed
-        as separate linked arguments. The whole thing is wrapped by ``nsys profile`` and run
-        inside the recorder container via ``docker compose exec``.
+        Profiling owns the recorder exclusively. The live recording is disabled first so
+        that exactly ONE ``mep_recorder`` exists during the profile — two pipelines would
+        contend for the same UDP port and ``/ramdisk`` and double the memory footprint,
+        which can freeze the host. The ``recorder_service`` process itself stays alive and
+        listening; only its recording is stopped, and it is left disabled when we finish
+        (the operator's next main-tab Start re-enables it normally).
 
-        Before launching, the RFSoC is tuned and armed via ``tune_and_arm(freq_hz)`` exactly
-        like a normal main-tab capture, so the profiled pipeline ingests the same RF the
-        operator selected (frequency, tuner, channel, injection) rather than stale FPGA state.
-
-        No temp file is written: the previous file-based approach was broken because the
-        file lived on the host while nsys runs inside the container, so the path did not
-        exist there and jsonargparse printed its usage and exited with code 2.
+        The recorder config is passed to ``--config`` as an inline JSON string (jsonargparse
+        parses JSON as YAML); ``--ram_ringbuffer_path`` / ``--output_path`` are passed as
+        separate linked arguments — the same contract recorder_service.run_recorder uses.
+        The whole thing is wrapped by ``nsys profile`` and run inside the recorder container
+        via ``docker compose exec``. The RFSoC is tuned and armed via ``tune_and_arm`` so the
+        profiled pipeline ingests the operator-selected RF, and is reset afterward.
 
         Args:
             freq_hz: Center/RF frequency to tune and arm before profiling (Hz)
@@ -2780,78 +2813,50 @@ class CaptureController:
             output_path: nsys report output prefix (inside the container)
             force_overwrite: If True, pass --force-overwrite=true to nsys
             cudabacktrace: cudabacktrace depth (e.g., "all", "32")
+            flush_on_cudaprofilerstop: Value for nsys --flush-on-cudaprofilerstop
 
         Returns:
             dict with keys: success (bool), status (str), output_file (str), error (str)
         """
+        compose_file = "/opt/radiohound/docker/compose.yaml"
+        output_file = f"{output_path}.nsys-rep"
+        yaml_file = f"{output_path}.yaml"
         armed = False
+
         try:
-            # Validate MQTT connection
             if not self._require_mqtt("profile holoscan"):
-                return {"success": False, "error": "MQTT not connected"}
-
-            # Load the authoritative recorder preset for the current sample rate.
-            preset_path, source = recorder_preset_path(self.sample_rate_mhz)
-            if source == "unavailable":
-                return {"success": False, "error": f"Recorder preset not found: {preset_path}"}
-            try:
-                config = copy.deepcopy(_load_yaml_mapping(preset_path))
-            except Exception as e:
-                return {"success": False, "error": f"Failed to load config: {e}"}
-
-            # Apply staged GUI overrides (dotted keys), exactly like the live recorder path.
-            for key, value in self.recorder_overrides.items():
-                _set_dotted_value(config, key, value)
-
-            # Enforce pipeline dependencies, then apply channel-specific runtime settings
-            # so the recorder actually listens to the active channel's UDP stream.
-            # This mirrors start_recorder() exactly: absolute preview channel_dir + a
-            # pre-created preview data directory so the DigitalRF / metadata sinks can
-            # create their HDF5 files (a relative dir or missing parent crashes dmd_sink).
-            _normalize_recorder_pipeline(config)
+                return {"success": False, "error": "MQTT not connected", "status": "Error"}
             if self.channel not in RECORDER_CHANNEL_PORTS:
-                return {"success": False, "error": f"Invalid channel: {self.channel}"}
+                return {"success": False, "error": f"Invalid channel: {self.channel}", "status": "Failed"}
 
-            self._clear_preview_data_dir()
-            channel_dir = f"{PREVIEW_DATA_DIR}/ch{self.channel}"
-            spectrogram_subdir = f"preview/data/ch{self.channel}/spectrograms"
-            _set_dotted_value(config, "basic_network.dst_port", RECORDER_CHANNEL_PORTS[self.channel])
-            _set_dotted_value(config, "drf_sink.channel_dir", channel_dir)
-            _set_dotted_value(config, "spectrogram_output.plot_subdir", spectrogram_subdir)
-            _set_dotted_value(config, "packet.freq_idx_offset", 0)
-            try:
-                conj_state = self.get_conjugate_state()
-                _set_dotted_value(config, "packet.apply_conjugate", bool(conj_state["apply_conjugate"]))
-            except Exception as e:
-                logging.warning(f"Could not resolve conjugate state for profiling: {e}")
-
-            # Serialize config as inline JSON (jsonargparse parses JSON as YAML).
+            config = self._build_recorder_config()
             config_json = json.dumps(config)
 
-            # Tune and arm the RFSoC exactly like a main-tab capture (reset → channel →
-            # frequency/tuner → metadata → capture) so the profiled pipeline ingests the
-            # operator-selected RF instead of whatever the FPGA was last left at.
-            try:
-                logging.info(f"Tuning and arming RFSoC for profiling at {freq_hz / 1e6:.2f} MHz...")
-                if not self.tune_and_arm(freq_hz):
-                    return {
-                        "success": False,
-                        "error": "RFSoC tune/arm failed; aborting profile",
-                        "status": "Failed",
-                    }
-                armed = True
-                time.sleep(1)
-            except Exception as e:
-                return {
-                    "success": False,
-                    "error": f"RFSoC tune/arm error: {e}",
-                    "status": "Failed",
-                }
+            # Stop any live recording so the profiler is the sole recorder. recorder_disable()
+            # cancels recorder_service's recording scope (SIGINT to its mep_recorder child and
+            # /ramdisk cleanup); the service stays up. This frees the UDP port and ramdisk and
+            # halves memory so nsys's cudabacktrace buffers have headroom.
+            logging.info("Disabling live recording so the profiler owns the pipeline...")
+            self.bus.recorder_disable()
+            self._recorder_running = False
+            time.sleep(1)
 
-            # Build the docker compose exec command. No shell, no temp file: the config
-            # travels as a single argv element so there are no quoting/path problems.
-            compose_file = "/opt/radiohound/docker/compose.yaml"
+            # Fresh preview data dir so the DigitalRF / metadata sinks can create their HDF5
+            # files (a missing parent crashes dmd_sink).
+            self._clear_preview_data_dir()
+
+            # Tune and arm the RFSoC like a main-tab capture so the profiled pipeline ingests
+            # the operator-selected RF instead of stale FPGA state.
+            logging.info(f"Tuning and arming RFSoC for profiling at {freq_hz / 1e6:.2f} MHz...")
+            if not self.tune_and_arm(freq_hz):
+                return {"success": False, "error": "RFSoC tune/arm failed; aborting profile", "status": "Failed"}
+            armed = True
+            time.sleep(1)
+
+            # Build the docker compose exec command. No shell, no temp file: the config travels
+            # as a single argv element so there are no quoting/path problems.
             force_flag = "--force-overwrite=true" if force_overwrite else "--force-overwrite=false"
+            flush_flag = f"--flush-on-cudaprofilerstop={'true' if flush_on_cudaprofilerstop else 'false'}"
             cmd = [
                 "docker", "compose", "-f", compose_file, "exec", "-T",
                 "-e", "HOLOSCAN_ENABLE_PROFILE=1",
@@ -2859,7 +2864,7 @@ class CaptureController:
                 "nsys", "profile",
                 f"--trace={trace}",
                 f"--cudabacktrace={cudabacktrace}",
-                f"--flush-on-cudaprofilerstop={'true' if flush_on_cudaprofilerstop else 'false'}",
+                flush_flag,
                 f"--duration={duration}",
                 f"--output={output_path}",
                 force_flag,
@@ -2869,15 +2874,13 @@ class CaptureController:
                 "--output_path", "/data/captures/preview/data",
             ]
 
-            # Log a human-readable, copy-pasteable equivalent of the command. The real
-            # cmd passes the config as a huge inline JSON blob, so for reproducibility we
-            # reference the resolved YAML we save next to the report (written below).
-            yaml_file = f"{output_path}.yaml"
+            # Log a copy-pasteable equivalent. The real cmd passes the config as a huge inline
+            # JSON blob, so for reproducibility we reference the resolved YAML saved below.
             reproducible_cmd = (
                 "HOLOSCAN_ENABLE_PROFILE=1 nsys profile \\\n"
                 f"  --trace={trace} \\\n"
                 f"  --cudabacktrace={cudabacktrace} \\\n"
-                f"  --flush-on-cudaprofilerstop={'true' if flush_on_cudaprofilerstop else 'false'} \\\n"
+                f"  {flush_flag} \\\n"
                 f"  --duration={duration} \\\n"
                 f"  --output={output_path} \\\n"
                 f"  {force_flag} \\\n"
@@ -2892,90 +2895,54 @@ class CaptureController:
             )
 
             logging.info(f"Launching nsys profiling: duration={duration}s, output={output_path}")
-
-            # Execute the profiler and wait for it to finish.
-            try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=duration + 60,
-                )
-            except subprocess.TimeoutExpired:
-                msg = f"nsys timed out after {duration + 60}s"
-                logging.error(msg)
-                return {"success": False, "error": msg, "status": "Timeout"}
-            except Exception as e:
-                msg = f"Subprocess failed: {e}"
-                logging.error(msg)
-                return {"success": False, "error": msg, "status": "Error"}
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=duration + 60,
+            )
 
             if result.stdout:
                 logging.info(f"nsys stdout:\n{result.stdout}")
             if result.stderr:
                 logging.info(f"nsys stderr:\n{result.stderr}")
 
-            # Success is judged by nsys's own report output from THIS run, not the exit
-            # code and not a file-existence check (which a stale report could spoof).
-            # When nsys writes the report it prints "Generated:\n  <path>.nsys-rep" to
-            # stdout/stderr — that line is the authoritative signal that this invocation
-            # produced a report. We only inspect the output captured from this process.
-            output_file = f"{output_path}.nsys-rep"
+            # Success is judged by nsys's own report output from THIS run, not the exit code
+            # and not a file-existence check (which a stale report could spoof). When nsys
+            # writes the report it prints "Generated:\n  <path>.nsys-rep".
             combined_output = f"{result.stdout or ''}\n{result.stderr or ''}"
-            report_generated = (
-                "Generated:" in combined_output and ".nsys-rep" in combined_output
-            )
+            report_generated = "Generated:" in combined_output and ".nsys-rep" in combined_output
 
             if not report_generated:
                 stderr_short = (result.stderr or "(no stderr)").strip()[:1000]
-                logging.error(
-                    f"nsys did not report a generated file (exit {result.returncode})"
-                )
+                logging.error(f"nsys did not report a generated file (exit {result.returncode})")
                 return {
                     "success": False,
                     "error": f"No report generated (nsys exit {result.returncode}): {stderr_short}",
                     "status": "Failed",
                 }
 
-            # The recorder's teardown is racy: it may exit 0, 143 (128+SIGTERM, the normal
-            # duration-stop path), or 139 (128+SIGSEGV, a segfault during shutdown). The
-            # report is already written by then, so none of these are profiler failures —
-            # but the exit code is always reported so a crash is visible.
+            # The recorder's teardown is racy: it may exit 0, 143 (SIGTERM, the normal
+            # duration-stop path), 137 (SIGKILL), or 139 (segfault during shutdown). The
+            # report is already written by then, so none are profiler failures — but the exit
+            # code is reported so a crash is visible.
             rc = result.returncode
-            if rc == 0:
-                status = f"Profile saved to {output_file}, exit code 0 (clean exit)"
-            elif rc == 143:
-                status = (
-                    f"Profile saved to {output_file}, exit code 143 "
-                    f"(recorder stopped by SIGTERM at duration limit)"
-                )
-            elif rc == 137:
-                status = (
-                    f"Profile saved to {output_file}, exit code 137 "
-                    f"(recorder killed by SIGKILL at duration limit)"
-                )
-            elif rc == 139:
-                status = (
-                    f"Profile saved to {output_file}, exit code 139 "
-                    f"(recorder crashed with segfault)"
-                )
-            else:
-                status = f"Profile saved to {output_file}, exit code {rc}"
-            logging.info(
-                f"Profiling complete (nsys reported a generated report, exit {rc}): {output_file}"
-            )
+            rc_descriptions = {
+                0: "(clean exit)",
+                143: "(recorder stopped by SIGTERM at duration limit)",
+                137: "(recorder killed by SIGKILL at duration limit)",
+                139: "(recorder crashed with segfault)",
+            }
+            rc_note = rc_descriptions.get(rc, "")
+            status = f"Profile saved to {output_file}, exit code {rc} {rc_note}".strip()
+            logging.info(f"Profiling complete (nsys reported a generated report, exit {rc}): {output_file}")
 
-            # Save the exact resolved config as YAML next to the report so the run is
-            # reproducible. Written inside the container (where output_path lives) via
-            # tee, so it lands in the same directory as the .nsys-rep file.
+            # Save the resolved config as YAML next to the report for reproducibility. Written
+            # inside the container (where output_path lives) via tee.
             try:
                 yaml_text = _dump_yaml_text(config)
-                write_cmd = [
-                    "docker", "compose", "-f", compose_file, "exec", "-T",
-                    "recorder", "tee", yaml_file,
-                ]
                 subprocess.run(
-                    write_cmd,
+                    ["docker", "compose", "-f", compose_file, "exec", "-T", "recorder", "tee", yaml_file],
                     input=yaml_text,
                     capture_output=True,
                     text=True,
@@ -2989,16 +2956,19 @@ class CaptureController:
                 "success": True,
                 "status": status,
                 "output_file": output_file,
-                "returncode": result.returncode,
+                "returncode": rc,
             }
 
+        except subprocess.TimeoutExpired:
+            msg = f"nsys timed out after {duration + 60}s"
+            logging.error(msg)
+            return {"success": False, "error": msg, "status": "Timeout"}
         except Exception as e:
             logging.exception("Profile error")
             return {"success": False, "error": str(e), "status": "Error"}
         finally:
-            # nsys only stops the recorder; the RFSoC keeps streaming UDP. Mirror the
-            # normal capture lifecycle (arm before, reset after) so profiling always
-            # leaves the hardware idle, regardless of how the run ended.
+            # nsys only stops the recorder; the RFSoC keeps streaming UDP. Reset it so
+            # profiling always leaves the hardware idle, regardless of how the run ended.
             if armed:
                 try:
                     logging.info("Stopping RFSoC UDP stream after profiling...")
