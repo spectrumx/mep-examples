@@ -1662,6 +1662,8 @@ class MEPGui:
         self._spec_max_scale = ttk.Scale(ctl_f, from_=-250.0, to=50.0, variable=self._vars["spec_vmax"],
                                          command=lambda _v: self._spec_apply_color_range())
         self._spec_max_scale.grid(row=0, column=4, sticky="ew", padx=2, pady=2)
+        ttk.Button(ctl_f, text="Clear", command=self._spec_clear_now).grid(
+            row=0, column=5, sticky="e", padx=5, pady=2)
         ttk.Label(ctl_f, text="Num Points").grid(row=1, column=0, sticky="w", padx=5, pady=(0, 2))
         self._vars["spec_bins"] = tk.StringVar(value="native" if self._spec_bins is None else str(self._spec_bins))
         bin_vals = (None, 64, 256, 512, 1024, 2048, 4096)
@@ -2124,6 +2126,14 @@ class MEPGui:
         self._vars["spec_vmin"].set(round(vmin, 1))
         self._vars["spec_vmax"].set(round(vmax, 1))
         self._spec_apply_color_range()
+
+    def _spec_clear_now(self):
+        """Clear the spectrogram display without changing stream state."""
+        self._spec_viewport.clear()
+        with self._spec_lock:
+            self._spec_pending.clear()
+        self._spec_latest_entry = None
+        self._spec_reset_canvas()
 
     def _spec_apply_color_range(self):
         """Recolor the entire waterfall under the current range, then redraw once.
