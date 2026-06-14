@@ -57,6 +57,7 @@ from start_mep_rx import (
     CONJUGATE_POLICY_OPTIONS,
     TX_CHANNEL_OPTIONS,
     TX_OFFSET_FREQ_MAX_MHZ,
+    TX_AMPLITUDE_BINS_MAX,
     AFE_DEFAULT_LOG_PATH,
     AFE_DEFAULT_LOG_RATE_S,
     AFE_DEFAULT_LOG_RATE_RANGE,
@@ -3302,32 +3303,32 @@ class MEPGui:
 
         # Settings frame is staging only: editing fields changes local values with
         # zero hardware effect. Nothing radiates until Start/Update is pressed.
-        set_f = ttk.LabelFrame(frame, text="TX Settings (staged, not yet applied)")
+        set_f = ttk.LabelFrame(frame, text="Manual Control (press Start/Update to apply)")
         set_f.grid(row=1, column=0, padx=4, pady=2, sticky="ew")
-        set_f.columnconfigure(1, weight=1)
+        set_f.columnconfigure(1, weight=0)
+
+        def _range_hint(text):
+            return dict(text=text, foreground="grey", font=("TkDefaultFont", 8))
 
         ttk.Label(set_f, text="Center Freq (MHz)").grid(row=0, column=0, sticky="w", padx=5, pady=3)
         self._vars["tx_center_freq"] = tk.StringVar(value="0")
-        ttk.Entry(set_f, textvariable=self._vars["tx_center_freq"], width=12).grid(row=0, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Entry(set_f, textvariable=self._vars["tx_center_freq"], width=10).grid(row=0, column=1, sticky="w", padx=5, pady=3)
+        ttk.Label(set_f, **_range_hint("MHz (no enforced limit)")).grid(row=0, column=2, sticky="w", padx=5, pady=3)
 
         ttk.Label(set_f, text="Offset Freq (MHz)").grid(row=1, column=0, sticky="w", padx=5, pady=3)
         self._vars["tx_offset_freq"] = tk.StringVar(value="0")
-        ttk.Entry(set_f, textvariable=self._vars["tx_offset_freq"], width=12).grid(row=1, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Entry(set_f, textvariable=self._vars["tx_offset_freq"], width=10).grid(row=1, column=1, sticky="w", padx=5, pady=3)
+        ttk.Label(set_f, **_range_hint(f"|offset| < {TX_OFFSET_FREQ_MAX_MHZ} MHz")).grid(row=1, column=2, sticky="w", padx=5, pady=3)
 
         ttk.Label(set_f, text="Amplitude (bins)").grid(row=2, column=0, sticky="w", padx=5, pady=3)
         self._vars["tx_amplitude_bins"] = tk.IntVar(value=0)
-        ttk.Spinbox(set_f, from_=0, to=8191, increment=1, textvariable=self._vars["tx_amplitude_bins"], width=10).grid(row=2, column=1, sticky="ew", padx=5, pady=3)
+        ttk.Spinbox(set_f, from_=0, to=TX_AMPLITUDE_BINS_MAX, increment=1, textvariable=self._vars["tx_amplitude_bins"], width=8).grid(row=2, column=1, sticky="w", padx=5, pady=3)
+        ttk.Label(set_f, **_range_hint(f"0 to {TX_AMPLITUDE_BINS_MAX}")).grid(row=2, column=2, sticky="w", padx=5, pady=3)
 
         ttk.Label(set_f, text="Channel").grid(row=3, column=0, sticky="w", padx=5, pady=3)
         self._vars["tx_channel"] = tk.StringVar(value=TX_CHANNEL_OPTIONS[0])
-        ttk.Combobox(set_f, textvariable=self._vars["tx_channel"], values=list(TX_CHANNEL_OPTIONS), width=10, state="readonly").grid(row=3, column=1, sticky="ew", padx=5, pady=3)
-
-        ttk.Label(
-            set_f,
-            text=f"tx_offset_freq magnitude must be less than {TX_OFFSET_FREQ_MAX_MHZ} MHz.",
-            foreground="grey",
-            font=("TkDefaultFont", 8),
-        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 3))
+        ttk.Combobox(set_f, textvariable=self._vars["tx_channel"], values=list(TX_CHANNEL_OPTIONS), width=8, state="readonly").grid(row=3, column=1, sticky="w", padx=5, pady=3)
+        ttk.Label(set_f, **_range_hint(", ".join(TX_CHANNEL_OPTIONS))).grid(row=3, column=2, sticky="w", padx=5, pady=3)
 
         # Start/Stop frame: the only controls that touch the radio.
         act_f = ttk.LabelFrame(frame, text="Transmit Control")
