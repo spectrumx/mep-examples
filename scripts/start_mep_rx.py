@@ -7,17 +7,21 @@ MEP system controller — MQTT gateway for RFSoC, recorder, tuner, and AFE.
 Architecture:
     MEPBus            — always-on MQTT connection, listener registry, thin command publishers
     CaptureController — on-demand sweep/record orchestrator (owns sync-wait + recipes)
+    TxController      — DAC function-generator (transmit) orchestrator, independent of RX
     System functions   — pure subprocess utilities (Jetson power, network info, NTP)
 
 Usage (CLI):
     python start_mep_rx.py -f1 7000 -f2 8000 -s 10 -d 60 -c A -r 10
 
 Usage (imported by mep_gui.py):
-    from start_mep_rx import MEPBus, CaptureController
+    from start_mep_rx import MEPBus, CaptureController, TxController
     bus = MEPBus()
     cap = CaptureController(bus)
     cap.configure_sweep(channel="A", sample_rate_mhz=10)
     cap.run_sweep(freqs_hz, dwell_s=60)
+    tx = TxController(bus)
+    tx.tx_start(channel="A", center_freq_mhz=2400, offset_freq_mhz=1, amplitude_bins=4096)
+    tx.tx_stop()
 
 Author: john.marino@colorado.edu
 """
@@ -91,6 +95,11 @@ TUNER_INJECTION_SIDE = {
 
 CONJUGATE_POLICY_DEFAULT = "auto"
 CONJUGATE_POLICY_OPTIONS = ("auto", "force_on", "force_off")
+
+# RFSoC TX hardware limits (source of truth: RFSoC firmware / DAC RFDC).
+TX_AMPLITUDE_BINS_MAX = 8191          # 14-bit signed DAC peak
+TX_OFFSET_FREQ_MAX_MHZ = 32           # function-gen baseband offset magnitude bound (exclusive)
+TX_CHANNEL_OPTIONS = ("None", "A", "B", "A,B")
 
 # Hardware configuration options (for dropdowns/validation)
 # CHANNEL_OPTIONS derived from RECORDER_CHANNEL_PORTS
@@ -1840,15 +1849,27 @@ class MEPBus:
         self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"tx_center_freq {freq_mhz}"})
 
     def rfsoc_set_tx_offset_freq(self, freq_mhz: float):
-        """Set TX function-generator baseband offset frequency."""
+        """Set TX function-generator baseband offset frequency (|f| < 32 MHz)."""
+        if abs(freq_mhz) >= TX_OFFSET_FREQ_MAX_MHZ:
+            raise ValueError(
+                f"TX offset frequency magnitude must be < {TX_OFFSET_FREQ_MAX_MHZ} MHz, got {freq_mhz} MHz"
+            )
         self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"tx_offset_freq {freq_mhz}"})
 
     def rfsoc_set_tx_amplitude(self, amplitude_bins: int):
         """Set TX waveform peak amplitude in DAC bins (0..8191)."""
+        if not (0 <= amplitude_bins <= TX_AMPLITUDE_BINS_MAX):
+            raise ValueError(
+                f"TX amplitude must be 0..{TX_AMPLITUDE_BINS_MAX} bins, got {amplitude_bins}"
+            )
         self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"tx_amplitude {amplitude_bins}"})
 
     def rfsoc_set_tx_channel(self, channel_list: str):
-        """Set TX DAC channel(s): A, B, or A,B."""
+        """Set TX DAC channel(s): None, A, B, or A,B."""
+        if channel_list not in TX_CHANNEL_OPTIONS:
+            raise ValueError(
+                f"TX channel must be one of {list(TX_CHANNEL_OPTIONS)}, got {channel_list!r}"
+            )
         self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"tx_channel {channel_list}"})
 
     # ------------------------------------------------------------------ #
@@ -2239,6 +2260,41 @@ class MEPBus:
             "lo_mhz": lo_mhz,
             "pwr_dbm": pwr_dbm,
             "raw": status_payload,
+        }
+
+    @staticmethod
+    def normalize_tx_status(payload: Optional[dict]) -> Optional[dict]:
+        """Normalize RFSoC status payload into a stable TX view for GUI/CLI.
+
+        Owns the RFSoC TX wire-field schema so consumers never read raw keys.
+
+        The firmware reports no explicit "transmitting" flag, so it is INFERRED:
+        a function generator radiates when a channel is selected and amplitude is
+        above zero. Offset 0 still emits a CW carrier, so offset is not part of the
+        test.
+
+        Returns:
+          {
+            "channels": list,
+            "center_freq": float|None,
+            "offset_freq": float|None,
+            "amplitude_bins": int|None,
+            "transmitting": bool,
+            "raw": dict,
+          }
+        """
+        if not isinstance(payload, dict):
+            return None
+        channels = payload.get("tx_channels") or []
+        amplitude_bins = payload.get("tx_amplitude_bins")
+        transmitting = bool(channels) and isinstance(amplitude_bins, (int, float)) and amplitude_bins > 0
+        return {
+            "channels": channels,
+            "center_freq": payload.get("tx_center_freq"),
+            "offset_freq": payload.get("tx_offset_freq"),
+            "amplitude_bins": amplitude_bins,
+            "transmitting": transmitting,
+            "raw": payload,
         }
 
     @staticmethod
@@ -3130,6 +3186,83 @@ class CaptureController:
         """Signal the current sweep or dwell to exit early."""
         logging.info("Stop requested")
         self._stop_flag.set()
+
+
+# ===== TX CONTROLLER ===== #
+
+class TxController:
+    """DAC function-generator (transmit) orchestrator.
+
+    Owns the TX start/stop policy and lives independently of RX capture: a single
+    instance is created once at app startup and never recreated, so transmit is
+    available with or without an RX session and RX reconfiguration can never
+    disturb an active transmit. TX state physically lives in the RFSoC's FPGA
+    registers, fully parallel to the RX capture path.
+    """
+
+    def __init__(self, bus: MEPBus):
+        self.bus = bus
+
+    def _require_mqtt(self, action: str) -> bool:
+        """Return False and log once when broker is offline for a control action."""
+        if self.bus.is_connected():
+            return True
+        status = self.bus.get_connection_status()
+        logging.error(
+            "Cannot %s while MQTT is offline (%s:%s). Last error: %s",
+            action,
+            status.get("broker"),
+            status.get("port"),
+            status.get("last_error") or "none",
+        )
+        return False
+
+    def tx_start(self, channel: str, center_freq_mhz: float,
+                 offset_freq_mhz: float, amplitude_bins: int) -> bool:
+        """Apply staged TX settings and begin (or update) transmission.
+
+        Emission is a side effect of the firmware's per-parameter `set` commands,
+        which have no atomic "apply then enable" verb and seed a full-scale default
+        amplitude. To stay safe this programs hardware in a deliberate order: force
+        TX off first (so a stale full-scale default cannot radiate while we load
+        values), program center / amplitude / offset while nothing is selected, then
+        select the channel LAST as the single deliberate moment emission begins.
+        Calling this while already transmitting re-applies cleanly (the GUI's
+        Start/Update). Selecting channel "None" is equivalent to a stop.
+
+        Raises ValueError (from the bus) if any staged value is out of hardware range;
+        because the channel is left deselected until the final step, a mid-sequence
+        validation failure leaves TX off.
+
+        TODO: a firmware-side tx_enable/tx_disable (or an atomic tx_start that applies
+        all params then enables) would remove this ordering dance and the full-scale
+        default hazard; this routine is a client-side workaround until then.
+        """
+        if not self._require_mqtt("start TX"):
+            return False
+        self.bus.rfsoc_set_tx_channel("None")
+        self.bus.rfsoc_set_tx_center_freq(center_freq_mhz)
+        self.bus.rfsoc_set_tx_amplitude(amplitude_bins)
+        self.bus.rfsoc_set_tx_offset_freq(offset_freq_mhz)
+        self.bus.rfsoc_set_tx_channel(channel)
+        logging.info(
+            "TX start/update: channel=%s center=%.3f MHz offset=%.3f MHz amplitude=%d bins",
+            channel, center_freq_mhz, offset_freq_mhz, amplitude_bins,
+        )
+        return True
+
+    def tx_stop(self) -> bool:
+        """Disable all TX output (authoritative hardware-off).
+
+        Publishes `tx_channel None`, which the firmware treats as the master TX
+        disable (zeroes amplitude and clears ENABLE on every function generator).
+        Idempotent and safe to call at any time, including shutdown.
+        """
+        if not self._require_mqtt("stop TX"):
+            return False
+        self.bus.rfsoc_set_tx_channel("None")
+        logging.info("TX stop: all function generators disabled")
+        return True
 
 
 # ===== DOCKER MANAGER ===== #

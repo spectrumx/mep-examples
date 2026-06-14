@@ -38,6 +38,7 @@ from start_mep_rx import (
     CaptureController,
     DockerManager,
     GPSDMonitor,
+    TxController,
     get_frequency_list,
     resolve_recorder_preset,
     preview_recorder_settings,
@@ -54,6 +55,8 @@ from start_mep_rx import (
     SAMPLE_RATE_OPTIONS,
     CONJUGATE_POLICY_DEFAULT,
     CONJUGATE_POLICY_OPTIONS,
+    TX_CHANNEL_OPTIONS,
+    TX_OFFSET_FREQ_MAX_MHZ,
     AFE_DEFAULT_LOG_PATH,
     AFE_DEFAULT_LOG_RATE_S,
     AFE_DEFAULT_LOG_RATE_RANGE,
@@ -366,6 +369,10 @@ class MEPGui:
         print("  Connecting to MQTT broker...", flush=True)
         self.bus = MEPBus()
         self.capture = None  # created on Start click via _get_or_create_capture
+        # TX lives independently of RX capture: one controller for the app's life,
+        # so transmit works with or without an RX session and RX reconfig cannot
+        # disturb it.
+        self.tx = TxController(self.bus)
         self._gps_monitor = None
 
         # ---- Register listeners on bus (always active) ----
@@ -3273,7 +3280,7 @@ class MEPGui:
         frame.columnconfigure(0, weight=1)
 
         def _ro_row(parent, row, label, key, unit=""):
-            sv = tk.StringVar(value="—")
+            sv = tk.StringVar(value="-")
             self._vars[key] = sv
             ttk.Label(parent, text=label).grid(
                 row=row, column=0, sticky="w", padx=5, pady=2)
@@ -3287,41 +3294,67 @@ class MEPGui:
         st_f = ttk.LabelFrame(frame, text="TX Status")
         st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
         st_f.columnconfigure(1, weight=1)
-        _ro_row(st_f, 0, "TX Channels", "tx_st_channels")
-        _ro_row(st_f, 1, "Center Frequency", "tx_st_center_freq", "MHz")
-        _ro_row(st_f, 2, "Offset Frequency", "tx_st_offset_freq", "MHz")
-        _ro_row(st_f, 3, "Amplitude", "tx_st_amplitude", "bins")
+        _ro_row(st_f, 0, "Inferred Transmit Status", "tx_st_transmitting")
+        _ro_row(st_f, 1, "TX Channels", "tx_st_channels")
+        _ro_row(st_f, 2, "Center Frequency", "tx_st_center_freq", "MHz")
+        _ro_row(st_f, 3, "Offset Frequency", "tx_st_offset_freq", "MHz")
+        _ro_row(st_f, 4, "Amplitude", "tx_st_amplitude", "bins")
 
-        ctrl_f = ttk.LabelFrame(frame, text="Manual Control")
-        ctrl_f.grid(row=1, column=0, padx=4, pady=(2, 4), sticky="ew")
-        ctrl_f.columnconfigure(1, weight=1)
+        # Settings frame is staging only: editing fields changes local values with
+        # zero hardware effect. Nothing radiates until Start/Update is pressed.
+        set_f = ttk.LabelFrame(frame, text="TX Settings (staged, not yet applied)")
+        set_f.grid(row=1, column=0, padx=4, pady=2, sticky="ew")
+        set_f.columnconfigure(1, weight=1)
 
-        ttk.Label(ctrl_f, text="Center Freq (MHz)").grid(row=0, column=0, sticky="w", padx=5, pady=3)
-        self._vars["tx_center_freq"] = tk.StringVar(value="")
-        ttk.Entry(ctrl_f, textvariable=self._vars["tx_center_freq"], width=12).grid(row=0, column=1, sticky="ew", padx=5, pady=3)
-        ttk.Button(ctrl_f, text="Set", command=self._tx_set_center_freq).grid(row=0, column=2, padx=5, pady=3, sticky="ew")
+        ttk.Label(set_f, text="Center Freq (MHz)").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["tx_center_freq"] = tk.StringVar(value="0")
+        ttk.Entry(set_f, textvariable=self._vars["tx_center_freq"], width=12).grid(row=0, column=1, sticky="ew", padx=5, pady=3)
 
-        ttk.Label(ctrl_f, text="Offset Freq (MHz)").grid(row=1, column=0, sticky="w", padx=5, pady=3)
-        self._vars["tx_offset_freq"] = tk.StringVar(value="")
-        ttk.Entry(ctrl_f, textvariable=self._vars["tx_offset_freq"], width=12).grid(row=1, column=1, sticky="ew", padx=5, pady=3)
-        ttk.Button(ctrl_f, text="Set", command=self._tx_set_offset_freq).grid(row=1, column=2, padx=5, pady=3, sticky="ew")
+        ttk.Label(set_f, text="Offset Freq (MHz)").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        self._vars["tx_offset_freq"] = tk.StringVar(value="0")
+        ttk.Entry(set_f, textvariable=self._vars["tx_offset_freq"], width=12).grid(row=1, column=1, sticky="ew", padx=5, pady=3)
 
-        ttk.Label(ctrl_f, text="Amplitude (bins)").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(set_f, text="Amplitude (bins)").grid(row=2, column=0, sticky="w", padx=5, pady=3)
         self._vars["tx_amplitude_bins"] = tk.IntVar(value=0)
-        ttk.Spinbox(ctrl_f, from_=0, to=8191, increment=1, textvariable=self._vars["tx_amplitude_bins"], width=10).grid(row=2, column=1, sticky="ew", padx=5, pady=3)
-        ttk.Button(ctrl_f, text="Set", command=self._tx_set_amplitude).grid(row=2, column=2, padx=5, pady=3, sticky="ew")
+        ttk.Spinbox(set_f, from_=0, to=8191, increment=1, textvariable=self._vars["tx_amplitude_bins"], width=10).grid(row=2, column=1, sticky="ew", padx=5, pady=3)
 
-        ttk.Label(ctrl_f, text="Channel").grid(row=3, column=0, sticky="w", padx=5, pady=3)
-        self._vars["tx_channel"] = tk.StringVar(value="None")
-        ttk.Combobox(ctrl_f, textvariable=self._vars["tx_channel"], values=["None", "A", "B", "A,B"], width=10, state="readonly").grid(row=3, column=1, sticky="ew", padx=5, pady=3)
-        ttk.Button(ctrl_f, text="Set", command=self._tx_set_channel).grid(row=3, column=2, padx=5, pady=3, sticky="ew")
+        ttk.Label(set_f, text="Channel").grid(row=3, column=0, sticky="w", padx=5, pady=3)
+        self._vars["tx_channel"] = tk.StringVar(value=TX_CHANNEL_OPTIONS[0])
+        ttk.Combobox(set_f, textvariable=self._vars["tx_channel"], values=list(TX_CHANNEL_OPTIONS), width=10, state="readonly").grid(row=3, column=1, sticky="ew", padx=5, pady=3)
 
         ttk.Label(
-            ctrl_f,
-            text="tx_offset_freq magnitude must be less than 32 MHz.",
+            set_f,
+            text=f"tx_offset_freq magnitude must be less than {TX_OFFSET_FREQ_MAX_MHZ} MHz.",
             foreground="grey",
             font=("TkDefaultFont", 8),
-        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 3))
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 3))
+
+        # Start/Stop frame: the only controls that touch the radio.
+        act_f = ttk.LabelFrame(frame, text="Transmit Control")
+        act_f.grid(row=2, column=0, padx=4, pady=(2, 4), sticky="ew")
+        act_f.columnconfigure(0, weight=1)
+        act_f.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            act_f,
+            text=("\u26a0 TRANSMIT WARNING. Do not transmit unless you hold a valid "
+                  "license or authorization for the selected frequency and power. "
+                  "The operator bears full responsibility for compliance."),
+            foreground="#b30000",
+            font=("TkDefaultFont", 9, "bold"),
+            wraplength=420,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 6))
+
+        ttk.Button(act_f, text="Start / Update", command=self._tx_start_update_click).grid(
+            row=1, column=0, sticky="ew", padx=5, pady=(0, 4))
+        ttk.Button(act_f, text="Stop", command=self._tx_stop_click).grid(
+            row=1, column=1, sticky="ew", padx=5, pady=(0, 4))
+
+        self._vars["tx_action_status"] = tk.StringVar(value="")
+        ttk.Label(act_f, textvariable=self._vars["tx_action_status"],
+                  foreground="grey").grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 4))
 
         self.bus.on_status(RFSOC_STATUS_TOPIC,
                            lambda data: self._gui_call(self._tx_apply, data))
@@ -5386,58 +5419,51 @@ class MEPGui:
     # ------------------------------------------------------------------ #
 
     def _tx_apply(self, tlm: dict):
-        ch = tlm.get("tx_channels", [])
-        self._vars["tx_st_channels"].set(str(ch) if ch else "—")
-
-        cf = tlm.get("tx_center_freq")
-        self._vars["tx_st_center_freq"].set(f"{cf:.3f}" if cf is not None else "—")
-
-        of = tlm.get("tx_offset_freq")
-        self._vars["tx_st_offset_freq"].set(f"{of:.3f}" if of is not None else "—")
-
-        amp = tlm.get("tx_amplitude_bins")
-        self._vars["tx_st_amplitude"].set(str(amp) if amp is not None else "—")
-
-    def _tx_set_center_freq(self):
-        try:
-            freq_mhz = float(self._vars["tx_center_freq"].get().strip())
-        except ValueError:
-            logging.error("TX: invalid center frequency value")
+        status = MEPBus.normalize_tx_status(tlm)
+        if status is None:
             return
-        self.bus.rfsoc_set_tx_center_freq(freq_mhz)
-        logging.info(f"TX: set tx_center_freq {freq_mhz:.3f} MHz sent")
 
-    def _tx_set_offset_freq(self):
-        try:
-            freq_mhz = float(self._vars["tx_offset_freq"].get().strip())
-        except ValueError:
-            logging.error("TX: invalid offset frequency value")
-            return
-        if abs(freq_mhz) >= 32:
-            logging.error(f"TX: offset frequency magnitude {abs(freq_mhz):.1f} MHz exceeds 32 MHz limit")
-            return
-        self.bus.rfsoc_set_tx_offset_freq(freq_mhz)
-        logging.info(f"TX: set tx_offset_freq {freq_mhz:.3f} MHz sent")
+        if status["transmitting"]:
+            self._vars["tx_st_transmitting"].set("TRANSMITTING")
+        else:
+            self._vars["tx_st_transmitting"].set("Not transmitting")
 
-    def _tx_set_amplitude(self):
+        ch = status["channels"]
+        self._vars["tx_st_channels"].set(str(ch) if ch else "-")
+
+        cf = status["center_freq"]
+        self._vars["tx_st_center_freq"].set(f"{cf:.3f}" if cf is not None else "-")
+
+        of = status["offset_freq"]
+        self._vars["tx_st_offset_freq"].set(f"{of:.3f}" if of is not None else "-")
+
+        amp = status["amplitude_bins"]
+        self._vars["tx_st_amplitude"].set(str(amp) if amp is not None else "-")
+
+    def _tx_start_update_click(self):
+        """Apply the staged TX settings and begin (or update) transmission."""
         try:
-            amp = int(self._vars["tx_amplitude_bins"].get())
+            center_mhz = float(self._vars["tx_center_freq"].get().strip())
+            offset_mhz = float(self._vars["tx_offset_freq"].get().strip())
+            amplitude = int(self._vars["tx_amplitude_bins"].get())
         except (ValueError, tk.TclError):
-            logging.error("TX: invalid amplitude value")
+            self._vars["tx_action_status"].set("Invalid staged value; nothing sent")
+            logging.error("TX: invalid staged value; start/update aborted")
             return
-        if amp < 0 or amp > 8191:
-            logging.error(f"TX: amplitude {amp} out of range (0..8191)")
+        channel = self._vars["tx_channel"].get().strip()
+        try:
+            self.tx.tx_start(channel, center_mhz, offset_mhz, amplitude)
+        except ValueError as e:
+            self._vars["tx_action_status"].set(f"Rejected: {e}")
+            logging.error(f"TX: {e}")
             return
-        self.bus.rfsoc_set_tx_amplitude(amp)
-        logging.info(f"TX: set tx_amplitude {amp} bins sent")
+        self._vars["tx_action_status"].set(
+            f"Start/Update sent (channel={channel})")
 
-    def _tx_set_channel(self):
-        ch = self._vars["tx_channel"].get().strip()
-        if not ch:
-            logging.error("TX: channel is empty")
-            return
-        self.bus.rfsoc_set_tx_channel(ch)
-        logging.info(f"TX: set tx_channel {ch} sent")
+    def _tx_stop_click(self):
+        """Disable all TX output."""
+        self.tx.tx_stop()
+        self._vars["tx_action_status"].set("Stop sent (TX off)")
 
     # ------------------------------------------------------------------ #
     #  TUN helpers
@@ -6201,6 +6227,11 @@ def main():
             except Exception:
                 pass
         try:
+            if getattr(app, "tx", None) is not None:
+                app.tx.tx_stop()
+        except Exception as e:
+            logging.debug(f"Exception stopping TX during cleanup: {e}")
+        try:
             if getattr(app, "capture", None) is not None:
                 app.capture.stop_recorder()
         except Exception as e:
@@ -6234,7 +6265,16 @@ def main():
     root.after(200, kickstart)
 
     app._mainloop_started = True
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        # Last-resort TX-off in case the loop exits without WM_DELETE_WINDOW
+        # (exception, signal). Idempotent with the _on_close path above.
+        try:
+            if getattr(app, "tx", None) is not None:
+                app.tx.tx_stop()
+        except Exception as e:
+            logging.debug(f"Exception stopping TX during final cleanup: {e}")
 
 
 if __name__ == "__main__":
