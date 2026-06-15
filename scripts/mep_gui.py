@@ -49,7 +49,6 @@ from start_mep_rx import (
     get_thermal_info_detailed,
     get_jetson_power_mode,
     set_jetson_power_mode_detailed,
-    TUNER_INJECTION_SIDE,
     CHANNEL_OPTIONS,
     TUNER_OPTIONS,
     SAMPLE_RATE_OPTIONS,

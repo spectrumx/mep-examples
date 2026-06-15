@@ -87,11 +87,16 @@ _SYNC_STATUS_TOPICS = (RFSOC_STATUS_TOPIC, RECORDER_STATUS_TOPIC, TUNER_STATUS_T
 # Owned by the FPGA UDP packet emitter. This is not the source of truth of this information.
 RECORDER_CHANNEL_PORTS = {"A": 60134, "B": 60133, "C": 60132, "D": 60131}
 
-TUNER_INJECTION_SIDE = {
-    "VALON":   "high",
-    "LMX2820": "high",
-    "TEST":    "high",
+# Single source of truth for tuner metadata, keyed by the canonical/friendly
+# name (the form the GUI dropdown, CLI, and the rest of this program use).
+# 'backend' is the lower-case name the tuner_control service expects (it calls
+# the test tuner 'dummy'); 'injection_side' feeds resolve_injection.
+TUNERS = {
+    "VALON":   {"backend": "valon",   "injection_side": "high"},
+    "LMX2820": {"backend": "lmx2820", "injection_side": "high"},
+    "TEST":    {"backend": "dummy",   "injection_side": "high"},
 }
+_TUNER_CANONICAL_BY_BACKEND = {meta["backend"]: name for name, meta in TUNERS.items()}
 
 CONJUGATE_POLICY_DEFAULT = "auto"
 CONJUGATE_POLICY_OPTIONS = ("auto", "force_on", "force_off")
@@ -104,7 +109,7 @@ TX_CHANNEL_OPTIONS = ("None", "A", "B", "A,B")
 # Hardware configuration options (for dropdowns/validation)
 # CHANNEL_OPTIONS derived from RECORDER_CHANNEL_PORTS
 CHANNEL_OPTIONS     = list(sorted(RECORDER_CHANNEL_PORTS.keys()))
-TUNER_OPTIONS       = ["None"] + list(TUNER_INJECTION_SIDE.keys()) + ["auto"]
+TUNER_OPTIONS       = ["None"] + list(TUNERS.keys()) + ["auto"]
 
 RECORDER_CONFIG_DIR = "/opt/radiohound/docker/recorder/configs"
 DOCKER_COMPOSE_DIR = "/opt/radiohound/docker"
@@ -125,6 +130,22 @@ def get_frequency_list(start_mhz: float, end_mhz: float, step_mhz: float):
     return range(start_hz, end_hz + step_hz, step_hz)
 
 
+def _normalize_tuner(tuner: Optional[str]) -> Optional[str]:
+    """Canonicalize a tuner selection at the system boundary.
+
+    None / '' / 'none' -> None (NCO mode), 'auto' (any case) -> 'auto', and a
+    concrete tuner name is upper-cased to match TUNERS keys.
+    """
+    if tuner is None:
+        return None
+    token = tuner.strip()
+    if not token or token.lower() == "none":
+        return None
+    if token.lower() == "auto":
+        return "auto"
+    return token.upper()
+
+
 def resolve_injection(tuner: str, injection_override: str = None) -> str:
     """Determine injection side for a given tuner.
     Returns 'high' or 'low'. Raises ValueError for unknown tuners.
@@ -133,9 +154,9 @@ def resolve_injection(tuner: str, injection_override: str = None) -> str:
         return injection_override
     if tuner.lower() == "auto":
         return "high"
-    if tuner.upper() in TUNER_INJECTION_SIDE:
-        return TUNER_INJECTION_SIDE[tuner.upper()]
-    raise ValueError(f"Tuner {tuner!r} not in TUNER_INJECTION_SIDE — add it or pass --injection")
+    if tuner.upper() in TUNERS:
+        return TUNERS[tuner.upper()]["injection_side"]
+    raise ValueError(f"Tuner {tuner!r} not in TUNERS — add it or pass --injection")
 
 
 def tuner_type_arg(x: str):
@@ -146,9 +167,9 @@ def tuner_type_arg(x: str):
     if x_lower == "auto":
         return "auto"
     x_upper = x.strip().upper()
-    if x_upper not in TUNER_INJECTION_SIDE:
+    if x_upper not in TUNERS:
         raise argparse.ArgumentTypeError(
-            f"Invalid tuner '{x}'. Valid: {list(TUNER_INJECTION_SIDE.keys())}, auto, None"
+            f"Invalid tuner '{x}'. Valid: {list(TUNERS.keys())}, auto, None"
         )
     return x_upper
 
@@ -2181,10 +2202,16 @@ class MEPBus:
         candidate_keys = ("tuner", "tuner_type", "active_tuner", "name", "model", "device")
 
         def _normalize(value):
-            if isinstance(value, str):
-                token = value.strip().upper()
-                if token in TUNER_INJECTION_SIDE:
-                    return token
+            if not isinstance(value, str):
+                return None
+            token = value.strip()
+            # Backend service name (e.g. 'valon', 'dummy') -> canonical.
+            canonical = _TUNER_CANONICAL_BY_BACKEND.get(token.lower())
+            if canonical:
+                return canonical
+            # Already canonical (e.g. 'VALON').
+            if token.upper() in TUNERS:
+                return token.upper()
             return None
 
         for key in candidate_keys:
@@ -2192,7 +2219,7 @@ class MEPBus:
             if resolved:
                 return resolved
 
-        for nested_key in ("arguments", "status", "data", "result"):
+        for nested_key in ("tuner", "arguments", "status", "data", "result"):
             nested = status_payload.get(nested_key)
             if isinstance(nested, dict):
                 for key in candidate_keys:
@@ -2373,9 +2400,7 @@ class CaptureController:
         self.injection: Optional[str] = None
         self.capture_name: Optional[str] = None
         self.conjugate_policy: str = CONJUGATE_POLICY_DEFAULT
-        self._tuner_initialized_for: Optional[str] = None
-        self._last_tuner_session_id: Optional[str] = None
-        self._tuner_session_counter = 0
+        self._tuner_request_counter = 0
 
         # ---- Recorder "what changed" state ----
         self._active_channel = None
@@ -2418,9 +2443,6 @@ class CaptureController:
             self._sync_cbs[topic] = _make_status_cb(topic)
             self.bus.on_status(topic, self._sync_cbs[topic])
 
-        # ---- Check for already-initialized tuner ----
-        self._query_and_cache_tuner_state()
-
     def _require_mqtt(self, action: str) -> bool:
         """Return False and log once when broker is offline for a control action."""
         if self.bus.is_connected():
@@ -2462,15 +2484,15 @@ class CaptureController:
         """Set parameters used by run_sweep / run_single / start_recorder."""
         self.channel = channel.upper()
         self.sample_rate_mhz = sample_rate_mhz
-        self.tuner = tuner
+        self.tuner = _normalize_tuner(tuner)
         self.adc_if_mhz = adc_if_mhz
         self.capture_name = capture_name
 
-        if tuner is None:
+        if self.tuner is None:
             self.injection = None
         else:
-            self.injection = resolve_injection(tuner, injection)
-            self._initialize_tuner_if_needed()
+            self.injection = resolve_injection(self.tuner, injection)
+            self._ensure_tuner_initialized()
 
     def set_recorder_overrides(self, overrides: dict[str, object]):
         """Replace the persistent recorder overrides used after config.load."""
@@ -2573,110 +2595,154 @@ class CaptureController:
         return False
 
     # ------------------------------------------------------------------ #
-    #  Tuner session management                                            #
+    #  Tuner readiness                                                     #
     # ------------------------------------------------------------------ #
 
-    def _generate_tuner_session_id(self) -> str:
-        self._tuner_session_counter += 1
-        return f"mep-tuner-{self._tuner_session_counter}"
+    def _resolved_tuner_name(self) -> Optional[str]:
+        """Concrete hardware tuner name, resolving 'auto' via cached status.
 
-    def _query_and_cache_tuner_state(self):
-        """Query tuner status at startup; cache what tuner (if any) is already initialized."""
-        if not self.bus.is_connected():
-            logging.debug("Skipping tuner startup query: MQTT offline")
-            return
+        Returns the resolved model (e.g. 'VALON'), or None when no tuner is
+        selected or 'auto' has not yet been resolved by the service.
+        """
+        if self.tuner is None:
+            return None
+        if self.tuner.lower() != "auto":
+            return self.tuner.upper()
+        return MEPBus._extract_tuner_name(self.bus.get_cached_status(TUNER_STATUS_TOPIC))
 
-        session_id = self._generate_tuner_session_id()
-        self._last_tuner_session_id = session_id
-        self.bus.publish_command(TUNER_CMD_TOPIC, {
-            "task_name": "status",
-            "arguments": {},
-            "session_id": session_id,
-        })
-        status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
+    def _tuner_ready(self) -> bool:
+        """True when the tuner service reports online with a tuner that
+        satisfies the current selection. Any resolved tuner satisfies 'auto'.
 
-        if not isinstance(status, dict):
-            logging.debug("No tuner status response at startup")
-            return
-
-        if not self._is_status_fresh(status, expected_session_id=session_id):
-            logging.debug("Startup tuner status is stale or session mismatch")
-            return
-
-        if status.get("state") != "online":
-            logging.debug(f"Tuner service not online (state={status.get('state')})")
-            return
-
-        tuner_name = MEPBus._extract_tuner_name(status)
-        if tuner_name:
-            self._tuner_initialized_for = tuner_name.upper()
-            logging.info(f"Tuner already initialized at startup: {tuner_name}")
-
-    def _is_status_fresh(self, status: dict, max_age_s: float = 5.0, expected_session_id: str = None) -> bool:
-        if not isinstance(status, dict):
+        Reads the asynchronously-cached MQTT status — never blocks, never
+        issues a request.
+        """
+        if self.tuner is None:
+            return True  # NCO mode needs no tuner
+        status = self.bus.get_cached_status(TUNER_STATUS_TOPIC)
+        if not isinstance(status, dict) or status.get("state") != "online":
             return False
-
-        if expected_session_id is not None and "session_id" in status:
-            if status.get("session_id") == expected_session_id:
-                logging.debug(f"Tuner status validated via session_id: {expected_session_id}")
-                return True
-            else:
-                logging.warning(
-                    f"Tuner status session_id mismatch: expected {expected_session_id!r}, got {status.get('session_id')!r}"
-                )
-                return False
-
-        msg_timestamp = status.get("timestamp")
-        if msg_timestamp is None:
-            logging.debug("Tuner status has no timestamp or session_id; assuming fresh")
+        resolved = MEPBus._extract_tuner_name(status)
+        if not resolved:
+            return False
+        if self.tuner.lower() == "auto":
             return True
+        return resolved == self.tuner.upper()
 
-        current_time = time.time()
-        age_s = current_time - msg_timestamp
+    def _send_init_tuner(self):
+        """Publish a fire-and-forget init_tuner command for the selected tuner."""
+        if self.tuner.lower() == "auto":
+            args = {}
+        else:
+            args = {"force_tuner": TUNERS[self.tuner.upper()]["backend"]}
+        logging.info(f"Requesting tuner init: {self.tuner}")
+        self.bus.publish_command(TUNER_CMD_TOPIC, {"task_name": "init_tuner", "arguments": args})
 
-        if age_s > max_age_s:
-            logging.warning(f"Tuner status is stale ({age_s:.1f}s old)")
-            return False
+    def _ensure_tuner_initialized(self):
+        """Request tuner init only when the service isn't already online with the
+        selected tuner.
 
-        return True
-
-    def _initialize_tuner_if_needed(self):
-        """Initialize tuner once if not already initialized for current config."""
+        Fire-and-forget: the cached MQTT status is the source of truth, so
+        repeated Starts with an already-online tuner do no work and never block.
+        """
+        if self.tuner is None:
+            return  # NCO mode
         if not self._require_mqtt("initialize tuner"):
             return
-
-        if self.tuner == self._tuner_initialized_for:
-            logging.debug(f"Tuner already initialized for {self.tuner}, skipping re-init")
+        if self._tuner_ready():
+            logging.debug(f"Tuner already online for {self.tuner}; skipping init")
             return
+        self._send_init_tuner()
 
-        logging.info(f"Initializing tuner: {self.tuner}")
+    def _wait_for_tuner_ready(self, timeout_s: float = 5.0) -> bool:
+        """Bounded poll for the tuner to report online for the selected tuner.
 
-        if self.tuner.lower() == "auto":
-            session_id = self._generate_tuner_session_id()
-            self._last_tuner_session_id = session_id
+        Used only as a cold-start guard before the first frequency set; warm
+        captures return immediately. Polls the async status cache rather than
+        issuing a blocking request/response handshake.
+        """
+        if self._tuner_ready():
+            return True
+        logging.info("Waiting for tuner to come online...")
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self._tuner_ready():
+                logging.info(f"Tuner online: {self._resolved_tuner_name()}")
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _next_tuner_request_id(self) -> str:
+        self._tuner_request_counter += 1
+        return f"mep-tuner-req-{self._tuner_request_counter}"
+
+    def _query_tuner_lock(self, timeout_s: float = 2.0) -> Optional[dict]:
+        """Request get_lock_status and return the correlated response payload.
+
+        Correlates on a unique session_id: on_status replays the last retained
+        tuner message on registration, so without correlation a stale or prior
+        lock response could be mistaken for this one. Returns None on timeout.
+        """
+        session_id = self._next_tuner_request_id()
+        matched = {"payload": None}
+        done = threading.Event()
+
+        def _listener(data):
+            if isinstance(data, dict) and data.get("session_id") == session_id:
+                matched["payload"] = data
+                done.set()
+
+        self.bus.on_status(TUNER_STATUS_TOPIC, _listener)
+        try:
             self.bus.publish_command(TUNER_CMD_TOPIC, {
-                "task_name": "init_tuner",
+                "task_name": "get_lock_status",
                 "arguments": {},
                 "session_id": session_id,
             })
-            init_status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
-            if self._is_status_fresh(init_status, expected_session_id=session_id):
-                resolved_tuner = MEPBus._extract_tuner_name(init_status) or "AUTO"
-                logging.info(f"Auto tuner resolved to: {resolved_tuner}")
-                self._tuner_initialized_for = resolved_tuner
-            else:
-                logging.warning("Auto tuner init status stale or missing")
-        else:
-            session_id = self._generate_tuner_session_id()
-            self._last_tuner_session_id = session_id
-            self.bus.publish_command(TUNER_CMD_TOPIC, {
-                "task_name": "init_tuner",
-                "arguments": {"force_tuner": self.tuner},
-                "session_id": session_id,
-            })
-            self._tuner_initialized_for = self.tuner
+            if done.wait(timeout=timeout_s):
+                return matched["payload"]
+            return None
+        finally:
+            self.bus.remove_listener(TUNER_STATUS_TOPIC, _listener)
 
-        time.sleep(0.1)
+    @staticmethod
+    def _interpret_lock(value) -> Optional[bool]:
+        """Map a get_lock_status value to locked(True)/unlocked(False), or None
+        when the shape is unrecognized.
+
+        The tuner returns a dict of per-PLL booleans; locked means every PLL is
+        locked. Matches the GUI's lock-status interpretation.
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, dict):
+            locks = [v for v in value.values() if isinstance(v, bool)]
+            if locks:
+                return all(locks)
+        return None
+
+    def _verify_tuner_lock(self) -> bool:
+        """Confirm the tuner PLL is locked before arming a capture.
+
+        Aborts (returns False) only when the tuner explicitly reports unlocked.
+        On no response or an unrecognized value it warns and proceeds, so
+        transient message loss or an unknown schema doesn't kill a sweep.
+        """
+        resp = self._query_tuner_lock(timeout_s=2.0)
+        if resp is None:
+            logging.warning("No lock-status response from tuner — proceeding unverified")
+            return True
+        locked = self._interpret_lock(resp.get("value"))
+        if locked is True:
+            logging.info("Tuner PLL locked")
+            return True
+        if locked is False:
+            logging.error("Tuner PLL NOT locked — aborting capture at this frequency")
+            return False
+        logging.warning(
+            f"Unrecognized lock-status value {resp.get('value')!r} — proceeding unverified"
+        )
+        return True
 
     def _normalized_conjugate_policy(self) -> str:
         """Return a valid conjugate policy from current controller state."""
@@ -3064,7 +3130,14 @@ class CaptureController:
             if self.adc_if_mhz is None:
                 raise ValueError("adc_if_mhz is required when a tuner is specified")
 
-            resolved_tuner = self.tuner.upper()
+            # Cold-start guard: only blocks when the tuner isn't yet online
+            # (e.g. first capture after launch). Warm captures pass straight
+            # through because _tuner_ready() is already True.
+            if not self._wait_for_tuner_ready():
+                logging.error(f"Tuner '{self.tuner}' did not come online — aborting capture")
+                return False
+
+            resolved_tuner = self._resolved_tuner_name()
 
             self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {self.adc_if_mhz}"})
             time.sleep(0.1)
@@ -3080,12 +3153,8 @@ class CaptureController:
             time.sleep(0.1)
 
             if resolved_tuner == "VALON":
-                self.bus.tuner_check_lock()
-                lock_status = self._wait_for_status(TUNER_STATUS_TOPIC, timeout_s=2.0)
-                if lock_status is not None:
-                    logging.info(f"Tuner lock status: {lock_status}")
-                else:
-                    logging.warning("No tuner lock status response received")
+                if not self._verify_tuner_lock():
+                    return False
 
         # Common tail: metadata → capture → TLM
         # (channel was already set right after reset above)
@@ -3633,7 +3702,7 @@ if __name__ == "__main__":
                         help="Fixed RFSoC IF in MHz (required if tuner is used)")
     parser.add_argument("--injection",         type=str,   default=None,
                         choices=["high", "low"],
-                        help="Override injection side (default: from TUNER_INJECTION_SIDE table)")
+                        help="Override injection side (default: from TUNERS table)")
     parser.add_argument("--log-level",  "-l",  type=str,   default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--skip_ntp",          action="store_true",
