@@ -65,6 +65,7 @@ from start_mep_rx import (
     RECORDER_STATUS_TOPIC,
     TUNER_CMD_TOPIC,
     TUNER_STATUS_TOPIC,
+    TUNER_RESPONSE_TOPIC,
     RFSOC_STATUS_TOPIC,
     AFE_CMD_TOPIC,
     AFE_STATUS_TOPIC,
@@ -3458,11 +3459,17 @@ class MEPGui:
         self._tun_update_capability_buttons()
 
         # Register tab-specific MQTT → UI. Emit-cached fires inline if data exists.
+        # Periodic status (state/tuner) arrives on the status topic; command
+        # replies (get_lock_status, get_freq, get_power) arrive on the dedicated
+        # response topic and carry task_name/value.
         def _tun_status_for_tab(data: dict):
-            if "task_name" in data and "value" in data and "state" not in data:
-                self._gui_call(self._tun_handle_response, data)
             self._gui_call(self._tun_refresh)
         self.bus.on_status(TUNER_STATUS_TOPIC, _tun_status_for_tab)
+
+        def _tun_response_for_tab(data: dict):
+            if "task_name" in data and "value" in data:
+                self._gui_call(self._tun_handle_response, data)
+        self.bus.on_status(TUNER_RESPONSE_TOPIC, _tun_response_for_tab)
 
     # ---- TLM tab ---- #
 

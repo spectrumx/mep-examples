@@ -67,6 +67,7 @@ RECORDER_CMD_TOPIC    = "recorder/command"
 RECORDER_STATUS_TOPIC = "recorder/status"
 TUNER_CMD_TOPIC       = "tuner_control/command"
 TUNER_STATUS_TOPIC    = "tuner_control/status"
+TUNER_RESPONSE_TOPIC  = "tuner_control/response"
 AFE_CMD_TOPIC         = "afe/command"
 AFE_RESPONSE_TOPIC    = "afe/response"
 AFE_STATUS_TOPIC      = "afe/status"
@@ -2679,9 +2680,11 @@ class CaptureController:
     def _query_tuner_lock(self, timeout_s: float = 2.0) -> Optional[dict]:
         """Request get_lock_status and return the correlated response payload.
 
-        Correlates on a unique session_id: on_status replays the last retained
-        tuner message on registration, so without correlation a stale or prior
-        lock response could be mistaken for this one. Returns None on timeout.
+        The tuner service publishes command responses to TUNER_RESPONSE_TOPIC
+        (separate from the periodic status on TUNER_STATUS_TOPIC). Correlates on
+        a unique session_id: on_status replays the last cached message on
+        registration, so without correlation a prior lock response could be
+        mistaken for this one. Returns None on timeout.
         """
         session_id = self._next_tuner_request_id()
         matched = {"payload": None}
@@ -2692,7 +2695,7 @@ class CaptureController:
                 matched["payload"] = data
                 done.set()
 
-        self.bus.on_status(TUNER_STATUS_TOPIC, _listener)
+        self.bus.on_status(TUNER_RESPONSE_TOPIC, _listener)
         try:
             self.bus.publish_command(TUNER_CMD_TOPIC, {
                 "task_name": "get_lock_status",
@@ -2703,7 +2706,7 @@ class CaptureController:
                 return matched["payload"]
             return None
         finally:
-            self.bus.remove_listener(TUNER_STATUS_TOPIC, _listener)
+            self.bus.remove_listener(TUNER_RESPONSE_TOPIC, _listener)
 
     @staticmethod
     def _interpret_lock(value) -> Optional[bool]:
@@ -2721,28 +2724,27 @@ class CaptureController:
                 return all(locks)
         return None
 
-    def _verify_tuner_lock(self) -> bool:
-        """Confirm the tuner PLL is locked before arming a capture.
+    def _report_tuner_lock(self) -> None:
+        """Log the VALON PLL lock state as an informational status update.
 
-        Aborts (returns False) only when the tuner explicitly reports unlocked.
-        On no response or an unrecognized value it warns and proceeds, so
-        transient message loss or an unknown schema doesn't kill a sweep.
+        This is never a go/no-go gate — PLL lock is not guaranteed on every
+        capture and is reported purely for the user's benefit. Only the VALON
+        exposes a real lock status (the caller invokes this for VALON only). The
+        single case worth surfacing loudly is an explicit "not locked", which
+        gets a WARNING. Every other case (locked, no response, unrecognized
+        shape) is quiet, and the capture always proceeds regardless.
         """
         resp = self._query_tuner_lock(timeout_s=2.0)
         if resp is None:
-            logging.warning("No lock-status response from tuner — proceeding unverified")
-            return True
+            logging.debug("No lock-status response from tuner")
+            return
         locked = self._interpret_lock(resp.get("value"))
         if locked is True:
             logging.info("Tuner PLL locked")
-            return True
-        if locked is False:
-            logging.error("Tuner PLL NOT locked — aborting capture at this frequency")
-            return False
-        logging.warning(
-            f"Unrecognized lock-status value {resp.get('value')!r} — proceeding unverified"
-        )
-        return True
+        elif locked is False:
+            logging.warning("Tuner PLL NOT locked")
+        else:
+            logging.debug(f"Unrecognized lock-status value {resp.get('value')!r}")
 
     def _normalized_conjugate_policy(self) -> str:
         """Return a valid conjugate policy from current controller state."""
@@ -3153,8 +3155,7 @@ class CaptureController:
             time.sleep(0.1)
 
             if resolved_tuner == "VALON":
-                if not self._verify_tuner_lock():
-                    return False
+                self._report_tuner_lock()
 
         # Common tail: metadata → capture → TLM
         # (channel was already set right after reset above)
