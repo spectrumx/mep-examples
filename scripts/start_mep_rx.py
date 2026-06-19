@@ -1844,7 +1844,7 @@ class MEPBus:
 
     def rfsoc_get_tlm(self):
         """Request RFSoC telemetry publish on rfsoc/status."""
-        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "get", "arguments": "tlm"}, sleep_s=0)
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "get", "arguments": ["tlm"]}, sleep_s=0)
 
     def rfsoc_capture_next_pps(self):
         """Arm capture on next PPS edge."""
@@ -2548,7 +2548,7 @@ class CaptureController:
         self._tlm_event.clear()
         self.bus.publish_command(
             RFSOC_CMD_TOPIC,
-            {"task_name": "get", "arguments": "tlm"},
+            {"task_name": "get", "arguments": ["tlm"]},
             sleep_s=0,
         )
         if self._tlm_event.wait(timeout=timeout_s):
