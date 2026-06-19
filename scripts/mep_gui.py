@@ -384,8 +384,13 @@ class MEPGui:
         self.bus.on_message(self._on_mqtt_message)
         self.bus.on_connection_state(self._on_mqtt_connection_state)
         self.bus.on_status(RECORDER_STATUS_TOPIC, self._on_recorder_status)
+        self.bus.on_status(RECORDER_STATUS_TOPIC, lambda data: self._gui_call(self._rec_status_ui_update, data))
         self.bus.on_status(RFSOC_STATUS_TOPIC, self._on_rfsoc_status)
+        self.bus.on_status(RFSOC_STATUS_TOPIC, lambda data: self._gui_call(self._soc_apply, data))
+        self.bus.on_status(RFSOC_STATUS_TOPIC, lambda data: self._gui_call(self._tx_apply, data))
         self.bus.on_status(TUNER_STATUS_TOPIC, self._on_tuner_status)
+        self.bus.on_status(TUNER_STATUS_TOPIC, lambda data: self._gui_call(self._tun_refresh))
+        self.bus.on_status(TUNER_RESPONSE_TOPIC, lambda data: self._gui_call(self._tun_handle_response, data) if "task_name" in data and "value" in data else None)
         self.bus.on_status(AFE_STATUS_TOPIC, self._on_afe_status)
         self.bus.on_status(AFE_GNSS_TOPIC, self._on_gnss)
         self.bus.on_status(AFE_IMU_TOPIC, self._on_imu)
@@ -3255,11 +3260,7 @@ class MEPGui:
             "Stops packet output immediately. Does not affect the recorder.",
         )
 
-        # Register MQTT → UI
-        self.bus.on_status(RFSOC_STATUS_TOPIC,
-                           lambda data: self._gui_call(self._soc_apply, data))
-
-    # ---- TX tab ---- #
+        # ---- TX tab ---- #
 
     def _build_tx_tab(self, frame: ttk.Frame):
         frame.columnconfigure(0, weight=1)
@@ -3340,9 +3341,6 @@ class MEPGui:
         ttk.Label(act_f, textvariable=self._vars["tx_action_status"],
                   foreground="grey").grid(
             row=2, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 4))
-
-        self.bus.on_status(RFSOC_STATUS_TOPIC,
-                           lambda data: self._gui_call(self._tx_apply, data))
 
     # ---- TUN tab ---- #
 
@@ -3446,15 +3444,6 @@ class MEPGui:
         # Periodic status (state/tuner) arrives on the status topic; command
         # replies (get_lock_status, get_freq, get_power) arrive on the dedicated
         # response topic and carry task_name/value.
-        def _tun_status_for_tab(data: dict):
-            self._gui_call(self._tun_refresh)
-        self.bus.on_status(TUNER_STATUS_TOPIC, _tun_status_for_tab)
-
-        def _tun_response_for_tab(data: dict):
-            if "task_name" in data and "value" in data:
-                self._gui_call(self._tun_handle_response, data)
-        self.bus.on_status(TUNER_RESPONSE_TOPIC, _tun_response_for_tab)
-
     # ---- TLM tab ---- #
 
     def _build_tlm_tab(self, frame: ttk.Frame):
@@ -4462,8 +4451,6 @@ class MEPGui:
         _bind_rec_copy_menus(scrollable_frame)
 
         # Register tab-specific MQTT → UI. Emit-cached fires inline if data exists.
-        self.bus.on_status(RECORDER_STATUS_TOPIC,
-                          lambda data: self._gui_call(self._rec_status_ui_update, data))
         self._update_conjugate_actual_display()
         self._rec_trace_busy = False
         self._rec_load_preset()
@@ -5324,18 +5311,14 @@ class MEPGui:
     # ------------------------------------------------------------------ #
 
     def _soc_refresh(self):
-        def _query():
-            self.bus.rfsoc_get_tlm()
-            time.sleep(0.25)
-            tlm = self.bus.get_cached_status(RFSOC_STATUS_TOPIC)
-            if not isinstance(tlm, dict):
-                logging.warning("SOC: no telemetry response")
-                return
-            self._gui_call(self._soc_apply, tlm)
-
-        threading.Thread(target=_query, daemon=True).start()
+        threading.Thread(
+            target=self.bus.rfsoc_get_tlm,
+            daemon=True,
+        ).start()
 
     def _soc_apply(self, tlm: dict):
+        if "soc_state" not in self._vars:
+            return  # SOC tab not yet built; skip until user opens it
         self._vars["soc_state"].set(tlm.get("state", "—"))
         f_c_hz = self._safe_float(tlm.get("f_c_hz"), 0.0)
         f_if_hz = self._safe_float(tlm.get("f_if_hz"), 0.0)
@@ -5411,6 +5394,8 @@ class MEPGui:
     # ------------------------------------------------------------------ #
 
     def _tx_apply(self, tlm: dict):
+        if "tx_st_transmitting" not in self._vars:
+            return  # TX tab not yet built
         status = MEPBus.normalize_tx_status(tlm)
         if status is None:
             return
@@ -5462,6 +5447,8 @@ class MEPGui:
     # ------------------------------------------------------------------ #
 
     def _tun_refresh(self):
+        if "tun_state" not in self._vars:
+            return  # TUN tab not yet built
         tuner_norm = self.bus.get_tuner_status_normalized()
         status = tuner_norm.get("raw") if isinstance(tuner_norm, dict) else None
 
@@ -5507,6 +5494,8 @@ class MEPGui:
         logging.info("TUN: status text updated")
 
     def _tun_handle_response(self, data: dict):
+        if "tun_set_freq" not in self._vars:
+            return  # TUN tab not yet built
         task = data.get("task_name", "")
         value = data.get("value")
         if value is None:
@@ -5797,6 +5786,8 @@ class MEPGui:
 
     def _rec_status_ui_update(self, data: dict):
         """Update REC tab widgets from recorder status (only called after tab is built)."""
+        if "rec_status" not in self._vars:
+            return  # REC tab not yet built
         self._vars["rec_status"].set(data.get("state", "—"))
 
     def _profile_holoscan_click(self):
