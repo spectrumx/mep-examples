@@ -3260,6 +3260,11 @@ class MEPGui:
             "Stops packet output immediately. Does not affect the recorder.",
         )
 
+        # Populate with cached data so tab shows current state immediately on first open.
+        cached = self.bus.get_cached_status(RFSOC_STATUS_TOPIC)
+        if isinstance(cached, dict):
+            self._soc_apply(cached)
+
         # ---- TX tab ---- #
 
     def _build_tx_tab(self, frame: ttk.Frame):
@@ -3341,6 +3346,11 @@ class MEPGui:
         ttk.Label(act_f, textvariable=self._vars["tx_action_status"],
                   foreground="grey").grid(
             row=2, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 4))
+
+        # Populate with cached data so tab shows current state immediately on first open.
+        cached = self.bus.get_cached_status(RFSOC_STATUS_TOPIC)
+        if isinstance(cached, dict):
+            self._tx_apply(cached)
 
     # ---- TUN tab ---- #
 
@@ -3439,6 +3449,9 @@ class MEPGui:
         self._vars["tun_name"].trace_add(
             "write", lambda *_: self._tun_update_capability_buttons())
         self._tun_update_capability_buttons()
+
+        # Populate with cached data so tab shows current state immediately on first open.
+        self._tun_refresh()
 
         # Register tab-specific MQTT → UI. Emit-cached fires inline if data exists.
         # Periodic status (state/tuner) arrives on the status topic; command
@@ -4454,6 +4467,10 @@ class MEPGui:
         self._update_conjugate_actual_display()
         self._rec_trace_busy = False
         self._rec_load_preset()
+        # Populate with cached data so tab shows current state immediately on first open.
+        cached = self.bus.get_cached_status(RECORDER_STATUS_TOPIC)
+        if isinstance(cached, dict):
+            self._rec_status_ui_update(cached)
         self._vars["sample_rate_mhz"].trace_add("write", self._on_rec_sample_rate_change)
         for key in (
             "sg_nperseg", "sg_nfft", "sg_noverlap", "sg_window", "sg_reduce_op",
