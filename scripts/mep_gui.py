@@ -3129,7 +3129,7 @@ class MEPGui:
 
         # ── Status ────────────────────────────────────────────────────────
         # Read-only. Auto-refreshed whenever the RFSoC publishes to rfsoc/status.
-        st_f = ttk.LabelFrame(frame, text="Status  (live from rfsoc/status)")
+        st_f = ttk.LabelFrame(frame, text="Current Status")
         st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
         st_f.columnconfigure(1, weight=1)
         _ro_row(st_f, 0, "State",                "soc_state")
@@ -3198,7 +3198,7 @@ class MEPGui:
             cb.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 12), pady=(0, 2))
 
         ch_set_btn = ttk.Button(mc_f, text="Set", command=self._soc_set_channels)
-        ch_set_btn.grid(row=3, column=2, sticky="e", padx=5, pady=(2, 2))
+        ch_set_btn.grid(row=2, column=2, sticky="se", padx=5, pady=(6, 2))
         self._add_tooltip(
             ch_set_btn,
             "MQTT: {\"task_name\": \"set\", \"arguments\": \"channel <A,B,...>\"}\n\n"
@@ -3206,6 +3206,11 @@ class MEPGui:
             "supported (e.g. A,B). Sending this command resets the FPGA control "
             "register — restart the UDP stream after setting.",
         )
+        ttk.Label(
+            mc_f,
+            text="remember to 'set' desired changes before pressing 'start'",
+            foreground="grey", font=("TkDefaultFont", 8),
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
         # ── UDP Stream ────────────────────────────────────────────────────
         # Controls whether the FPGA ADC-to-UDP IP cores are streaming packets.
         udp_f = ttk.LabelFrame(frame, text="UDP Stream")
@@ -5353,11 +5358,8 @@ class MEPGui:
             for ch in channels
         ]
         self._vars["soc_channels"].set(", ".join(channel_with_ports) if channel_with_ports else "—")
-        # Sync channel checkboxes to reflect actual hardware state
-        for ch in ("A", "B", "C", "D"):
-            key = f"soc_ch_{ch}"
-            if key in self._vars:
-                self._vars[key].set(ch in channels)
+        # Manual Control checkboxes are staged user intent and intentionally do
+        # not mirror live hardware state; Current Status above is the source of truth.
 
     def _soc_start_stream(self):
         mode = self._vars["soc_start_mode"].get()
