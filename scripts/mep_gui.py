@@ -3188,13 +3188,14 @@ class MEPGui:
         ttk.Label(mc_f, text="Active Channels").grid(row=2, column=0, sticky="nw", padx=5, pady=(6, 2))
         cb_row = ttk.Frame(mc_f)
         cb_row.grid(row=2, column=1, columnspan=2, sticky="w", padx=5, pady=(6, 2))
-        for ch in ("A", "B", "C", "D"):
+        for i, ch in enumerate(("A", "B", "C", "D")):
             port = RECORDER_CHANNEL_PORTS.get(ch, "?")
-            ttk.Checkbutton(
+            cb = ttk.Checkbutton(
                 cb_row,
                 text=f"{ch} ({port})",
                 variable=self._vars[f"soc_ch_{ch}"],
-            ).pack(side="left", padx=(0, 10))
+            )
+            cb.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 12), pady=(0, 2))
 
         ch_set_btn = ttk.Button(mc_f, text="Set", command=self._soc_set_channels)
         ch_set_btn.grid(row=3, column=2, sticky="e", padx=5, pady=(2, 2))
@@ -6202,7 +6203,10 @@ def main():
     app  = MEPGui(root)
     print("  Initialization complete — starting event loop.", flush=True)
 
+    close_state = {"ran": False}
+
     def _on_close():
+        close_state["ran"] = True
         logging.info("Window closed — cleaning up")
         app._gui_queue_closed = True
         handler = getattr(app, "_text_log_handler", None)
@@ -6260,7 +6264,13 @@ def main():
         # Last-resort TX-off in case the loop exits without WM_DELETE_WINDOW
         # (exception, signal). Idempotent with the _on_close path above.
         try:
-            if getattr(app, "tx", None) is not None:
+            bus = getattr(app, "bus", None)
+            if (
+                not close_state["ran"]
+                and getattr(app, "tx", None) is not None
+                and bus is not None
+                and bus.is_connected()
+            ):
                 app.tx.tx_stop()
         except Exception as e:
             logging.debug(f"Exception stopping TX during final cleanup: {e}")
