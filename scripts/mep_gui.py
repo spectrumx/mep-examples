@@ -50,6 +50,7 @@ from start_mep_rx import (
     get_jetson_power_mode,
     set_jetson_power_mode_detailed,
     CHANNEL_OPTIONS,
+    RECORDER_CHANNEL_PORTS,
     TUNER_OPTIONS,
     SAMPLE_RATE_OPTIONS,
     CONJUGATE_POLICY_DEFAULT,
@@ -3146,10 +3147,68 @@ class MEPGui:
             "Status also auto-updates on every RFSoC event.",
         )
 
+        # ── Manual Control ────────────────────────────────────────────────
+        mc_f = ttk.LabelFrame(frame, text="Manual Control")
+        mc_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        mc_f.columnconfigure(1, weight=1)
+
+        ttk.Label(mc_f, text="NCO Frequency (MHz)").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self._vars["soc_if_test"] = tk.StringVar(value="1090")
+        ttk.Entry(mc_f, textvariable=self._vars["soc_if_test"], width=12).grid(
+            row=0, column=1, sticky="ew", padx=5, pady=3)
+        nco_btn = ttk.Button(mc_f, text="Set", command=self._soc_set_if_test)
+        nco_btn.grid(row=0, column=2, padx=5, pady=3, sticky="ew")
+        self._add_tooltip(
+            nco_btn,
+            "MQTT: {\"task_name\": \"set\", \"arguments\": \"freq_IF <MHz>\"}\n\n"
+            "Tunes the ADC digital mixer (NCO) on all tiles to -freq_IF. "
+            "Also updates the sample rate metadata register. "
+            "Avoid changing during an active sweep.",
+        )
+
+        ttk.Label(mc_f, text="Freq Metadata (MHz)").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        self._vars["soc_freq_metadata"] = tk.StringVar(value="")
+        ttk.Entry(mc_f, textvariable=self._vars["soc_freq_metadata"], width=12).grid(
+            row=1, column=1, sticky="ew", padx=5, pady=3)
+        meta_btn = ttk.Button(mc_f, text="Set", command=self._soc_set_freq_metadata)
+        meta_btn.grid(row=1, column=2, padx=5, pady=3, sticky="ew")
+        self._add_tooltip(
+            meta_btn,
+            "MQTT: {\"task_name\": \"set\", \"arguments\": \"freq_metadata <Hz>\"}\n\n"
+            "Updates the frequency tag written into UDP packet headers, "
+            "independently of the NCO. Used when an external tuner shifts "
+            "the true RF center frequency. Enter MHz; converted to Hz before sending.",
+        )
+
+        self._vars["soc_ch_A"] = tk.BooleanVar(value=False)
+        self._vars["soc_ch_B"] = tk.BooleanVar(value=False)
+        self._vars["soc_ch_C"] = tk.BooleanVar(value=False)
+        self._vars["soc_ch_D"] = tk.BooleanVar(value=False)
+
+        ttk.Label(mc_f, text="Active Channels").grid(row=2, column=0, sticky="nw", padx=5, pady=(6, 2))
+        cb_row = ttk.Frame(mc_f)
+        cb_row.grid(row=2, column=1, columnspan=2, sticky="w", padx=5, pady=(6, 2))
+        for ch in ("A", "B", "C", "D"):
+            port = RECORDER_CHANNEL_PORTS.get(ch, "?")
+            ttk.Checkbutton(
+                cb_row,
+                text=f"{ch} ({port})",
+                variable=self._vars[f"soc_ch_{ch}"],
+            ).pack(side="left", padx=(0, 10))
+
+        ch_set_btn = ttk.Button(mc_f, text="Set", command=self._soc_set_channels)
+        ch_set_btn.grid(row=3, column=2, sticky="e", padx=5, pady=(2, 2))
+        self._add_tooltip(
+            ch_set_btn,
+            "MQTT: {\"task_name\": \"set\", \"arguments\": \"channel <A,B,...>\"}\n\n"
+            "Sets which ADC channels stream UDP packets. Multiple channels are "
+            "supported (e.g. A,B). Sending this command resets the FPGA control "
+            "register — restart the UDP stream after setting.",
+        )
         # ── UDP Stream ────────────────────────────────────────────────────
         # Controls whether the FPGA ADC-to-UDP IP cores are streaming packets.
         udp_f = ttk.LabelFrame(frame, text="UDP Stream")
-        udp_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        udp_f.grid(row=2, column=0, padx=4, pady=(2, 6), sticky="ew")
         udp_f.columnconfigure(0, weight=1)
         udp_f.columnconfigure(1, weight=1)
 
@@ -3189,87 +3248,6 @@ class MEPGui:
             "Writes CTRL=RESET to all active FPGA ADC-to-UDP IP cores. "
             "Stops packet output immediately. Does not affect the recorder.",
         )
-
-        # ── Frequency Control ─────────────────────────────────────────────
-        freq_f = ttk.LabelFrame(frame, text="Frequency")
-        freq_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="ew")
-        freq_f.columnconfigure(1, weight=1)
-
-        ttk.Label(freq_f, text="NCO Frequency (MHz)").grid(row=0, column=0, sticky="w", padx=5, pady=3)
-        self._vars["soc_if_test"] = tk.StringVar(value="1090")
-        ttk.Entry(freq_f, textvariable=self._vars["soc_if_test"], width=12).grid(
-            row=0, column=1, sticky="ew", padx=5, pady=3)
-        nco_btn = ttk.Button(freq_f, text="Set", command=self._soc_set_if_test)
-        nco_btn.grid(row=0, column=2, padx=5, pady=3, sticky="ew")
-        self._add_tooltip(
-            nco_btn,
-            "MQTT: {\"task_name\": \"set\", \"arguments\": \"freq_IF <MHz>\"}\n\n"
-            "Tunes the ADC digital mixer (NCO) on all tiles to -freq_IF. "
-            "Also updates the sample rate metadata register. "
-            "Avoid changing during an active sweep.",
-        )
-
-        ttk.Label(freq_f, text="Freq Metadata (MHz)").grid(row=1, column=0, sticky="w", padx=5, pady=3)
-        self._vars["soc_freq_metadata"] = tk.StringVar(value="")
-        ttk.Entry(freq_f, textvariable=self._vars["soc_freq_metadata"], width=12).grid(
-            row=1, column=1, sticky="ew", padx=5, pady=3)
-        meta_btn = ttk.Button(freq_f, text="Set", command=self._soc_set_freq_metadata)
-        meta_btn.grid(row=1, column=2, padx=5, pady=3, sticky="ew")
-        self._add_tooltip(
-            meta_btn,
-            "MQTT: {\"task_name\": \"set\", \"arguments\": \"freq_metadata <Hz>\"}\n\n"
-            "Updates the frequency tag written into UDP packet headers, "
-            "independently of the NCO. Used when an external tuner shifts "
-            "the true RF center frequency. Enter MHz; converted to Hz before sending.",
-        )
-        ttk.Label(
-            freq_f,
-            text="\u26a0 Do not change frequency during an active sweep.",
-            foreground="grey", font=("TkDefaultFont", 8),
-        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
-
-        # ── Channel Control ───────────────────────────────────────────────
-        ch_f = ttk.LabelFrame(frame, text="Active Channels")
-        ch_f.grid(row=3, column=0, padx=4, pady=(2, 2), sticky="ew")
-        ch_f.columnconfigure(0, weight=1)
-
-        self._vars["soc_ch_A"] = tk.BooleanVar(value=False)
-        self._vars["soc_ch_B"] = tk.BooleanVar(value=False)
-        self._vars["soc_ch_C"] = tk.BooleanVar(value=False)
-        self._vars["soc_ch_D"] = tk.BooleanVar(value=False)
-        cb_row = ttk.Frame(ch_f)
-        cb_row.grid(row=0, column=0, sticky="w", padx=5, pady=(6, 2))
-        for ch in ("A", "B", "C", "D"):
-            ttk.Checkbutton(cb_row, text=f"  {ch}  ", variable=self._vars[f"soc_ch_{ch}"]).pack(
-                side="left", padx=4)
-        ch_apply_btn = ttk.Button(ch_f, text="Apply Channels", command=self._soc_set_channels)
-        ch_apply_btn.grid(row=1, column=0, sticky="w", padx=5, pady=(2, 2))
-        self._add_tooltip(
-            ch_apply_btn,
-            "MQTT: {\"task_name\": \"set\", \"arguments\": \"channel <A,B,...>\"}\n\n"
-            "Sets which ADC channels stream UDP packets. Multiple channels are "
-            "supported (e.g. A,B). Sending this command resets the FPGA control "
-            "register — restart the UDP stream after applying.",
-        )
-        ttk.Label(
-            ch_f,
-            text="Checkboxes reflect last received status. Applying resets stream — restart after.",
-            foreground="grey", font=("TkDefaultFont", 8),
-        ).grid(row=2, column=0, sticky="w", padx=5, pady=(0, 4))
-
-        # ── Clock Source (informational) ──────────────────────────────────
-        clk_f = ttk.LabelFrame(frame, text="Clock Source")
-        clk_f.grid(row=4, column=0, padx=4, pady=(2, 6), sticky="ew")
-        ttk.Label(
-            clk_f,
-            text=(
-                "Clock source (internal / external) is configured at RFSoC service "
-                "startup via CLI arguments and is not readable or changeable via "
-                "MQTT with the current firmware. Check the rfsoc service launch "
-                "arguments to verify clock configuration."
-            ),
-            foreground="grey", font=("TkDefaultFont", 8), justify="left", wraplength=380,
-        ).pack(padx=8, pady=6, anchor="w")
 
         # Register MQTT → UI
         self.bus.on_status(RFSOC_STATUS_TOPIC,
@@ -5369,7 +5347,11 @@ class MEPGui:
         else:
             channels = []
 
-        self._vars["soc_channels"].set(",".join(channels) if channels else "—")
+        channel_with_ports = [
+            f"{ch} ({RECORDER_CHANNEL_PORTS.get(ch, '?')})"
+            for ch in channels
+        ]
+        self._vars["soc_channels"].set(", ".join(channel_with_ports) if channel_with_ports else "—")
         # Sync channel checkboxes to reflect actual hardware state
         for ch in ("A", "B", "C", "D"):
             key = f"soc_ch_{ch}"
