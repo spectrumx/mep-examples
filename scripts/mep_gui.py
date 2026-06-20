@@ -5538,8 +5538,9 @@ class MEPGui:
 
     def _soc_set_pps_publish_interval(self):
         try:
-            interval_s = int(self._vars["soc_pps_publish_interval_set"].get().strip())
-        except ValueError:
+            raw_value = self._vars["soc_pps_publish_interval_set"].get()
+            interval_s = int(raw_value.strip()) if isinstance(raw_value, str) else int(raw_value)
+        except (TypeError, ValueError):
             logging.error("SOC: invalid PPS publish interval (must be integer seconds)")
             return
         if interval_s < 0:
