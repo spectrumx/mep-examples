@@ -1463,6 +1463,8 @@ class MEPGui:
     def _gps_log_line(self, direction: str, line: str):
         if not hasattr(self, "_gpsd_text"):
             return
+        if self._vars.get("gpsd_stream_state") is not None and self._vars["gpsd_stream_state"].get() != "live":
+            return
         if not self._is_adv_tab_selected("GPS"):
             return
         ts = datetime.datetime.now().strftime("%H:%M:%S")
