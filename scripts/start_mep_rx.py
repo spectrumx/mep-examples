@@ -1024,7 +1024,7 @@ class GPSDMonitor:
 
     def set_watch(self, enable: bool, raw: int = 0):
         if enable:
-            self.send_command(f'?WATCH={{"enable":true,"raw":{int(raw)}}}')
+            self.send_command(f'?WATCH={{"enable":true,"json":true,"raw":{int(raw)}}}')
         else:
             self.send_command('?WATCH={"enable":false}')
 
@@ -1066,7 +1066,7 @@ class GPSDMonitor:
                     self._set("gpsd_conn_status", "Connected", force=True)
                     self._emit_state()
 
-                    init_cmd = '?WATCH={"enable":true,"raw":0};'
+                    init_cmd = '?WATCH={"enable":true,"json":true,"raw":0};'
                     s.sendall((init_cmd + "\n").encode("ascii", errors="ignore"))
                     self._emit_line("TX", init_cmd)
                     self._set("gpsd_watch_state", "enabled raw=0", force=True)
