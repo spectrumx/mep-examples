@@ -3135,7 +3135,7 @@ class MEPGui:
                     row=row, column=2, sticky="w")
 
         # ── Status ────────────────────────────────────────────────────────
-        # Read-only. Updated by live rfsoc/status plus optional periodic query.
+        # Read-only. Updated by live rfsoc/status; Refresh Status forces an explicit re-query.
         st_f = ttk.LabelFrame(frame, text="Current Status")
         st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
         st_f.columnconfigure(1, weight=1)
@@ -3146,17 +3146,11 @@ class MEPGui:
         _ro_row(st_f, 4, "PPS Count",            "soc_pps")
         _ro_row(st_f, 5, "Active Channels",      "soc_channels")
         _ro_row(st_f, 6, "PPS Publish Interval", "soc_pps_publish_interval", "s")
-        self._vars["soc_auto_refresh"] = tk.BooleanVar(value=True)
         ctrl_row = ttk.Frame(st_f)
         ctrl_row.grid(row=7, column=0, columnspan=3, sticky="w", padx=5, pady=(4, 4))
         refresh_btn = ttk.Button(st_f, text="Refresh Status", command=self._soc_refresh)
         refresh_btn = ttk.Button(ctrl_row, text="Refresh Status", command=self._soc_refresh)
         refresh_btn.pack(side="left")
-        ttk.Checkbutton(
-            ctrl_row,
-            text="Auto-refresh (1s, active tab only)",
-            variable=self._vars["soc_auto_refresh"],
-        ).pack(side="left", padx=(12, 0))
         self._add_tooltip(
             refresh_btn,
             "MQTT: {\"task_name\": \"get\", \"arguments\": [\"tlm\"]}\n\n"
@@ -6319,23 +6313,7 @@ class MEPGui:
 
     def _poll_housekeeping(self):
         self._jetson_health_poll()
-        self._soc_poll()
         self.root.after(1000, self._poll_housekeeping)
-
-    def _soc_poll(self):
-        # Optional periodic status query for users who prefer explicit polling.
-        # Passive rfsoc/status pushes still update Current Status regardless.
-        if not self._vars.get("soc_auto_refresh", tk.BooleanVar(value=False)).get():
-            return
-        if not self._adv_frame.winfo_viewable():
-            return
-        try:
-            current = self._adv_nb.index("current")
-            if self._adv_nb.tab(current, "text") != "SOC":
-                return
-        except Exception:
-            return
-        self.bus.rfsoc_get_tlm()
 
 
 # ===== ENTRY POINT ===== #
