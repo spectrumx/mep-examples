@@ -1479,7 +1479,6 @@ class MEPGui:
         self._vars["gpsd_stream_state"].set("live")
 
     def _gps_stream_off(self):
-        self._gps_monitor.set_watch(enable=False)
         self._vars["gpsd_stream_state"].set("paused")
 
     def _gps_send_manual(self):
