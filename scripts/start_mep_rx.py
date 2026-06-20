@@ -63,6 +63,7 @@ AFE_DEFAULT_LOG_RATE_RANGE = (1, 3600)
 # Command and Status Topics
 RFSOC_CMD_TOPIC       = "rfsoc/command"
 RFSOC_STATUS_TOPIC    = "rfsoc/status"
+RFSOC_PLL_CONFIG_TOPIC = "rfsoc/pll_config"
 RECORDER_CMD_TOPIC    = "recorder/command"
 RECORDER_STATUS_TOPIC = "recorder/status"
 TUNER_CMD_TOPIC       = "tuner_control/command"
@@ -1815,18 +1816,22 @@ class MEPBus:
             time.sleep(sleep_s)
         return True
 
-    def publish(self, topic: str, payload_str: str):
+    def publish(self, topic: str, payload_str: str = "", retain: bool = False):
         """Publish a raw string payload to a topic. For debug/manual use."""
         if not self._connected:
             logging.warning("MQTT offline: publish not sent to %s", topic)
             return False
 
-        info = self._client.publish(topic, payload_str)
+        info = self._client.publish(topic, payload_str, retain=retain)
         if info.rc != mqtt_lib.MQTT_ERR_SUCCESS:
             self._last_error = f"publish rc={info.rc}"
             logging.warning("MQTT publish failed: topic=%s rc=%s", topic, info.rc)
             return False
         return True
+
+    def clear_retained(self, topic: str):
+        """Clear the retained message for a topic by publishing empty retained payload."""
+        return self.publish(topic, payload_str="", retain=True)
 
     def disconnect(self):
         if self._loop_started:
@@ -1865,6 +1870,24 @@ class MEPBus:
     def rfsoc_set_if(self, if_mhz: float):
         """Set RFSoC IF frequency in MHz."""
         self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {if_mhz}"})
+
+    def rfsoc_set_pps_publish_interval(self, interval_s: int):
+        """Set RFSoC PPS status publish interval in seconds (0 disables periodic PPS publish)."""
+        self.publish_command(
+            RFSOC_CMD_TOPIC,
+            {"task_name": "set_pps_publish_interval", "arguments": int(interval_s)},
+        )
+
+    def rfsoc_get_pll_config(self, converter: str, tile: int):
+        """Query RFSoC PLL configuration for converter ('adc'|'dac') and tile index."""
+        converter_norm = str(converter).strip().lower()
+        if converter_norm not in ("adc", "dac"):
+            raise ValueError(f"converter must be 'adc' or 'dac', got {converter!r}")
+        self.publish_command(
+            RFSOC_CMD_TOPIC,
+            {"task_name": "get", "arguments": f"pll_config {converter_norm} {int(tile)}"},
+            sleep_s=0,
+        )
 
     def rfsoc_set_tx_center_freq(self, freq_mhz: float):
         """Set TX DAC RFDC mixer/NCO center frequency on all TX channels."""

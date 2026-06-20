@@ -62,6 +62,7 @@ from start_mep_rx import (
     AFE_DEFAULT_LOG_RATE_S,
     AFE_DEFAULT_LOG_RATE_RANGE,
     RFSOC_CMD_TOPIC,
+    RFSOC_PLL_CONFIG_TOPIC,
     RECORDER_CMD_TOPIC,
     RECORDER_STATUS_TOPIC,
     TUNER_CMD_TOPIC,
@@ -388,6 +389,7 @@ class MEPGui:
         self.bus.on_status(RFSOC_STATUS_TOPIC, self._on_rfsoc_status)
         self.bus.on_status(RFSOC_STATUS_TOPIC, lambda data: self._gui_call(self._soc_apply, data))
         self.bus.on_status(RFSOC_STATUS_TOPIC, lambda data: self._gui_call(self._tx_apply, data))
+        self.bus.on_status(RFSOC_PLL_CONFIG_TOPIC, lambda data: self._gui_call(self._soc_apply_pll_config, data))
         self.bus.on_status(TUNER_STATUS_TOPIC, self._on_tuner_status)
         self.bus.on_status(TUNER_STATUS_TOPIC, lambda data: self._gui_call(self._tun_refresh))
         self.bus.on_status(TUNER_RESPONSE_TOPIC, lambda data: self._gui_call(self._tun_handle_response, data) if "task_name" in data and "value" in data else None)
@@ -3133,7 +3135,7 @@ class MEPGui:
                     row=row, column=2, sticky="w")
 
         # ── Status ────────────────────────────────────────────────────────
-        # Read-only. Auto-refreshed whenever the RFSoC publishes to rfsoc/status.
+        # Read-only. Updated by live rfsoc/status plus optional periodic query.
         st_f = ttk.LabelFrame(frame, text="Current Status")
         st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
         st_f.columnconfigure(1, weight=1)
@@ -3143,13 +3145,23 @@ class MEPGui:
         _ro_row(st_f, 3, "Sample Rate",          "soc_fs",  "MHz")
         _ro_row(st_f, 4, "PPS Count",            "soc_pps")
         _ro_row(st_f, 5, "Active Channels",      "soc_channels")
+        _ro_row(st_f, 6, "PPS Publish Interval", "soc_pps_publish_interval", "s")
+        self._vars["soc_auto_refresh"] = tk.BooleanVar(value=True)
+        ctrl_row = ttk.Frame(st_f)
+        ctrl_row.grid(row=7, column=0, columnspan=3, sticky="w", padx=5, pady=(4, 4))
         refresh_btn = ttk.Button(st_f, text="Refresh Status", command=self._soc_refresh)
-        refresh_btn.grid(row=6, column=0, columnspan=3, sticky="w", padx=5, pady=(4, 4))
+        refresh_btn = ttk.Button(ctrl_row, text="Refresh Status", command=self._soc_refresh)
+        refresh_btn.pack(side="left")
+        ttk.Checkbutton(
+            ctrl_row,
+            text="Auto-refresh (1s, active tab only)",
+            variable=self._vars["soc_auto_refresh"],
+        ).pack(side="left", padx=(12, 0))
         self._add_tooltip(
             refresh_btn,
             "MQTT: {\"task_name\": \"get\", \"arguments\": [\"tlm\"]}\n\n"
             "Requests the RFSoC to re-publish its current state to rfsoc/status. "
-            "Status also auto-updates on every RFSoC event.",
+            "Status also updates passively on every RFSoC event.",
         )
 
         # ── Manual Control ────────────────────────────────────────────────
@@ -3185,14 +3197,27 @@ class MEPGui:
             "the true RF center frequency. Enter MHz; converted to Hz before sending.",
         )
 
+        ttk.Label(mc_f, text="PPS Publish Interval (s)").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        self._vars["soc_pps_publish_interval_set"] = tk.IntVar(value=30)
+        ttk.Entry(mc_f, textvariable=self._vars["soc_pps_publish_interval_set"], width=12).grid(
+            row=2, column=1, sticky="ew", padx=5, pady=3)
+        pps_pub_btn = ttk.Button(mc_f, text="Set", command=self._soc_set_pps_publish_interval)
+        pps_pub_btn.grid(row=2, column=2, padx=5, pady=3, sticky="ew")
+        self._add_tooltip(
+            pps_pub_btn,
+            "MQTT: {\"task_name\": \"set_pps_publish_interval\", \"arguments\": <seconds>}\n\n"
+            "Sets periodic PPS-status publish interval on RFSoC. "
+            "Use 0 to disable periodic PPS publish.",
+        )
+
         self._vars["soc_ch_A"] = tk.BooleanVar(value=False)
         self._vars["soc_ch_B"] = tk.BooleanVar(value=False)
         self._vars["soc_ch_C"] = tk.BooleanVar(value=False)
         self._vars["soc_ch_D"] = tk.BooleanVar(value=False)
 
-        ttk.Label(mc_f, text="Active Channels").grid(row=2, column=0, sticky="nw", padx=5, pady=(6, 2))
+        ttk.Label(mc_f, text="Channels").grid(row=4, column=0, sticky="nw", padx=5, pady=(6, 2))
         cb_row = ttk.Frame(mc_f)
-        cb_row.grid(row=2, column=1, columnspan=2, sticky="w", padx=5, pady=(6, 2))
+        cb_row.grid(row=4, column=1, columnspan=2, sticky="w", padx=5, pady=(6, 2))
         for i, ch in enumerate(("A", "B", "C", "D")):
             port = RECORDER_CHANNEL_PORTS.get(ch, "?")
             cb = ttk.Checkbutton(
@@ -3203,7 +3228,7 @@ class MEPGui:
             cb.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 12), pady=(0, 2))
 
         ch_set_btn = ttk.Button(mc_f, text="Set", command=self._soc_set_channels)
-        ch_set_btn.grid(row=2, column=2, sticky="se", padx=5, pady=(6, 2))
+        ch_set_btn.grid(row=4, column=2, sticky="se", padx=5, pady=(6, 2))
         self._add_tooltip(
             ch_set_btn,
             "MQTT: {\"task_name\": \"set\", \"arguments\": \"channel <A,B,...>\"}\n\n"
@@ -3215,7 +3240,7 @@ class MEPGui:
             mc_f,
             text="remember to 'set' desired changes before pressing 'start'",
             foreground="grey", font=("TkDefaultFont", 8),
-        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
+        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
         # ── UDP Stream ────────────────────────────────────────────────────
         # Controls whether the FPGA ADC-to-UDP IP cores are streaming packets.
         udp_f = ttk.LabelFrame(frame, text="UDP Stream")
@@ -3264,6 +3289,59 @@ class MEPGui:
         cached = self.bus.get_cached_status(RFSOC_STATUS_TOPIC)
         if isinstance(cached, dict):
             self._soc_apply(cached)
+
+        # ── PLL Query ───────────────────────────────────────────────────────
+        pll_f = ttk.LabelFrame(frame, text="PLL Query")
+        pll_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        pll_f.columnconfigure(0, weight=1)
+
+        btn_row = ttk.Frame(pll_f)
+        btn_row.grid(row=0, column=0, sticky="ew", padx=5, pady=(4, 1))
+        for i in range(6):
+            btn_row.columnconfigure(i, weight=1)
+
+        buttons = [
+            ("ADC 1", "adc", 0),
+            ("ADC 2", "adc", 1),
+            ("ADC 3", "adc", 2),
+            ("ADC 4", "adc", 3),
+            ("DAC 1", "dac", 0),
+            ("DAC 2", "dac", 1),
+        ]
+        for col, (label, conv, tile) in enumerate(buttons):
+            ttk.Button(
+                btn_row,
+                text=label,
+                command=lambda c=conv, t=tile: self._soc_query_pll(c, t),
+            ).grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 4, 0), pady=0)
+
+        self._vars["soc_pll_last_query"] = tk.StringVar(value="")
+        ttk.Label(
+            pll_f,
+            textvariable=self._vars["soc_pll_last_query"],
+            foreground="grey",
+            font=("TkDefaultFont", 8),
+        ).grid(row=1, column=0, sticky="w", padx=5, pady=(0, 1))
+
+        self._soc_pll_text = scrolledtext.ScrolledText(
+            pll_f,
+            height=4,
+            wrap="word",
+            font=("TkFixedFont", 9),
+            background="#f5f5f5",
+            exportselection=False,
+        )
+        self._soc_pll_text.grid(row=2, column=0, sticky="ew", padx=5, pady=(0, 4))
+        self._soc_pll_text.insert("1.0", "No PLL data yet. Click a query button.\n")
+        self._bind_copy_menu(self._soc_pll_text, allow_paste=False)
+
+        pll_cached = self.bus.get_cached_status(RFSOC_PLL_CONFIG_TOPIC)
+        if isinstance(pll_cached, dict):
+            self._soc_apply_pll_config(pll_cached)
+
+        # Shift rows below PLL section
+        mc_f.grid_configure(row=2)
+        udp_f.grid_configure(row=3)
 
         # ---- TX tab ---- #
 
@@ -5344,6 +5422,8 @@ class MEPGui:
         self._vars["soc_fif"].set(f"{f_if_hz/1e6:.3f}")
         self._vars["soc_fs"].set(f"{f_s_hz/1e6:.3f}")
         self._vars["soc_pps"].set(str(tlm.get("pps_count", "—")))
+        interval = tlm.get("pps_publish_interval", tlm.get("pps_publish_interval_s", "—"))
+        self._vars["soc_pps_publish_interval"].set(str(interval) if interval is not None else "—")
 
         raw_channels = tlm.get("channels", [])
         if isinstance(raw_channels, str):
@@ -5360,6 +5440,31 @@ class MEPGui:
         self._vars["soc_channels"].set(", ".join(channel_with_ports) if channel_with_ports else "—")
         # Manual Control checkboxes are staged user intent and intentionally do
         # not mirror live hardware state; Current Status above is the source of truth.
+
+    def _soc_query_pll(self, converter: str, tile: int):
+        try:
+            self.bus.rfsoc_get_pll_config(converter, tile)
+        except Exception as e:
+            logging.error(f"SOC: PLL query failed ({converter} tile {tile}): {e}")
+            return
+        label = f"{str(converter).upper()} {tile}"
+        if "soc_pll_last_query" in self._vars:
+            self._vars["soc_pll_last_query"].set(f"Requested: {label}")
+        logging.info("SOC: requested PLL config for %s", label)
+
+    def _soc_apply_pll_config(self, data: dict):
+        if not isinstance(data, dict):
+            return
+        # Listener is registered globally, but SOC widgets are lazy-built.
+        if not hasattr(self, "_soc_pll_text"):
+            return
+        if "soc_pll_last_query" in self._vars:
+            conv = str(data.get("converter_type", "?")).upper()
+            tile = data.get("tile", "?")
+            self._vars["soc_pll_last_query"].set(f"Last reply: {conv} {tile}")
+        pretty = json.dumps(data, indent=2, sort_keys=True)
+        self._soc_pll_text.delete("1.0", "end")
+        self._soc_pll_text.insert("end", pretty)
 
     def _soc_start_stream(self):
         mode = self._vars["soc_start_mode"].get()
@@ -5396,6 +5501,18 @@ class MEPGui:
         freq_hz = freq_mhz * 1e6
         self.bus.rfsoc_set_freq_metadata(freq_hz)
         logging.info(f"SOC: set freq_metadata {freq_hz:.0f} Hz sent")
+
+    def _soc_set_pps_publish_interval(self):
+        try:
+            interval_s = int(self._vars["soc_pps_publish_interval_set"].get().strip())
+        except ValueError:
+            logging.error("SOC: invalid PPS publish interval (must be integer seconds)")
+            return
+        if interval_s < 0:
+            logging.error("SOC: PPS publish interval must be >= 0 seconds")
+            return
+        self.bus.rfsoc_set_pps_publish_interval(interval_s)
+        logging.info("SOC: set_pps_publish_interval %d sent", interval_s)
 
     def _soc_set_channels(self):
         selected = [ch for ch in ("A", "B", "C", "D") if self._vars[f"soc_ch_{ch}"].get()]
@@ -6202,7 +6319,23 @@ class MEPGui:
 
     def _poll_housekeeping(self):
         self._jetson_health_poll()
+        self._soc_poll()
         self.root.after(1000, self._poll_housekeeping)
+
+    def _soc_poll(self):
+        # Optional periodic status query for users who prefer explicit polling.
+        # Passive rfsoc/status pushes still update Current Status regardless.
+        if not self._vars.get("soc_auto_refresh", tk.BooleanVar(value=False)).get():
+            return
+        if not self._adv_frame.winfo_viewable():
+            return
+        try:
+            current = self._adv_nb.index("current")
+            if self._adv_nb.tab(current, "text") != "SOC":
+                return
+        except Exception:
+            return
+        self.bus.rfsoc_get_tlm()
 
 
 # ===== ENTRY POINT ===== #
