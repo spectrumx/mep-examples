@@ -3295,12 +3295,12 @@ class MEPGui:
             btn_row.columnconfigure(i, weight=1)
 
         buttons = [
-            ("ADC 1", "adc", 0),
-            ("ADC 2", "adc", 1),
-            ("ADC 3", "adc", 2),
-            ("ADC 4", "adc", 3),
-            ("DAC 1", "dac", 0),
-            ("DAC 2", "dac", 1),
+            ("ADC 0", "adc", 0),
+            ("ADC 1", "adc", 1),
+            ("ADC 2", "adc", 2),
+            ("ADC 3", "adc", 3),
+            ("DAC 0", "dac", 0),
+            ("DAC 1", "dac", 1),
         ]
         for col, (label, conv, tile) in enumerate(buttons):
             ttk.Button(
