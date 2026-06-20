@@ -3289,33 +3289,39 @@ class MEPGui:
         pll_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
         pll_f.columnconfigure(0, weight=1)
 
-        btn_row = ttk.Frame(pll_f)
-        btn_row.grid(row=0, column=0, sticky="ew", padx=5, pady=(4, 1))
-        for i in range(6):
-            btn_row.columnconfigure(i, weight=1)
+        ctl_row = ttk.Frame(pll_f)
+        ctl_row.grid(row=0, column=0, sticky="ew", padx=5, pady=(4, 1))
+        ctl_row.columnconfigure(1, weight=1)
+        ctl_row.columnconfigure(3, weight=1)
 
-        buttons = [
-            ("ADC 0", "adc", 0),
-            ("ADC 1", "adc", 1),
-            ("ADC 2", "adc", 2),
-            ("ADC 3", "adc", 3),
-            ("DAC 0", "dac", 0),
-            ("DAC 1", "dac", 1),
-        ]
-        for col, (label, conv, tile) in enumerate(buttons):
-            ttk.Button(
-                btn_row,
-                text=label,
-                command=lambda c=conv, t=tile: self._soc_query_pll(c, t),
-            ).grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 4, 0), pady=0)
+        ttk.Label(ctl_row, text="Converter").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=0)
+        self._vars["soc_pll_converter"] = tk.StringVar(value="ADC")
+        ttk.Combobox(
+            ctl_row,
+            textvariable=self._vars["soc_pll_converter"],
+            values=["ADC", "DAC"],
+            state="readonly",
+            width=8,
+        ).grid(row=0, column=1, sticky="w", padx=(0, 8), pady=0)
 
-        self._vars["soc_pll_last_query"] = tk.StringVar(value="")
-        ttk.Label(
-            pll_f,
-            textvariable=self._vars["soc_pll_last_query"],
-            foreground="grey",
-            font=("TkDefaultFont", 8),
-        ).grid(row=1, column=0, sticky="w", padx=5, pady=(0, 1))
+        ttk.Label(ctl_row, text="Tile").grid(row=0, column=2, sticky="w", padx=(0, 4), pady=0)
+        self._vars["soc_pll_tile"] = tk.StringVar(value="0")
+        ttk.Combobox(
+            ctl_row,
+            textvariable=self._vars["soc_pll_tile"],
+            values=["0", "1", "2", "3"],
+            state="readonly",
+            width=8,
+        ).grid(row=0, column=3, sticky="w", padx=(0, 8), pady=0)
+
+        ttk.Button(
+            ctl_row,
+            text="Query",
+            command=lambda: self._soc_query_pll(
+                self._vars["soc_pll_converter"].get().lower(),
+                int(self._vars["soc_pll_tile"].get()),
+            ),
+        ).grid(row=0, column=4, sticky="e", pady=0)
 
         self._soc_pll_text = scrolledtext.ScrolledText(
             pll_f,
@@ -3325,13 +3331,9 @@ class MEPGui:
             background="#f5f5f5",
             exportselection=False,
         )
-        self._soc_pll_text.grid(row=2, column=0, sticky="ew", padx=5, pady=(0, 4))
-        self._soc_pll_text.insert("1.0", "No PLL data yet. Click a query button.\n")
+        self._soc_pll_text.grid(row=1, column=0, sticky="ew", padx=5, pady=(1, 4))
+        self._soc_pll_text.insert("1.0", "No PLL data yet. Choose converter/tile and click Query.\n")
         self._bind_copy_menu(self._soc_pll_text, allow_paste=False)
-
-        pll_cached = self.bus.get_cached_status(RFSOC_PLL_CONFIG_TOPIC)
-        if isinstance(pll_cached, dict):
-            self._soc_apply_pll_config(pll_cached)
 
         # Shift rows below PLL section
         mc_f.grid_configure(row=2)
@@ -5436,15 +5438,41 @@ class MEPGui:
         # not mirror live hardware state; Current Status above is the source of truth.
 
     def _soc_query_pll(self, converter: str, tile: int):
+        if hasattr(self, "_soc_pll_text"):
+            self._soc_pll_text.delete("1.0", "end")
+
+        after_id = getattr(self, "_soc_pll_after_id", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self._soc_pll_after_id = None
+        self._soc_pll_pending = (str(converter).lower(), int(tile))
+
         try:
             self.bus.rfsoc_get_pll_config(converter, tile)
         except Exception as e:
+            self._soc_pll_pending = None
             logging.error(f"SOC: PLL query failed ({converter} tile {tile}): {e}")
             return
         label = f"{str(converter).upper()} {tile}"
-        if "soc_pll_last_query" in self._vars:
-            self._vars["soc_pll_last_query"].set(f"Requested: {label}")
+        self._soc_pll_after_id = self.root.after(
+            2000,
+            lambda c=str(converter).lower(), t=int(tile): self._soc_pll_query_timeout(c, t),
+        )
         logging.info("SOC: requested PLL config for %s", label)
+
+    def _soc_pll_query_timeout(self, converter: str, tile: int):
+        pending = getattr(self, "_soc_pll_pending", None)
+        self._soc_pll_after_id = None
+        if pending != (converter, tile):
+            return
+        self._soc_pll_pending = None
+        if hasattr(self, "_soc_pll_text"):
+            self._soc_pll_text.delete("1.0", "end")
+            self._soc_pll_text.insert("end", "Blank reply, not enabled in bitstream")
+        logging.info("SOC: no PLL reply for %s %s", converter.upper(), tile)
 
     def _soc_apply_pll_config(self, data: dict):
         if not isinstance(data, dict):
@@ -5452,10 +5480,22 @@ class MEPGui:
         # Listener is registered globally, but SOC widgets are lazy-built.
         if not hasattr(self, "_soc_pll_text"):
             return
-        if "soc_pll_last_query" in self._vars:
-            conv = str(data.get("converter_type", "?")).upper()
-            tile = data.get("tile", "?")
-            self._vars["soc_pll_last_query"].set(f"Last reply: {conv} {tile}")
+        converter = str(data.get("converter_type", "")).lower()
+        try:
+            tile = int(data.get("tile"))
+        except (TypeError, ValueError):
+            return
+        pending = getattr(self, "_soc_pll_pending", None)
+        if pending != (converter, tile):
+            return
+        after_id = getattr(self, "_soc_pll_after_id", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self._soc_pll_after_id = None
+        self._soc_pll_pending = None
         pretty = json.dumps(data, indent=2, sort_keys=True)
         self._soc_pll_text.delete("1.0", "end")
         self._soc_pll_text.insert("end", pretty)
