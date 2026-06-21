@@ -1078,32 +1078,22 @@ class MEPGui:
                 level = "yellow"
             else:
                 level = "green"
-            rec_detail_parts = [f"state={rec_state}"]
-            if isinstance(tuner_norm, dict):
-                rec_tuner = tuner_norm.get("name") or selected_tuner
-                rec_tuner_state = str(tuner_norm.get("state", "unknown")).lower()
-                rec_detail_parts.append(f"tuner={rec_tuner} ({rec_tuner_state})")
-            if isinstance(tlm, dict):
-                rec_rfsoc_state = str(tlm.get("state", "?")).lower()
-                rec_detail_parts.append(f"rfsoc={rec_rfsoc_state}")
+            rec_output_path = rec_status.get("output_path", "?")
+            rec_timestamp = rec_status.get("timestamp")
+            if isinstance(rec_timestamp, (int, float)):
+                rec_timestamp_txt = datetime.datetime.fromtimestamp(rec_timestamp).isoformat(sep=" ", timespec="seconds")
+            else:
+                rec_timestamp_txt = str(rec_timestamp) if rec_timestamp is not None else "?"
             self._set_status_cell(
                 "recorder",
                 level,
                 rec_state,
-                detail=", ".join(rec_detail_parts),
+                detail=f"state={rec_state}, output_path={rec_output_path}, timestamp={rec_timestamp_txt}",
             )
         else:
             sweep_active = self._sweep_thread and self._sweep_thread.is_alive()
             if sweep_active:
-                rec_detail_parts = ["Sweep active, waiting for recorder status"]
-                if isinstance(tuner_norm, dict):
-                    rec_tuner = tuner_norm.get("name") or selected_tuner
-                    rec_tuner_state = str(tuner_norm.get("state", "unknown")).lower()
-                    rec_detail_parts.append(f"tuner={rec_tuner} ({rec_tuner_state})")
-                if isinstance(tlm, dict):
-                    rec_rfsoc_state = str(tlm.get("state", "?")).lower()
-                    rec_detail_parts.append(f"rfsoc={rec_rfsoc_state}")
-                self._set_status_cell("recorder", "yellow", "starting", detail=", ".join(rec_detail_parts))
+                self._set_status_cell("recorder", "yellow", "starting", detail="Sweep active, waiting for recorder status")
             else:
                 level = "yellow" if mqtt_ok else "red"
                 self._set_status_cell("recorder", level, "no data", detail="No recorder status in cache")
