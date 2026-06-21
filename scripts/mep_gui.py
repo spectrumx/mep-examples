@@ -1022,16 +1022,17 @@ class MEPGui:
         tlm = self.bus.get_cached_status(RFSOC_STATUS_TOPIC)
         if isinstance(tlm, dict):
             state = str(tlm.get("state", "?")).lower()
-            f_c_hz = self._safe_float(tlm.get("f_c_hz"), 0.0)
-            f_c_mhz = f_c_hz / 1e6
+            f_if_hz = self._safe_float(tlm.get("f_if_hz"), 0.0)
+            f_if_mhz = f_if_hz / 1e6
+            f_if_mhz_rounded = round(f_if_mhz)
             bad_states = {"error", "offline", "disconnected", "fault"}
             level = "red" if state in bad_states else "green"
             pps = tlm.get("pps_count", "?")
             self._set_status_cell(
                 "rfsoc",
                 level,
-                f"{state} {f_c_mhz:.1f}MHz",
-                detail=f"state={state}, f_c={f_c_mhz:.3f} MHz, pps={pps}",
+                state,
+                detail=f"state={state}, f_if_hz={f_if_hz}, pps={pps}",
             )
         else:
             level = "yellow" if mqtt_ok else "red"
@@ -1059,7 +1060,7 @@ class MEPGui:
             self._set_status_cell(
                 "tuner",
                 level,
-                f"{active_tuner} {lo_txt}",
+                active_tuner,
                 detail=f"state={t_state}, active={active_tuner}, {lo_txt} MHz",
             )
         elif str(selected_tuner).lower() == "none":
@@ -1077,16 +1078,32 @@ class MEPGui:
                 level = "yellow"
             else:
                 level = "green"
+            rec_detail_parts = [f"state={rec_state}"]
+            if isinstance(tuner_norm, dict):
+                rec_tuner = tuner_norm.get("name") or selected_tuner
+                rec_tuner_state = str(tuner_norm.get("state", "unknown")).lower()
+                rec_detail_parts.append(f"tuner={rec_tuner} ({rec_tuner_state})")
+            if isinstance(tlm, dict):
+                rec_rfsoc_state = str(tlm.get("state", "?")).lower()
+                rec_detail_parts.append(f"rfsoc={rec_rfsoc_state}")
             self._set_status_cell(
                 "recorder",
                 level,
                 rec_state,
-                detail=f"state={rec_state}",
+                detail=", ".join(rec_detail_parts),
             )
         else:
             sweep_active = self._sweep_thread and self._sweep_thread.is_alive()
             if sweep_active:
-                self._set_status_cell("recorder", "yellow", "starting", detail="Sweep active, waiting for recorder status")
+                rec_detail_parts = ["Sweep active, waiting for recorder status"]
+                if isinstance(tuner_norm, dict):
+                    rec_tuner = tuner_norm.get("name") or selected_tuner
+                    rec_tuner_state = str(tuner_norm.get("state", "unknown")).lower()
+                    rec_detail_parts.append(f"tuner={rec_tuner} ({rec_tuner_state})")
+                if isinstance(tlm, dict):
+                    rec_rfsoc_state = str(tlm.get("state", "?")).lower()
+                    rec_detail_parts.append(f"rfsoc={rec_rfsoc_state}")
+                self._set_status_cell("recorder", "yellow", "starting", detail=", ".join(rec_detail_parts))
             else:
                 level = "yellow" if mqtt_ok else "red"
                 self._set_status_cell("recorder", level, "no data", detail="No recorder status in cache")
