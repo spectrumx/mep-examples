@@ -5404,7 +5404,7 @@ class MEPGui:
 
     def _soc_refresh(self):
         threading.Thread(
-            target=self.bus.rfsoc_get_tlm,
+            target=self.bus.rfsoc_status,
             daemon=True,
         ).start()
 
@@ -5598,11 +5598,9 @@ class MEPGui:
             logging.error("TX: invalid staged value; start/update aborted")
             return
         channel = self._vars["tx_channel"].get().strip()
-        try:
-            self.tx.tx_start(channel, center_mhz, offset_mhz, amplitude)
-        except ValueError as e:
-            self._vars["tx_action_status"].set(f"Rejected: {e}")
-            logging.error(f"TX: {e}")
+        if not self.tx.tx_start(channel, center_mhz, offset_mhz, amplitude):
+            self._vars["tx_action_status"].set("Failed to start TX")
+            logging.error("TX: start failed")
             return
         self._vars["tx_action_status"].set(
             f"Start/Update sent (channel={channel})")
@@ -6387,11 +6385,6 @@ def main():
                 app.tx.tx_stop()
         except Exception as e:
             logging.debug(f"Exception stopping TX during cleanup: {e}")
-        try:
-            if getattr(app, "capture", None) is not None:
-                app.capture.stop_recorder()
-        except Exception as e:
-            logging.debug(f"Exception stopping recorder during cleanup: {e}")
         try:
             app._spec_is_active = False
             app._spec_stop_render_loop()

@@ -1851,6 +1851,10 @@ class MEPBus:
         """Request RFSoC telemetry publish on rfsoc/status."""
         self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "get", "arguments": ["tlm"]}, sleep_s=0)
 
+    def rfsoc_status(self):
+        """Request RFSoC status refresh via status task."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "status", "arguments": {}})
+
     def rfsoc_capture_next_pps(self):
         """Arm capture on next PPS edge."""
         self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "capture_next_pps"})
@@ -1916,6 +1920,14 @@ class MEPBus:
                 f"TX channel must be one of {list(TX_CHANNEL_OPTIONS)}, got {channel_list!r}"
             )
         self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"tx_channel {channel_list}"})
+
+    def rfsoc_tx_start(self):
+        """Send explicit TX start command to RFSoC."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "tx_start"})
+
+    def rfsoc_tx_stop(self):
+        """Send explicit TX stop command to RFSoC."""
+        self.publish_command(RFSOC_CMD_TOPIC, {"task_name": "tx_stop"})
 
     # ------------------------------------------------------------------ #
     #  Tuner                                                               #
@@ -3314,47 +3326,36 @@ class TxController:
                  offset_freq_mhz: float, amplitude_bins: int) -> bool:
         """Apply staged TX settings and begin (or update) transmission.
 
-        Emission is a side effect of the firmware's per-parameter `set` commands,
-        which have no atomic "apply then enable" verb and seed a full-scale default
-        amplitude. To stay safe this programs hardware in a deliberate order: force
-        TX off first (so a stale full-scale default cannot radiate while we load
-        values), program center / amplitude / offset while nothing is selected, then
-        select the channel LAST as the single deliberate moment emission begins.
-        Calling this while already transmitting re-applies cleanly (the GUI's
-        Start/Update). Selecting channel "None" is equivalent to a stop.
-
-        Raises ValueError (from the bus) if any staged value is out of hardware range;
-        because the channel is left deselected until the final step, a mid-sequence
-        validation failure leaves TX off.
-
-        TODO: a firmware-side tx_enable/tx_disable (or an atomic tx_start that applies
-        all params then enables) would remove this ordering dance and the full-scale
-        default hazard; this routine is a client-side workaround until then.
+        Sets the TX parameters (center freq, amplitude, offset freq) then calls
+        the explicit tx_start task, which the firmware now handles atomically.
         """
         if not self._require_mqtt("start TX"):
             return False
-        self.bus.rfsoc_set_tx_channel("None")
-        self.bus.rfsoc_set_tx_center_freq(center_freq_mhz)
-        self.bus.rfsoc_set_tx_amplitude(amplitude_bins)
-        self.bus.rfsoc_set_tx_offset_freq(offset_freq_mhz)
-        self.bus.rfsoc_set_tx_channel(channel)
-        logging.info(
-            "TX start/update: channel=%s center=%.3f MHz offset=%.3f MHz amplitude=%d bins",
-            channel, center_freq_mhz, offset_freq_mhz, amplitude_bins,
-        )
-        return True
+        try:
+            self.bus.rfsoc_set_tx_center_freq(center_freq_mhz)
+            self.bus.rfsoc_set_tx_amplitude(amplitude_bins)
+            self.bus.rfsoc_set_tx_offset_freq(offset_freq_mhz)
+            self.bus.rfsoc_set_tx_channel(channel)
+            self.bus.rfsoc_tx_start()
+            logging.info(
+                "TX start/update: channel=%s center=%.3f MHz offset=%.3f MHz amplitude=%d bins",
+                channel, center_freq_mhz, offset_freq_mhz, amplitude_bins,
+            )
+            return True
+        except ValueError as e:
+            logging.error(f"TX start failed: {e}")
+            return False
 
     def tx_stop(self) -> bool:
         """Disable all TX output (authoritative hardware-off).
 
-        Publishes `tx_channel None`, which the firmware treats as the master TX
-        disable (zeroes amplitude and clears ENABLE on every function generator).
+        Publishes the explicit tx_stop command to the firmware.
         Idempotent and safe to call at any time, including shutdown.
         """
         if not self._require_mqtt("stop TX"):
             return False
-        self.bus.rfsoc_set_tx_channel("None")
-        logging.info("TX stop: all function generators disabled")
+        self.bus.rfsoc_tx_stop()
+        logging.info("TX stop: sent to firmware")
         return True
 
 
