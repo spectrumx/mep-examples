@@ -4144,21 +4144,6 @@ class MEPGui:
 
         self._vars["sg_digital_rf"] = tk.BooleanVar(value=False)
         self._vars["sg_metadata"] = tk.BooleanVar(value=False)
-        self._drf_metadata_lock = False
-
-        def _sync_drf_metadata(*_):
-            if self._drf_metadata_lock:
-                return
-            self._drf_metadata_lock = True
-            try:
-                val = bool(self._vars["sg_digital_rf"].get())
-                self._vars["sg_digital_rf"].set(val)
-                self._vars["sg_metadata"].set(val)
-            finally:
-                self._drf_metadata_lock = False
-
-        self._vars["sg_digital_rf"].trace_add("write", _sync_drf_metadata)
-        self._vars["sg_metadata"].trace_add("write", _sync_drf_metadata)
 
         cb_drf = ttk.Checkbutton(
             drf_frame,
