@@ -151,11 +151,11 @@ if __name__ == '__main__':
   #
   cmdList = ["ubxtool -e BINARY ",    # 1st
              "ubxtool -d NMEA   ",    # 2nd
-             "ubxtool -d BEIDOU ",
-             "ubxtool -d GALILEO",
-             "ubxtool -d GLONASS",
-             "ubxtool -d SBAS   ",
              "ubxtool -e GPS    ",
+             "ubxtool -e BEIDOU ",
+             "ubxtool -e GALILEO",
+             "ubxtool -e GLONASS",
+             "ubxtool -e SBAS   ",
              "ubxtool -e RAWX   ",
              "ubxtool -e SFRBX  ",
              "ubxtool -z CFG-UART1-BAUDRATE,1350000 ", # the fastest the rp2040 can handle
@@ -170,7 +170,7 @@ if __name__ == '__main__':
              "ubxtool -z CFG-TP-LEN_TP2,100       ",
              "ubxtool -z CFG-TP-LEN_LOCK_TP2,1000 ",
              "ubxtool -z CFG-TP-ANT_CABLEDELAY,%d "%(cable_delay),  # antenna
-             "ubxtool -p MODEL,0",  # Dynamic platform model preset, 0=mobile, 1=stationary
+             "ubxtool -p MODEL,0",  # Dynamic platform model preset, 0=mobile, 1(or 2?)=stationary
              #"ubxtool -z CFG-TP-DRSTR_TP1,%d"%(drstr),              # coded driver strength
              #"ubxtool -z CFG-TP-DRSTR_TP2,%d"%(drstr),
          ]
