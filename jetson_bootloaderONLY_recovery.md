@@ -3,20 +3,25 @@
 
 ---
 
-## Prerequisites
-- x86_64 Ubuntu host
-- Jetson Orin NX connected via USB-C
-- Jetson in recovery mode (short out leads on 'recovery' 2-pin port, then power on)
-
-Confirm Jetson is visible in recovery mode on host:
-```bash
-lsusb | grep -i nvidia
-# Should show: NVidia Corp. APX
-```
+## 0. Prerequisites
+- USB-C to USB-A cable
+- [Host PC] with Ubuntu 24.04 (Noble) OS
+- [MEP] with Jetson Orin NX (The OS SSD does *NOT* need to be plugged in at all)
 
 ---
 
-## 1. Install dependencies
+## 1. Physical Setup
+1. Plug USB-C into MEP Jetson (while powered off) -> USB-A into any x86_64 Ubuntu host. Ubuntu 24.04 (Noble) is known to work.
+2. Put Jetson into recovery mode, by shorting out the leads on the 'recovery' 2-pin port, then power on the Jetson
+
+On the host, confirm Jetson is visible in recovery mode:
+```bash
+lsusb | grep -i nvidia
+# Should show: NVIDIA Corp. APX
+```
+---
+
+## 2. (On the Host PC) Install dependencies
 
 ```bash
 sudo apt update
@@ -25,7 +30,7 @@ sudo apt install -y qemu-user-static binfmt-support nfs-kernel-server sshpass ab
 
 ---
 
-## 2. Increase USB buffer size
+## 3. (On the Host PC) Increase USB buffer size
 
 ```bash
 sudo sh -c 'echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb'
@@ -33,7 +38,7 @@ sudo sh -c 'echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb'
 
 ---
 
-## 3. Fix USB network interface naming
+## 4. (On the Host PC) Fix USB network interface naming
 
 Ubuntu 24.04 renames the Jetson's USB network interface away from `usb0`. This rule forces it to stay as `usb0` for NVIDIA devices only:
 
@@ -43,8 +48,18 @@ sudo udevadm control --reload-rules
 ```
 
 ---
+## 5. (On the Host PC) If UFW is active, allow inbound initrd-flash traffic on usb0
 
-## 4. Download and extract the BSP and root filesystem
+This rule allows inbound IPv6 traffic on `usb0` from the Jetson initrd flashing subnet. It does not open all `usb0` traffic.
+
+```bash
+sudo ufw allow in on usb0 from fc00:1:1::/48 \
+  comment 'NVIDIA Jetson initrd flashing'
+```
+
+---
+
+## 6. (On the Host PC) Download and extract the BSP and root filesystem
 
 ```bash
 cd ~/Downloads
@@ -64,7 +79,7 @@ Note: the root filesystem tarball is ~1.7GB. It is needed to build the ramdisk e
 
 ---
 
-## 5. Apply binaries on the host
+## 7. (On the Host PC) Apply binaries
 
 Remove conflicting device files first to prevent the script from failing silently:
 
@@ -78,7 +93,7 @@ The last line of output should say `L4T BSP package installation completed!`
 
 ---
 
-## 6. Flash bootloader only using l4t_initrd_flash
+## 8. (From the Host PC) Flash Jetson bootloader only using l4t_initrd_flash
 
 Make sure Jetson is in recovery mode and plugged in, then:
 
@@ -102,9 +117,20 @@ You will see repeated `Waiting for target to boot-up...` and `Waiting for device
 Once SSH connects, it will flash eMMC then QSPI. It may appear stuck at `Starting to flash to qspi` for several minutes — this is also normal. Do not interrupt it.
 
 When complete you will see:
-```
+```text
 Flash is successful
 Reboot device
+```
+
+---
+
+## 9. Optional: (On the Host PC) Remove the temporary UFW rule
+
+If you added the `usb0` allow rule for flashing and do not want to keep it, list numbered rules and delete the matching entry:
+
+```bash
+sudo ufw status numbered
+sudo ufw delete <rule-number>
 ```
 
 ---
