@@ -512,6 +512,7 @@ class Tx:
             src_k = blocks.file_source(
                 gr.sizeof_short * 2, op.waveform_files[k], repeat, offset, length
             )
+            src_k.set_output_multiple(int(op.samplerate / 5))
             fg.connect(src_k, (u, k))
 
         # start the flowgraph once we are near the launch time
@@ -818,7 +819,7 @@ def _build_tx_parser(Parser, *args):
         "--devargs",
         dest="dev_args",
         action=Extend,
-        help="""Device arguments, e.g. "send_buff_size=1000000".
+        help="""Device arguments, e.g. "master_clock_rate=40e6,num_send_frames=512,send_buff_size=1000000".
                 (default: '')""",
     )
     txgroup.add_argument(
