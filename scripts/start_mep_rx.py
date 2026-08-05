@@ -2841,13 +2841,20 @@ class CaptureController:
     def _write_capture_settings(self, f_hz: float, sweep: bool) -> None:
         """Write capture settings.json beside the capture data directory."""
         try:
-            lo_mhz = None
-            if self.tuner is not None and self.adc_if_mhz is not None and self.injection:
-                f_mhz = float(f_hz) / 1e6
-                if str(self.injection).lower() == "high":
-                    lo_mhz = f_mhz + float(self.adc_if_mhz)
+            f_mhz = float(f_hz) / 1e6
+            # Mirror tune_and_arm semantics so settings metadata matches hardware mode.
+            if self.tuner is None:
+                # NCO mode: RFSoC IF is tuned directly to RF center; no external LO.
+                if_mhz = f_mhz
+                lo_mhz = f_mhz
+            else:
+                # External tuner mode: RFSoC IF + tuner LO define RF center.
+                if_mhz = float(self.adc_if_mhz) if self.adc_if_mhz is not None else f_mhz
+                injection_mode = str(self.injection or "high").lower()
+                if injection_mode == "high":
+                    lo_mhz = f_mhz + if_mhz
                 else:
-                    lo_mhz = f_mhz - float(self.adc_if_mhz)
+                    lo_mhz = f_mhz - if_mhz
 
             payload = {
                 "capture_name": (self.capture_name or "").strip() or "preview",
@@ -2858,7 +2865,7 @@ class CaptureController:
                 "sweep": bool(sweep),
                 "tuner": "none" if self.tuner is None else str(self.tuner).lower(),
                 "injection": "none" if self.injection is None else str(self.injection).lower(),
-                "if_mhz": self.adc_if_mhz,
+                "if_mhz": if_mhz,
                 "lo_mhz": lo_mhz,
                 "created_at": datetime.utcnow().isoformat(),
             }
