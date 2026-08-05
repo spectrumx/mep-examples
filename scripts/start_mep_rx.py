@@ -36,6 +36,7 @@ import shutil
 import base64
 import re
 import math
+import uuid
 import socket
 import subprocess
 import queue
@@ -116,6 +117,7 @@ TUNER_OPTIONS       = ["None"] + list(TUNERS.keys()) + ["auto"]
 RECORDER_CONFIG_DIR = "/opt/radiohound/docker/recorder/configs"
 DOCKER_COMPOSE_DIR = "/opt/radiohound/docker"
 PREVIEW_DATA_DIR = "/data/captures/preview/data"
+CAPTURES_ROOT_DIR = "/data/captures"
 
 GREEN = "\033[92m"
 RESET = "\033[0m"
@@ -2825,6 +2827,52 @@ class CaptureController:
         if os.path.isdir(stale_dir):
             shutil.rmtree(stale_dir, ignore_errors=True)
 
+    def _capture_root_dir(self) -> str:
+        """Return capture root folder that contains both settings.json and data/."""
+        capture_folder = (self.capture_name or "").strip() or "preview"
+        return os.path.join(CAPTURES_ROOT_DIR, capture_folder)
+
+    def _format_sds_path(self) -> str:
+        """Generate an SDS-friendly path token from the capture name + random suffix."""
+        capture_folder = (self.capture_name or "").strip() or "preview"
+        token = uuid.uuid4().hex
+        return f"{capture_folder}_{token[:4]}_{token[4:10]}"
+
+    def _write_capture_settings(self, f_hz: float, sweep: bool) -> None:
+        """Write capture settings.json beside the capture data directory."""
+        try:
+            lo_mhz = None
+            if self.tuner is not None and self.adc_if_mhz is not None and self.injection:
+                f_mhz = float(f_hz) / 1e6
+                if str(self.injection).lower() == "high":
+                    lo_mhz = f_mhz + float(self.adc_if_mhz)
+                else:
+                    lo_mhz = f_mhz - float(self.adc_if_mhz)
+
+            payload = {
+                "capture_name": (self.capture_name or "").strip() or "preview",
+                "sds_path": self._format_sds_path(),
+                "f_hz": int(round(float(f_hz))),
+                "channel": self.channel,
+                "sample_rate": int(self.sample_rate_mhz) if self.sample_rate_mhz is not None else None,
+                "sweep": bool(sweep),
+                "tuner": "none" if self.tuner is None else str(self.tuner).lower(),
+                "injection": "none" if self.injection is None else str(self.injection).lower(),
+                "if_mhz": self.adc_if_mhz,
+                "lo_mhz": lo_mhz,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+
+            capture_root = self._capture_root_dir()
+            os.makedirs(capture_root, exist_ok=True)
+            settings_path = os.path.join(capture_root, "settings.json")
+            with open(settings_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+                fh.write("\n")
+            logging.info("Wrote capture settings: %s", settings_path)
+        except Exception as exc:
+            logging.warning("Failed to write capture settings.json: %s", exc)
+
     def start_recorder(self, freq_idx_offset: float = 0.0):
         """Configure and enable the DigitalRF recorder."""
         if not self._require_mqtt("start recorder"):
@@ -3213,6 +3261,8 @@ class CaptureController:
         if not self._require_mqtt("run single capture"):
             return False
 
+        self._write_capture_settings(f_hz=f_hz, sweep=False)
+
         sample_rate_changed = (self.sample_rate_mhz != self._active_sample_rate)
         channel_changed = (self.channel != self._active_channel)
 
@@ -3252,12 +3302,17 @@ class CaptureController:
         if not self.start_recorder():
             return False
         last_restart = time.time()
+        wrote_settings = False
 
         try:
             for f_hz in freqs_hz:
                 if self._stop_flag.is_set():
                     logging.info("Sweep interrupted by stop flag")
                     break
+
+                if not wrote_settings:
+                    self._write_capture_settings(f_hz=f_hz, sweep=True)
+                    wrote_settings = True
 
                 if restart_interval and time.time() - last_restart >= restart_interval:
                     logging.info("Restart interval reached — restarting recorder")
