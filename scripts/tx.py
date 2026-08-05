@@ -162,6 +162,10 @@ class MultiFileSource(gr.sync_block):
         self._cur_file_idx = 0
         self._cur_file_spec = self.spec.file_specs[self._cur_file_idx]
         self._samples_remaining = self.spec.file_specs[0].sample_length
+        for k, file_spec in enumerate(self.spec.file_specs):
+            if k == 0:
+                print(f"File sequence (repeated: {self.repeat}):")
+            print(f"{k}: {file_spec.path.name} for {file_spec.sample_length} samples")
         return super().start()
 
     def work(self, input_items, output_items):
@@ -173,15 +177,13 @@ class MultiFileSource(gr.sync_block):
         next_index = 0
         # repeat reading until we succeed or return
         while next_index < nsamples:
-            if self._samples_remaining == self._cur_file_spec.sample_length:
-                if self.verbose:
-                    print(
-                        f"Playing {self._cur_file_spec.path.name} "
-                        f"for {self._cur_file_spec.sample_length} samples"
-                    )
-                else:
-                    sys.stdout.write(".")
-                    sys.stdout.flush()
+            if (
+                self.verbose
+                and len(self.spec.file_specs) > 1
+                and (self._samples_remaining == self._cur_file_spec.sample_length)
+            ):
+                sys.stdout.write(f"{self._cur_file_idx}")
+                sys.stdout.flush()
             n_requested = min(nsamples - next_index, self._samples_remaining)
             data = np.fromfile(
                 self._file_handles[self._cur_file_idx],
@@ -755,7 +757,10 @@ class Tx:
         for waveform_file, type in zip(op.waveform_files, op.types):
             file_spec = MultiFileSourceSpec.from_str(waveform_file, types=[type])
             src_k = MultiFileSource(
-                file_spec, repeat=op.repeat, min_chunksize=int(op.samplerate / 5)
+                file_spec,
+                repeat=op.repeat,
+                min_chunksize=int(op.samplerate / 5),
+                verbose=op.verbose,
             )
             srcs.append(src_k)
 
