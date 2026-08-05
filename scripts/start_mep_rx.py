@@ -2833,10 +2833,15 @@ class CaptureController:
         return os.path.join(CAPTURES_ROOT_DIR, capture_folder)
 
     def _format_sds_path(self) -> str:
-        """Generate an SDS-friendly path token from the capture name + random suffix."""
+        """Generate SDS path token: <capture>_<hostname>_<random6>."""
         capture_folder = (self.capture_name or "").strip() or "preview"
-        token = uuid.uuid4().hex
-        return f"{capture_folder}_{token[:4]}_{token[4:10]}"
+        host_token = (get_local_hostname() or "").strip().lower()
+        host_token = re.sub(r"[^a-z0-9_-]", "", host_token)
+        if not host_token:
+            raise RuntimeError("Unable to derive hostname token for sds_path")
+
+        random6 = uuid.uuid4().hex[:6]
+        return f"{capture_folder}_{host_token}_{random6}"
 
     def _write_capture_settings(self, f_hz: float, sweep: bool) -> None:
         """Write capture settings.json beside the capture data directory."""
