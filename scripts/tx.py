@@ -9,12 +9,16 @@
 # ----------------------------------------------------------------------------
 """Transmit waveforms with synchronized USRPs."""
 
+import dataclasses
 import math
 import multiprocessing
 import os
+import pathlib
 import re
 import sys
 import time
+import traceback
+import typing
 from argparse import Action, ArgumentParser, Namespace, RawDescriptionHelpFormatter
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
@@ -28,15 +32,187 @@ import numpy as np
 from gnuradio import blocks, gr, uhd
 
 
+@dataclasses.dataclass
+class FileSourceSpec:
+    path: pathlib.Path
+    type: typing.Literal["fc32", "sc16"] | None = None
+    sample_length: int | None = None
+
+    def __post_init__(self):
+        # infer None type from file extension
+        if self.type is None:
+            if self.path.suffix in (".fc32", ".sc16"):
+                self.type = self.path.suffix[1:]
+            else:
+                msg = f"Could not infer file data type from suffix {self.path.suffix}"
+                raise ValueError(msg)
+        # check if file exists and remove type-only suffix
+        if not self.path.exists():
+            pth = self.path.parent / self.path.stem
+            if pth.exists():
+                self.path = pth
+            else:
+                msg = f"{self.path} or {pth} does not exist"
+                raise FileNotFoundError(msg)
+        # resolve sample length
+        if self.sample_length is None:
+            num_bytes = self.path.stat().st_size
+            if self.type == "fc32":
+                self.sample_length = num_bytes // 8
+            elif self.type == "sc16":
+                self.sample_length = num_bytes // 4
+
+    @staticmethod
+    def from_str(spec_str: str, type: str | None = None):
+        spl = spec_str.split(":", 1)
+        pth = pathlib.Path(spl[0])
+        if len(spl) == 1:
+            sample_length = None
+        else:
+            # float convert before int so e-notation is allowed (e.g. 1e6 == 1000000)
+            sample_length = int(float(spl[1]))
+        return FileSourceSpec(path=pth, type=type, sample_length=sample_length)
+
+
+@dataclasses.dataclass
+class MultiFileSourceSpec:
+    file_specs: list[tuple[FileSourceSpec, ...]]
+
+    def __post_init__(self):
+        # check that files all have the same type
+        typ = self.file_specs[0].type
+        typs = [spec.type for spec in self.file_specs]
+        if not all(t == typ for t in typs):
+            msg = f"All files must have the same data type (current: {typs})"
+            raise ValueError(msg)
+
+    @staticmethod
+    def from_str(spec_str: str, types: list[str | None] | None = None):
+        if types is None:
+            types = [None]
+        specs = []
+        for k, file_spec_str in enumerate(spec_str.split(",")):
+            specs.append(
+                FileSourceSpec.from_str(file_spec_str, type=types[k % len(types)])
+            )
+        return MultiFileSourceSpec(file_specs=specs)
+
+
+class MultiFileSource(gr.sync_block):
+    """Source block for reading multiple files in series."""
+
+    def __init__(
+        self,
+        spec,
+        repeat=True,
+        min_chunksize=1,
+    ):
+        self.spec = spec
+        self.repeat = repeat
+        self.min_chunksize = min_chunksize
+        self.type = self.spec.file_specs[0].type
+
+        if self.type == "fc32":
+            self._dtype = np.complex64
+            self._vlen = 1
+            out_sig = [self._dtype]
+        elif self.type == "sc16":
+            self._dtype = np.int16
+            self._vlen = 2
+            out_sig = [(self._dtype, self._vlen)]
+        else:
+            msg = f"File type {self.type} not currently supported"
+            raise ValueError(msg)
+
+        gr.sync_block.__init__(
+            self, name="multi_file_source", in_sig=None, out_sig=out_sig
+        )
+
+        # reduce CPU usage and underruns by setting a minimum number of samples
+        # to handle at once
+        # (really want to set_min_noutput_items, but no way to do that from
+        #  Python)
+        if self.min_chunksize > 1:
+            try:
+                self.set_output_multiple(self.min_chunksize)
+            except RuntimeError:
+                traceback.print_exc()
+                msg = (
+                    f"Failed to set source block min_chunksize to {self.min_chunksize}."
+                )
+                raise ValueError(msg)
+
+        self._file_handles = []
+        self._cur_file_idx = None
+        self._samples_remaining = 0
+        self._done = False
+
+    def start(self):
+        self._file_handles = [
+            open(fspec.path, mode="rb") for fspec in self.spec.file_specs
+        ]
+        self._cur_file_idx = 0
+        self._cur_file_spec = self.spec.file_specs[self._cur_file_idx]
+        self._samples_remaining = self.spec.file_specs[0].sample_length
+        return super().start()
+
+    def work(self, input_items, output_items):
+        if self._done:
+            # return WORK_DONE
+            return -1
+        out = output_items[0]
+        nsamples = out.shape[0]
+        next_index = 0
+        # repeat reading until we succeed or return
+        while next_index < nsamples:
+            if self._samples_remaining == self._cur_file_spec.sample_length:
+                print(
+                    f"Playing {self._cur_file_spec.path.name} "
+                    f"for {self._cur_file_spec.sample_length} samples"
+                )
+            n_requested = min(nsamples - next_index, self._samples_remaining)
+            data = np.fromfile(
+                self._file_handles[self._cur_file_idx],
+                dtype=self._dtype,
+                count=n_requested * self._vlen,
+            )
+            n = data.shape[0] // self._vlen
+            stop_index = next_index + n
+            out_dest = out[next_index:stop_index].ravel()
+            out_dest[:] = data
+            next_index += n
+            self._samples_remaining -= n
+
+            if self._samples_remaining == 0:
+                # move to the next file
+                self._cur_file_idx = (self._cur_file_idx + 1) % len(self._file_handles)
+                if self._cur_file_idx == 0 and not self.repeat:
+                    self._done = True
+                    break
+                self._cur_file_spec = self.spec.file_specs[self._cur_file_idx]
+                # make sure we start at the beginning of the file
+                self._file_handles[self._cur_file_idx].seek(0)
+                self._samples_remaining = self._cur_file_spec.sample_length
+            elif n < n_requested:
+                # We didn't get all the samples requested, which means end of file
+                # so reset file seek position to beginning
+                self._file_handles[self._cur_file_idx].seek(0)
+
+        return next_index // self._vlen
+
+
 class Tx:
     """Transmit data in binary format from a single USRP."""
 
     def __init__(
         self,
         waveform_files=[None],
+        types=[None],
+        repeat=True,
+        amplitudes=[1.0],
         mboards=[],
-        subdevs=["A:0"],
-        centerfreqs=[440e6],  # Deal with this
+        subdevs=["A:A"],
+        centerfreqs=[915e6],
         lo_offsets=[0],
         lo_sources=[""],
         lo_exports=[None],
@@ -66,8 +242,8 @@ class Tx:
         mboards :
             List of mboards. Default =[]
         subdevs
-            List of subdevices, default:["A:0"],
-        centerfreqs=,# Deal with this
+            List of subdevices, default:["A:A"],
+        centerfreqs
             List of center frequencies. default [440e6]
         lo_offsets=[0],
         lo_sources=[""],
@@ -125,6 +301,8 @@ class Tx:
 
         # repeat arguments as necessary
         op.waveform_files = list(islice(cycle(op.waveform_files), 0, op.nchs))
+        op.types = list(islice(cycle(op.types), 0, op.nchs))
+        op.amplitudes = list(islice(cycle(op.amplitudes), 0, op.nchs))
         op.subdevs = list(islice(cycle(op.subdevs), 0, op.nmboards))
         op.centerfreqs = list(islice(cycle(op.centerfreqs), 0, op.nchs))
         op.dc_offsets = list(islice(cycle(op.dc_offsets), 0, op.nchs))
@@ -172,6 +350,7 @@ class Tx:
                 LO export: {lo_exports}
                 DC offset: {dc_offsets}
                 IQ balance: {iq_balances}
+                Amplitude: {amplitudes}
                 Gain: {gains}
                 Bandwidth: {bandwidths}
                 Antenna: {antennas}
@@ -445,6 +624,15 @@ class Tx:
                 else:
                     print("Note: failed to enable realtime scheduling")
 
+        # get file sources
+        srcs = []
+        for waveform_file, type in zip(op.waveform_files, op.types):
+            file_spec = MultiFileSourceSpec.from_str(waveform_file, types=[type])
+            src_k = MultiFileSource(
+                file_spec, repeat=op.repeat, min_chunksize=int(op.samplerate / 5)
+            )
+            srcs.append(src_k)
+
         # wait for the start time if it is not past
         while (st is not None) and (
             (st - datetime.now(tz=timezone.utc)) > timedelta(seconds=SETUP_TIME)
@@ -506,14 +694,18 @@ class Tx:
         # populate flowgraph one channel at a time
         fg = gr.top_block()
         for k in range(op.nchs):
-            repeat = True
-            offset = 0
-            length = 0
-            src_k = blocks.file_source(
-                gr.sizeof_short * 2, op.waveform_files[k], repeat, offset, length
-            )
-            src_k.set_output_multiple(int(op.samplerate / 5))
-            fg.connect(src_k, (u, k))
+            src_k = srcs[k]
+            amplitude_k = op.amplitudes[k]
+            if src_k.type == "sc16":
+                gain_k = blocks.multiply_const_vss([int(amplitude_k), int(amplitude_k)])
+                fg.connect(src_k, gain_k)
+                fg.connect(gain_k, (u, k))
+            elif src_k.type == "fc32":
+                gain_k = blocks.multiply_const_cc(amplitude_k)
+                convert_k = blocks.complex_to_interleaved_short(True, 32767.0)
+                fg.connect(src_k, gain_k)
+                fg.connect(gain_k, convert_k)
+                fg.connect(convert_k, (u, k))
 
         # start the flowgraph once we are near the launch time
         # (start too soon and device buffers might not yet be flushed)
@@ -622,7 +814,7 @@ def _build_tx_parser(Parser, *args):
     formatter = RawDescriptionHelpFormatter(scriptname)
     width = formatter._width
 
-    title = "txcmd.py"
+    title = "tx.py"
     copyright = "Copyright (c) 2017 Massachusetts Institute of Technology"
     shortdesc = "Transmit a waveform on a loop using synchronized USRPs."
     desc = "\n".join(
@@ -708,6 +900,23 @@ def _build_tx_parser(Parser, *args):
         nargs="+",
         help="""Binary files of interleaved short complex dtype giving a waveform.""",
     )
+    wavgroup.add_argument(
+        "--type",
+        dest="types",
+        default=None,
+        action=Extend,
+        help="""String indicating numerical type for the waveform binary file.
+                Valid values include `fc32` (complex 32-bit floating point),
+                `sc16` (complex 16-bit integer), or `None` (default, use file
+                extension to determine type).""",
+    )
+    wavgroup.add_argument(
+        "--norepeat",
+        dest="repeat",
+        default=True,
+        action="store_false",
+        help="Disable repeating of the waveform sequence and end when complete. (default: False)",
+    )
 
     mbgroup = parser.add_argument_group(title="mainboard")
     mbgroup.add_argument(
@@ -722,7 +931,7 @@ def _build_tx_parser(Parser, *args):
         "--subdevice",
         dest="subdevs",
         action=Extend,
-        help="""USRP subdevice string. (default: "A:0")""",
+        help="""USRP subdevice string. (default: "A:A")""",
     )
 
     chgroup = parser.add_argument_group(title="channel")
@@ -732,7 +941,7 @@ def _build_tx_parser(Parser, *args):
         dest="centerfreqs",
         action=Extend,
         type=float,
-        help="""Center frequency in Hz. (default: 440e6)""",
+        help="""Center frequency in Hz. (default: 915e6)""",
     )
     chgroup.add_argument(
         "-F",
@@ -779,6 +988,14 @@ def _build_tx_parser(Parser, *args):
         type=noneorcomplex,
         help="""IQ balance correction to use. Can be 'None'/'' to keep device
                 default or a complex value (e.g. "1+1j"). (default: 0)""",
+    )
+    chgroup.add_argument(
+        "-G",
+        "--amplitude",
+        dest="amplitudes",
+        action=Extend,
+        type=float,
+        help="""Waveform amplitude multiplier. (default: 1)""",
     )
     chgroup.add_argument(
         "-g",
