@@ -112,10 +112,12 @@ class MultiFileSource(gr.sync_block):
         spec,
         repeat=True,
         min_chunksize=1,
+        verbose=False,
     ):
         self.spec = spec
         self.repeat = repeat
         self.min_chunksize = min_chunksize
+        self.verbose = verbose
         self.type = self.spec.file_specs[0].type
 
         if self.type == "fc32":
@@ -172,10 +174,14 @@ class MultiFileSource(gr.sync_block):
         # repeat reading until we succeed or return
         while next_index < nsamples:
             if self._samples_remaining == self._cur_file_spec.sample_length:
-                print(
-                    f"Playing {self._cur_file_spec.path.name} "
-                    f"for {self._cur_file_spec.sample_length} samples"
-                )
+                if self.verbose:
+                    print(
+                        f"Playing {self._cur_file_spec.path.name} "
+                        f"for {self._cur_file_spec.sample_length} samples"
+                    )
+                else:
+                    sys.stdout.write(".")
+                    sys.stdout.flush()
             n_requested = min(nsamples - next_index, self._samples_remaining)
             data = np.fromfile(
                 self._file_handles[self._cur_file_idx],
@@ -221,7 +227,7 @@ class Tx:
             "clock_sources": [""],
             "time_sources": [""],
             # tx group (apply to all)
-            "samplerate": 1e6,
+            "samplerate": 10e6,
             "dev_args": {},
             "stream_args": {},
             "tune_args": {},
@@ -234,7 +240,7 @@ class Tx:
             "waveform_files": [None],
             "types": [None],
             "amplitudes": [1.0],
-            "centerfreqs": [915e6],
+            "centerfreqs": [1090e6],
             "lo_offsets": [0],
             "lo_sources": [""],
             "lo_exports": [None],
@@ -1095,7 +1101,7 @@ def _build_tx_parser(Parser, *args):
         dest="centerfreqs",
         action=Extend,
         type=float,
-        help="""Center frequency in Hz. (default: 915e6)""",
+        help="""Center frequency in Hz. (default: 1090e6)""",
     )
     chgroup.add_argument(
         "-F",
@@ -1183,7 +1189,7 @@ def _build_tx_parser(Parser, *args):
         "--samplerate",
         dest="samplerate",
         type=evalfloat,
-        help="""Sample rate in Hz. (default: waveform default or 1e6)""",
+        help="""Sample rate in Hz. (default: 10e6)""",
     )
     txgroup.add_argument(
         "-A",
@@ -1191,7 +1197,7 @@ def _build_tx_parser(Parser, *args):
         dest="dev_args",
         action=Extend,
         help="""Device arguments, e.g. "master_clock_rate=40e6,num_send_frames=512,send_buff_size=1000000".
-                (default: '')""",
+                (default: 'num_send_frames=512')""",
     )
     txgroup.add_argument(
         "-a",
