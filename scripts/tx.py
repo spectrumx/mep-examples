@@ -10,6 +10,7 @@
 """Transmit waveforms with synchronized USRPs."""
 
 import dataclasses
+import io
 import math
 import os
 import pathlib
@@ -121,11 +122,11 @@ class MultiFileSource(gr.sync_block):
         self.type = self.spec.file_specs[0].type
 
         if self.type == "fc32":
-            self._dtype = np.complex64
+            self._dtype = np.dtype(np.complex64)
             self._vlen = 1
             out_sig = [self._dtype]
         elif self.type == "sc16":
-            self._dtype = np.int16
+            self._dtype = np.dtype(np.int16)
             self._vlen = 2
             out_sig = [(self._dtype, self._vlen)]
         else:
@@ -156,9 +157,19 @@ class MultiFileSource(gr.sync_block):
         self._done = False
 
     def start(self):
-        self._file_handles = [
-            open(fspec.path, mode="rb") for fspec in self.spec.file_specs
-        ]
+        self._file_handles = []
+        for fspec in self.spec.file_specs:
+            nsamples = fspec.path.stat().st_size // (self._dtype.itemsize * self._vlen)
+            if nsamples < min(self.min_chunksize, fspec.sample_length):
+                # read entire file into memory and duplicate until it is at least
+                # the min_chunksize to avoid excessive looping to fill numpy array
+                ntiles = int(np.ceil(self.min_chunksize / nsamples))
+                with open(fspec.path, mode="rb") as file_in:
+                    data = np.fromfile(file_in, dtype=self._dtype)
+                handle = io.BytesIO(np.tile(data, ntiles).tobytes())
+            else:
+                handle = open(fspec.path, mode="rb")
+            self._file_handles.append(handle)
         self._cur_file_idx = 0
         self._cur_file_spec = self.spec.file_specs[self._cur_file_idx]
         self._samples_remaining = self.spec.file_specs[0].sample_length
@@ -184,18 +195,12 @@ class MultiFileSource(gr.sync_block):
             ):
                 sys.stdout.write(f"{self._cur_file_idx}")
                 sys.stdout.flush()
-            n_requested = min(nsamples - next_index, self._samples_remaining)
-            data = np.fromfile(
-                self._file_handles[self._cur_file_idx],
-                dtype=self._dtype,
-                count=n_requested * self._vlen,
-            )
-            n = data.shape[0] // self._vlen
-            stop_index = next_index + n
-            out_dest = out[next_index:stop_index].ravel()
-            out_dest[:] = data
-            next_index += n
-            self._samples_remaining -= n
+            out_view = out[next_index : (next_index + self._samples_remaining)]
+            out_dest = out_view.ravel()
+            n_bytes_read = self._file_handles[self._cur_file_idx].readinto(out_dest)
+            n_samples_read = n_bytes_read // (self._dtype.itemsize * self._vlen)
+            next_index += n_samples_read
+            self._samples_remaining -= n_samples_read
 
             if self._samples_remaining == 0:
                 # move to the next file
@@ -207,12 +212,16 @@ class MultiFileSource(gr.sync_block):
                 # make sure we start at the beginning of the file
                 self._file_handles[self._cur_file_idx].seek(0)
                 self._samples_remaining = self._cur_file_spec.sample_length
-            elif n < n_requested:
+            elif n_samples_read < len(out_view):
                 # We didn't get all the samples requested, which means end of file
                 # so reset file seek position to beginning
                 self._file_handles[self._cur_file_idx].seek(0)
 
         return next_index // self._vlen
+
+    def stop(self):
+        for handle in self._file_handles:
+            handle.close()
 
 
 class Tx:
