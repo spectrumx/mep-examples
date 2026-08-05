@@ -1,4 +1,4 @@
-#!python
+#!/usr/bin/env python
 # ----------------------------------------------------------------------------
 # Copyright (c) 2017 Massachusetts Institute of Technology (MIT)
 # All rights reserved.
@@ -11,15 +11,21 @@
 
 import dataclasses
 import math
-import multiprocessing
 import os
 import pathlib
 import re
+import signal
 import sys
 import time
 import traceback
 import typing
-from argparse import Action, ArgumentParser, Namespace, RawDescriptionHelpFormatter
+from argparse import (
+    SUPPRESS,
+    Action,
+    ArgumentParser,
+    Namespace,
+    RawDescriptionHelpFormatter,
+)
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from itertools import chain, cycle, islice, repeat
@@ -204,69 +210,41 @@ class MultiFileSource(gr.sync_block):
 class Tx:
     """Transmit data in binary format from a single USRP."""
 
-    def __init__(
-        self,
-        waveform_files=[None],
-        types=[None],
-        repeat=True,
-        amplitudes=[1.0],
-        mboards=[],
-        subdevs=["A:A"],
-        centerfreqs=[915e6],
-        lo_offsets=[0],
-        lo_sources=[""],
-        lo_exports=[None],
-        dc_offsets=[None],
-        iq_balances=[None],
-        gains=[0],
-        bandwidths=[0],
-        antennas=[""],
-        samplerate=1e6,
-        cpu_format=None,
-        dev_args=[],
-        stream_args=[],
-        tune_args=[],
-        sync=True,
-        sync_source="gpsdo",
-        realtime=False,
-        verbose=True,
-        test_settings=True,
-        logger=print,
-        tevent=multiprocessing.Event(),
-    ):
-        """
-        Parmaeters
-        ----------
-        waveform_files : list
-            List of waveform file paths. Files should be binary in interleaved short complex format. default: [None]
-        mboards :
-            List of mboards. Default =[]
-        subdevs
-            List of subdevices, default:["A:A"],
-        centerfreqs
-            List of center frequencies. default [440e6]
-        lo_offsets=[0],
-        lo_sources=[""],
-        lo_exports=[None],
-        dc_offsets=[None],
-        iq_balances=[None],
-        gains=[0],
-        bandwidths=[0],
-        antennas=[""],
-        samplerate=1e6,
-        cpu_format=None,
-        dev_args=[],
-        stream_args=[],
-        tune_args=[],
-        sync=True,
-        sync_source="gpsdo",
-        realtime=False,
-        verbose=True,
-        test_settings=True,
-        muxed_dual_channel=False,
-        logger=print,"""
-        options = locals()
-        del options["self"]
+    def __init__(self, **kwargs):
+        options = {
+            "logger": print,
+            "verbose": True,
+            # mainboard group (num: len of mboards)
+            "mboards": [],
+            "subdevs": ["A:A"],
+            "clock_rates": [None],
+            "clock_sources": [""],
+            "time_sources": [""],
+            # tx group (apply to all)
+            "samplerate": 1e6,
+            "dev_args": {},
+            "stream_args": {},
+            "tune_args": {},
+            "time_sync": True,
+            "wait_for_lock": True,
+            "realtime": False,
+            "test_settings": True,
+            "repeat": True,
+            # channel group (num: matching channels from mboards/subdevs)
+            "waveform_files": [None],
+            "types": [None],
+            "amplitudes": [1.0],
+            "centerfreqs": [915e6],
+            "lo_offsets": [0],
+            "lo_sources": [""],
+            "lo_exports": [None],
+            "dc_offsets": [None],
+            "iq_balances": [None],
+            "gains": [0],
+            "bandwidths": [0],
+            "antennas": [""],
+        }
+        options.update(kwargs)
         op = self._parse_options(**options)
         self.op = op
 
@@ -274,8 +252,7 @@ class Tx:
             # test usrp device settings, release device when done
             if op.verbose:
                 op.logger("Initialization: testing device settings.")
-            u = self._usrp_setup()
-            del u
+            self._usrp_setup()
 
     @staticmethod
     def _parse_options(**kwargs):
@@ -283,6 +260,35 @@ class Tx:
         op = Namespace(**kwargs)
 
         op.cpu_format = "sc16"
+
+        # set clock/time source defaults depending on time_sync/wait_for_lock
+        if op.time_sync:
+            # if unset, change source to "external"
+            op.time_sources = [src if src else "external" for src in op.time_sources]
+        if op.wait_for_lock:
+            # if unset, change source to "external"
+            op.clock_sources = [src if src else "external" for src in op.clock_sources]
+
+        # repeat mainboard arguments as necessary
+        op.nmboards = len(op.mboards) if len(op.mboards) > 0 else 1
+        for mb_arg in ("subdevs", "clock_rates", "clock_sources", "time_sources"):
+            val = getattr(op, mb_arg)
+            mbval = list(islice(cycle(val), 0, op.nmboards))
+            setattr(op, mb_arg, mbval)
+
+        # get number of transmitter channels by total number of subdevices over
+        # all mainboards
+        op.mboards_bychan = []
+        op.subdevs_bychan = []
+        op.mboardnum_bychan = []
+        mboards = op.mboards if op.mboards else ["default"]
+        for mbnum, (mb, sd) in enumerate(zip(mboards, op.subdevs)):
+            sds = sd.split()
+            mbs = list(repeat(mb, len(sds)))
+            mbnums = list(repeat(mbnum, len(sds)))
+            op.mboards_bychan.extend(mbs)
+            op.subdevs_bychan.extend(sds)
+            op.mboardnum_bychan.extend(mbnums)
 
         # determine mboard and subdev per channel, get number of channels
         op.mboards_bychan = []
@@ -296,23 +302,26 @@ class Tx:
             op.mboards_bychan.extend(mbs)
             op.subdevs_bychan.extend(sds)
             op.mboardnum_bychan.extend(mbnums)
-        op.nmboards = len(op.mboards) if len(op.mboards) > 0 else 1
-        op.nchs = len(op.mboards_bychan)
 
-        # repeat arguments as necessary
-        op.waveform_files = list(islice(cycle(op.waveform_files), 0, op.nchs))
-        op.types = list(islice(cycle(op.types), 0, op.nchs))
-        op.amplitudes = list(islice(cycle(op.amplitudes), 0, op.nchs))
-        op.subdevs = list(islice(cycle(op.subdevs), 0, op.nmboards))
-        op.centerfreqs = list(islice(cycle(op.centerfreqs), 0, op.nchs))
-        op.dc_offsets = list(islice(cycle(op.dc_offsets), 0, op.nchs))
-        op.iq_balances = list(islice(cycle(op.iq_balances), 0, op.nchs))
-        op.lo_offsets = list(islice(cycle(op.lo_offsets), 0, op.nchs))
-        op.lo_sources = list(islice(cycle(op.lo_sources), 0, op.nchs))
-        op.lo_exports = list(islice(cycle(op.lo_exports), 0, op.nchs))
-        op.gains = list(islice(cycle(op.gains), 0, op.nchs))
-        op.bandwidths = list(islice(cycle(op.bandwidths), 0, op.nchs))
-        op.antennas = list(islice(cycle(op.antennas), 0, op.nchs))
+        # repeat receiver channel arguments as necessary
+        op.nchs = len(op.subdevs_bychan)
+        for ch_arg in (
+            "amplitudes",
+            "antennas",
+            "bandwidths",
+            "centerfreqs",
+            "dc_offsets",
+            "iq_balances",
+            "gains",
+            "lo_offsets",
+            "lo_sources",
+            "lo_exports",
+            "types",
+            "waveform_files",
+        ):
+            val = getattr(op, ch_arg)
+            rval = list(islice(cycle(val), 0, op.nchs))
+            setattr(op, ch_arg, rval)
 
         # create device_addr string to identify the requested device(s)
         op.mboard_strs = []
@@ -337,27 +346,49 @@ class Tx:
             else:
                 s = f"{idtype}{n}={mb.strip()}"
             op.mboard_strs.append(s)
+        op.mboard_str = ",".join(op.mboard_strs)
+
+        # set device arguments for default parameters that can be set on init
+        # this only works for certain devices, but others will ignore the arguments
+        if op.time_sources[0] and "time_source" not in op.dev_args:
+            op.dev_args["time_source"] = op.time_sources[0]
+        if op.clock_sources[0] and "clock_source" not in op.dev_args:
+            op.dev_args["clock_source"] = op.clock_sources[0]
+        if op.clock_rates[0] and "master_clock_rate" not in op.dev_args:
+            op.dev_args["master_clock_rate"] = op.clock_rates[0]
+        if op.lo_sources[0] and "rx_lo_source" not in op.dev_args:
+            op.dev_args["rx_lo_source"] = op.lo_sources[0]
+
+        # convert arg dicts to string arguments
+        dev_args_strs = [f"{k}={v}" for k, v in op.dev_args.items()]
+        op.dev_args_str = ",".join(dev_args_strs)
+        op.mboard_dev_args_str = ",".join(chain(op.mboard_strs, dev_args_strs))
+        op.stream_args_str = ",".join(f"{k}={v}" for k, v in op.stream_args.items())
+        op.tune_args_str = ",".join(f"{k}={v}" for k, v in op.tune_args.items())
 
         if op.verbose:
             opstr = (
                 dedent(
                     """\
-                Main boards: {mboard_strs}
+                Main boards: {mboard_str}
                 Subdevices: {subdevs}
+                Clock rates: {clock_rates}
+                Clock sources: {clock_sources}
+                Time sources: {time_sources}
+                Sample rate: {samplerate}
+                Device arguments: {dev_args_str}
+                Stream arguments: {stream_args_str}
+                Tune arguments: {tune_args_str}
+                Antenna: {antennas}
+                Bandwidth: {bandwidths}
                 Frequency: {centerfreqs}
                 LO frequency offset: {lo_offsets}
                 LO source: {lo_sources}
                 LO export: {lo_exports}
+                Gain: {gains}
                 DC offset: {dc_offsets}
                 IQ balance: {iq_balances}
                 Amplitude: {amplitudes}
-                Gain: {gains}
-                Bandwidth: {bandwidths}
-                Antenna: {antennas}
-                Device arguments: {dev_args}
-                Stream arguments: {stream_args}
-                Tune arguments: {tune_args}
-                Sample rate: {samplerate}
             """
                 )
                 .strip()
@@ -382,24 +413,60 @@ class Tx:
         """Create, set up, and return USRP sink object."""
         op = self.op
         # create usrp sink block
+        op.otw_format = "sc16"
         u = uhd.usrp_sink(
-            device_addr=",".join(chain(op.mboard_strs, op.dev_args)),
+            device_addr=op.mboard_dev_args_str,
             stream_args=uhd.stream_args(
                 cpu_format=op.cpu_format,
-                otw_format="sc16",
+                otw_format=op.otw_format,
                 channels=list(range(op.nchs)),
-                args=",".join(op.stream_args),
+                args=op.stream_args_str,
             ),
         )
 
-        # set clock and time source if synced
-        if op.sync:
-            try:
-                u.set_clock_source(op.sync_source, uhd.ALL_MBOARDS)
-                u.set_time_source(op.sync_source, uhd.ALL_MBOARDS)
-            except RuntimeError:
-                errstr = f"Unknown sync_source option: '{op.sync_source}'. Must be one of {u.get_clock_sources(0)}."
-                raise ValueError(errstr)
+        # set mainboard options
+        for mb_num in range(op.nmboards):
+            u.set_subdev_spec(op.subdevs[mb_num], mb_num)
+
+            # set master clock rate
+            clock_rate = op.clock_rates[mb_num]
+            if clock_rate is not None and clock_rate != u.get_clock_rate(mb_num):
+                u.set_clock_rate(clock_rate, mb_num)
+
+            # gr-uhd multi-usrp object does not have set_sync_source (which
+            # is a thing on modern USRPs) so we need to set time and clock
+            # sources as separate calls. Only some pairs of time and clock
+            # source are valid, so it seems optimal to set the time source
+            # first to reduce the overall number of re-syncs since
+            # (clock=external, time=internal) is generally valid but unlikely
+            # whereas (clock=internal, time=external) is generally invalid,
+            # and the unset default is for internal sources.
+
+            # set time source
+            time_source = op.time_sources[mb_num]
+            if time_source and time_source != u.get_time_source(mb_num):
+                try:
+                    u.set_time_source(time_source, mb_num)
+                except RuntimeError:
+                    errstr = (
+                        f"Setting mainboard {mb_num} time_source to '{time_source}' failed."
+                        f" Must be one of {u.get_time_sources(mb_num)}. If setting is valid, check that"
+                        " the source (PPS) is operational."
+                    )
+                    raise ValueError(errstr)
+
+            # set clock source
+            clock_source = op.clock_sources[mb_num]
+            if clock_source and clock_source != u.get_clock_source(mb_num):
+                try:
+                    u.set_clock_source(clock_source, mb_num)
+                except RuntimeError:
+                    errstr = (
+                        f"Setting mainboard {mb_num} clock_source to '{clock_source}' failed."
+                        f" Must be one of {u.get_clock_sources(mb_num)}. If setting is valid, check that"
+                        " the source (REF) is operational."
+                    )
+                    raise ValueError(errstr)
 
         # check for ref lock
         mbnums_with_ref = [
@@ -407,11 +474,15 @@ class Tx:
             for mb_num in range(op.nmboards)
             if "ref_locked" in u.get_mboard_sensor_names(mb_num)
         ]
-        if mbnums_with_ref and op.sync:
+        if op.wait_for_lock and mbnums_with_ref:
             if op.verbose:
                 sys.stdout.write("Waiting for reference lock...")
                 sys.stdout.flush()
             timeout = 0
+            if op.wait_for_lock is True:
+                timeout_thresh = 30
+            else:
+                timeout_thresh = op.wait_for_lock
             while not all(
                 u.get_mboard_sensor("ref_locked", mb_num).to_bool()
                 for mb_num in mbnums_with_ref
@@ -421,36 +492,85 @@ class Tx:
                     sys.stdout.flush()
                 time.sleep(1)
                 timeout += 1
-                if timeout > 30:
+                if timeout > timeout_thresh:
                     if op.verbose:
                         sys.stdout.write("failed\n")
                         sys.stdout.flush()
-                    raise RuntimeError("Failed to lock to 10 MHz reference.")
+                    unlocked_mbs = [
+                        mb_num
+                        for mb_num in mbnums_with_ref
+                        if u.get_mboard_sensor("ref_locked", mb_num).to_bool()
+                    ]
+                    errstr = (
+                        f"Failed to lock to 10 MHz reference on mainboards {unlocked_mbs}."
+                        " To skip waiting for lock, set `wait_for_lock` to"
+                        " False (pass --nolock on the command line)."
+                    )
+                    raise RuntimeError(errstr)
             if op.verbose:
                 sys.stdout.write("locked\n")
                 sys.stdout.flush()
 
         # Check if GPSDO is locked to gps
-        if op.sync_source == "gpsdo" and op.sync:
-            if op.verbose:
-                sys.stdout.write("Checking for gpsdo lock...")
-                sys.stdout.flush()
+        mbnums_with_gpsdo = [
+            mb_num
+            for mb_num in range(op.nmboards)
+            if "gps_locked" in u.get_mboard_sensor_names(mb_num)
+        ]
+        for mb_num in mbnums_with_gpsdo:
+            if op.wait_for_lock and (
+                op.clock_sources[mb_num] == "gpsdo"
+                or op.time_sources[mb_num] == "gpsdo"
+            ):
+                if op.verbose:
+                    sys.stdout.write(
+                        f"Checking for gpsdo lock for mboard {op.mboard_strs[mb_num]}..."
+                    )
+                    sys.stdout.flush()
 
-            gps_lock_list = [
-                u.get_mboard_sensor("gps_locked", mb_num).to_bool()
-                for mb_num in mbnums_with_ref
-            ]
-            if all(gps_lock_list):
+                timeout = 0
+                if op.wait_for_lock is True:
+                    timeout_thresh = 30
+                else:
+                    timeout_thresh = op.wait_for_lock
+
+                while not u.get_mboard_sensor("gps_locked", mb_num).to_bool():
+                    if op.verbose:
+                        sys.stdout.write(".")
+                        sys.stdout.flush()
+                    time.sleep(1)
+                    timeout += 1
+                    if timeout > timeout_thresh:
+                        if op.verbose:
+                            sys.stdout.write("failed\n")
+                            sys.stdout.flush()
+                        unlocked_mbs = [
+                            mb_num
+                            for mb_num in mbnums_with_gpsdo
+                            if u.get_mboard_sensor("gps_locked", mb_num).to_bool()
+                        ]
+                        errstr = (
+                            f"Failed to lock to GPS on mainboards {unlocked_mbs}."
+                            " To skip waiting for lock, set `wait_for_lock` to"
+                            " False (pass --nolock on the command line)."
+                        )
+                        raise RuntimeError(errstr)
                 if op.verbose:
                     sys.stdout.write("GPSDO locked.\n")
                     sys.stdout.flush()
-        # set mainboard options
-        for mb_num in range(op.nmboards):
-            u.set_subdev_spec(op.subdevs[mb_num], mb_num)
+
         # set global options
-        # sample rate
+        # sample rate (set after clock rate so it can be calculated correctly)
         u.set_samp_rate(float(op.samplerate))
-        # read back actual value
+
+        # read back actual mainboard options
+        # (clock rate can be affected by setting sample rate)
+        for mb_num in range(op.nmboards):
+            op.clock_rates[mb_num] = u.get_clock_rate(mb_num)
+            op.clock_sources[mb_num] = u.get_clock_source(mb_num)
+            op.time_sources[mb_num] = u.get_time_source(mb_num)
+
+        # read back actual sample rate value
         samplerate = u.get_samp_rate()
         # calculate longdouble precision sample rate
         # (integer division of clock rate)
@@ -491,7 +611,7 @@ class Tx:
                 uhd.tune_request(
                     op.centerfreqs[ch_num],
                     op.lo_offsets[ch_num],
-                    args=uhd.device_addr(",".join(op.tune_args)),
+                    args=uhd.device_addr(op.tune_args_str),
                 ),
                 ch_num,
             )
@@ -601,14 +721,14 @@ class Tx:
             if op.verbose:
                 ststr = st.strftime("%a %b %d %H:%M:%S %Y")
                 stts = (st - drf.util.epoch).total_seconds()
-                print(f"Start time: {ststr} ({stts})")
+                op.logger(f"Start time: {ststr} ({stts})")
 
         et = drf.util.parse_identifier_to_time(endtime, ref_datetime=st)
         if et is not None:
             if op.verbose:
                 etstr = et.strftime("%a %b %d %H:%M:%S %Y")
                 etts = (et - drf.util.epoch).total_seconds()
-                print(f"End time: {etstr} ({etts})")
+                op.logger(f"End time: {etstr} ({etts})")
 
             if (
                 et < (datetime.now(tz=timezone.utc) + timedelta(seconds=SETUP_TIME))
@@ -620,9 +740,9 @@ class Tx:
 
             if op.verbose:
                 if r == gr.RT_OK:
-                    print("Realtime scheduling enabled")
+                    op.logger("Realtime scheduling enabled")
                 else:
-                    print("Note: failed to enable realtime scheduling")
+                    op.logger("Note: failed to enable realtime scheduling")
 
         # get file sources
         srcs = []
@@ -639,7 +759,7 @@ class Tx:
         ):
             ttl = int((st - datetime.now(tz=timezone.utc)).total_seconds())
             if (ttl % 10) == 0:
-                print(f"Standby {ttl} s remaining...")
+                op.logger(f"Standby {ttl} s remaining...")
                 sys.stdout.flush()
             time.sleep(1)
 
@@ -648,14 +768,14 @@ class Tx:
 
         # set device time
         tt = time.time()
-        if op.sync:
+        if op.time_sync:
             # wait until time 0.2 to 0.5 past full second, then latch
             # we have to trust NTP to be 0.2 s accurate
             while tt - math.floor(tt) < 0.2 or tt - math.floor(tt) > 0.3:
                 time.sleep(0.01)
                 tt = time.time()
             if op.verbose:
-                print("Latching at " + str(tt))
+                op.logger("Latching at " + str(tt))
             # waits for the next pps to happen
             # (at time math.ceil(tt))
             # then sets the time for the subsequent pps
@@ -684,7 +804,7 @@ class Tx:
         lt = drf.util.sample_to_datetime(lt_samples, op.samplerate)
         if op.verbose:
             ltstr = lt.strftime("%a %b %d %H:%M:%S.%f %Y")
-            print(f"Launch time: {ltstr} ({ltts!r})")
+            op.logger(f"Launch time: {ltstr} ({ltts!r})")
         # command launch time
         ct_td = lt - drf.util.epoch
         ct_secs = ct_td.total_seconds() // 1.0
@@ -743,7 +863,7 @@ class Tx:
         fg.stop()
         # need to wait for the flowgraph to clean up, otherwise it won't exit
         fg.wait()
-        print("done")
+        op.logger("done")
         sys.stdout.flush()
 
 
@@ -763,6 +883,14 @@ def noneorstr(s):
         return None
     else:
         return s
+
+
+def noneorfloat(s):
+    """Turn empty or 'none' to None, else evaluate to float."""
+    if s.lower() in ("", "none"):
+        return None
+    else:
+        return evalfloat(s)
 
 
 def noneorbool(s):
@@ -865,8 +993,8 @@ def _build_tx_parser(Parser, *args):
     )
     egs = [
         """\
-        {0} -m 192.168.10.2 -d "A:0" -f 440e6 -F 12.5e6 -G 0.25 -g 0 -r 1e6
-        code.bin
+        {0} -m 192.168.10.2 -d "A:0" -f 1090e6 -F 12.5e6 -G 0.25 -g 0 -r 1e6
+        code.fc32
         """
     ]
     egs = [" \\\n".join(egtw.wrap(dedent(s.format(scriptname)))) for s in egs]
@@ -932,6 +1060,32 @@ def _build_tx_parser(Parser, *args):
         dest="subdevs",
         action=Extend,
         help="""USRP subdevice string. (default: "A:A")""",
+    )
+    mbgroup.add_argument(
+        "--clock_rate",
+        dest="clock_rates",
+        action=Extend,
+        type=noneorfloat,
+        help="""Master clock rate for mainboard. Can be 'None'/'' to use
+                device default or a value in Hz. (default: None)""",
+    )
+    mbgroup.add_argument(
+        "--clock_source",
+        dest="clock_sources",
+        action=Extend,
+        type=noneorstr,
+        help="""Clock source (i.e. 10 MHz REF) for mainboard. Can be 'None'/''
+                to use default (do not set if --nolock, otherwise 'external')
+                or a string like 'external' or 'internal'. (default: '')""",
+    )
+    mbgroup.add_argument(
+        "--time_source",
+        dest="time_sources",
+        action=Extend,
+        type=noneorstr,
+        help="""Time source (i.e. PPS) for mainboard. Can be 'None'/''
+                to use default (do not set if --nosync, otherwise 'external')
+                or a string like 'external' or 'internal'. (default: '')""",
     )
 
     chgroup = parser.add_argument_group(title="channel")
@@ -1055,17 +1209,18 @@ def _build_tx_parser(Parser, *args):
         help="""Tune request arguments, e.g. "mode_n=integer,int_n_step=100e3".
                 (default: '')""",
     )
-    txgroup.add_argument(
-        "--sync_source",
-        dest="sync_source",
-        help="""Clock and time source for all mainboards.
-                (default: 'external')""",
-    )
+    txgroup.add_argument("--sync_source", dest="sync_source", help=SUPPRESS)
     txgroup.add_argument(
         "--nosync",
-        dest="sync",
+        dest="time_sync",
         action="store_false",
-        help="""No syncing with external clock. (default: False)""",
+        help="""Skip syncing with reference time. (default: False)""",
+    )
+    txgroup.add_argument(
+        "--nolock",
+        dest="wait_for_lock",
+        action="store_false",
+        help="""Don't wait for reference clock to lock. (default: False)""",
     )
     txgroup.add_argument(
         "--realtime",
@@ -1113,25 +1268,34 @@ def _build_tx_parser(Parser, *args):
 
 
 def main(op):
+    # handle deprecated sync_source argument, converting it to clock_sources
+    # and time_sources
+    if op.sync_source is not None:
+        if op.clock_sources is None:
+            op.clock_sources = [op.sync_source]
+        if op.time_sources is None:
+            op.time_sources = [op.sync_source]
+    del op.sync_source
+
     # remove redundant arguments in dev_args, stream_args, tune_args
     if op.dev_args is not None:
         try:
             dev_args_dict = dict([a.split("=") for a in op.dev_args])
         except ValueError:
             raise ValueError("Device arguments must be {KEY}={VALUE} pairs.")
-        op.dev_args = [f"{k}={v}" for k, v in dev_args_dict.items()]
+        op.dev_args = dev_args_dict
     if op.stream_args is not None:
         try:
             stream_args_dict = dict([a.split("=") for a in op.stream_args])
         except ValueError:
             raise ValueError("Stream arguments must be {KEY}={VALUE} pairs.")
-        op.stream_args = [f"{k}={v}" for k, v in stream_args_dict.items()]
+        op.stream_args = stream_args_dict
     if op.tune_args is not None:
         try:
             tune_args_dict = dict([a.split("=") for a in op.tune_args])
         except ValueError:
             raise ValueError("Tune request arguments must be {KEY}={VALUE} pairs.")
-        op.tune_args = [f"{k}={v}" for k, v in tune_args_dict.items()]
+        op.tune_args = tune_args_dict
 
     # ignore test_settings option if no starttime is set (starting right now)
     if op.starttime is None:
@@ -1144,6 +1308,14 @@ def main(op):
         for k in list(options.keys())
         if k in ("starttime", "endtime", "duration", "period")
     }
+
+    # handle SIGTERM (getting killed) gracefully by calling sys.exit
+    def sigterm_handler(signal, frame):
+        print("Killed")
+        sys.stdout.flush()
+        sys.exit(128 + signal)
+
+    signal.signal(signal.SIGTERM, sigterm_handler)
 
     tx = Tx(**options)
     tx.run(**runopts)
