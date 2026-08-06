@@ -160,7 +160,10 @@ class MultiFileSource(gr.sync_block):
         self._file_handles = []
         for fspec in self.spec.file_specs:
             nsamples = fspec.path.stat().st_size // (self._dtype.itemsize * self._vlen)
-            if nsamples < min(self.min_chunksize, fspec.sample_length):
+            if (
+                nsamples < self.min_chunksize
+                and self.min_chunksize <= fspec.sample_length
+            ):
                 # read entire file into memory and duplicate until it is at least
                 # the min_chunksize to avoid excessive looping to fill numpy array
                 ntiles = int(np.ceil(self.min_chunksize / nsamples))
@@ -664,6 +667,8 @@ class Tx:
 
         # read back actual channel settings
         for ch_num in range(op.nchs):
+            # center_freq may have changed after tuning other channels
+            op.centerfreqs[ch_num] = u.get_center_freq(ch_num)
             if op.lo_sources[ch_num]:
                 op.lo_sources[ch_num] = u.get_lo_source(uhd.ALL_LOS, ch_num)
             if op.lo_exports[ch_num] is not None:
