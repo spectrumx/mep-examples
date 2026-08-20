@@ -166,9 +166,9 @@ class MultiFileSource(gr.sync_block):
             ):
                 # read entire file into memory and duplicate until it is at least
                 # the min_chunksize to avoid excessive looping to fill numpy array
-                ntiles = int(np.ceil(self.min_chunksize / nsamples))
                 with open(fspec.path, mode="rb") as file_in:
                     data = np.fromfile(file_in, dtype=self._dtype)
+                ntiles = int(np.ceil(self.min_chunksize / nsamples))
                 handle = io.BytesIO(np.tile(data, ntiles).tobytes())
             else:
                 handle = open(fspec.path, mode="rb")
