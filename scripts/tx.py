@@ -161,7 +161,8 @@ class MultiFileSource(gr.sync_block):
         for fspec in self.spec.file_specs:
             nsamples = fspec.path.stat().st_size // (self._dtype.itemsize * self._vlen)
             if (
-                nsamples < self.min_chunksize
+                fspec.path.is_file()
+                and nsamples < self.min_chunksize
                 and self.min_chunksize <= fspec.sample_length
             ):
                 # read entire file into memory and duplicate until it is at least
