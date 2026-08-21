@@ -41,9 +41,10 @@ import socket
 import subprocess
 import queue
 import copy
+import csv
 from fractions import Fraction
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 import threading
 from typing import Optional, Callable
 import numpy as np
@@ -55,11 +56,6 @@ MQTT_BROKER = "localhost"
 MQTT_PORT   = 1883
 SPEC_POWER_FLOOR = np.float32(1e-12)
 SPEC_DB_SCALE = np.float32(10.0)
-
-# AFE logging defaults shared with GUI/CLI callers.
-AFE_DEFAULT_LOG_PATH = "/data/log_telemetry"
-AFE_DEFAULT_LOG_RATE_S = 1
-AFE_DEFAULT_LOG_RATE_RANGE = (1, 3600)
 
 # Command and Status Topics
 RFSOC_CMD_TOPIC       = "rfsoc/command"
@@ -2207,7 +2203,7 @@ class MEPBus:
             "arguments": {"path": path},
         })
 
-    def afe_set_log_rate(self, n: int):
+    def afe_set_log_rate(self, n: float):
         self.publish_command(f"{AFE_CMD_TOPIC}/logging", {
             "task_name": "set_log_rate_sec",
             "arguments": {"n": n},
@@ -2419,6 +2415,107 @@ class MEPBus:
 
 # ===== CAPTURE CONTROLLER ===== #
 
+class CaptureTelemetryLogger:
+    """Capture-scoped GPS/IMU/MAG/HK track, independent of afe_service.py's own logger.
+
+    Subscribes to the AFE data topics via plain MQTT fan-out for the duration of a
+    capture and writes a merged row into the capture folder each time GPS updates
+    (so track density follows the GNSS rate, not a fixed timer). No coordination
+    with afe_service.py is required — it never redirects or controls the AFE
+    service's own always-on logging, it just listens to the same public topics.
+    Every row is flushed+fsynced immediately; nothing here depends on a clean stop.
+    """
+
+    # Field names mirror the JSON keys afe_service.py publishes on afe/data/*.
+    _FIELDS_GPS = ("timestamp", "utc_time", "latitude", "longitude", "altitude_m", "speed_knots", "fix_valid", "fix")
+    _FIELDS_IMU = ("acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z")
+    _FIELDS_MAG = ("mag_x", "mag_y", "mag_z")
+    _FIELDS_HK = ("ocxo_locked", "spi_ok", "mag_ok", "imu_ok", "sw_temp_c", "mag_temp_c", "imu_temp_c", "imu_active", "imu_tilt")
+
+    def __init__(self, bus: "MEPBus"):
+        self.bus = bus
+        self._fh = None
+        self._writer = None
+        self._last_imu: dict = {}
+        self._last_mag: dict = {}
+        self._last_hk: dict = {}
+        self._gps_cb = None
+        self._imu_cb = None
+        self._mag_cb = None
+        self._hk_cb = None
+        self._active = False
+
+    def start(self, capture_dir: str):
+        """Begin logging a GPS/telemetry track into capture_dir. Idempotent."""
+        if self._active:
+            return
+        os.makedirs(capture_dir, exist_ok=True)
+        path = os.path.join(capture_dir, "gps_telemetry.csv")
+        header = (
+            ["snapshot_utc"]
+            + [f"gnss_{k}" for k in self._FIELDS_GPS]
+            + [f"mag_{k}" for k in self._FIELDS_MAG]
+            + [f"imu_{k}" for k in self._FIELDS_IMU]
+            + [f"hk_{k}" for k in self._FIELDS_HK]
+        )
+        self._fh = open(path, "w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._fh)
+        self._writer.writerow(header)
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+
+        self._imu_cb = lambda data: self._last_imu.update(data)
+        self._mag_cb = lambda data: self._last_mag.update(data)
+        self._hk_cb = lambda data: self._last_hk.update(data)
+        self._gps_cb = self._on_gps
+
+        self.bus.on_status(AFE_IMU_TOPIC, self._imu_cb)
+        self.bus.on_status(AFE_MAG_TOPIC, self._mag_cb)
+        self.bus.on_status(AFE_HK_TOPIC, self._hk_cb)
+        self.bus.on_status(AFE_GNSS_TOPIC, self._gps_cb)  # GPS arrival drives the row cadence
+        self._active = True
+        logging.info(f"Capture telemetry log started: {path}")
+
+    def _on_gps(self, gps: dict):
+        if not self._active or self._writer is None:
+            return
+        now = datetime.now(timezone.utc)
+        row = [now.isoformat()]
+        row.extend(gps.get(k) for k in self._FIELDS_GPS)
+        row.extend(self._last_mag.get(k) for k in self._FIELDS_MAG)
+        row.extend(self._last_imu.get(k) for k in self._FIELDS_IMU)
+        row.extend(self._last_hk.get(k) for k in self._FIELDS_HK)
+        try:
+            self._writer.writerow(row)
+            self._fh.flush()
+            os.fsync(self._fh.fileno())  # durable before the next line executes, not "eventually"
+        except Exception:
+            logging.exception("Capture telemetry write error")
+
+    def stop(self):
+        """Stop logging and release MQTT listeners. Safe to call even if never started."""
+        if not self._active:
+            return
+        for topic, cb in (
+            (AFE_GNSS_TOPIC, self._gps_cb),
+            (AFE_IMU_TOPIC, self._imu_cb),
+            (AFE_MAG_TOPIC, self._mag_cb),
+            (AFE_HK_TOPIC, self._hk_cb),
+        ):
+            if cb is not None:
+                self.bus.remove_listener(topic, cb)
+        if self._fh is not None:
+            try:
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
+                self._fh.close()
+            except Exception:
+                logging.exception("Capture telemetry close error")
+        self._fh, self._writer = None, None
+        self._active = False
+        logging.info("Capture telemetry log stopped")
+
+
 class CaptureController:
     """On-demand sweep/record orchestrator — owns sync-wait infra and recipes.
 
@@ -2429,6 +2526,7 @@ class CaptureController:
 
     def __init__(self, bus: MEPBus):
         self.bus = bus
+        self.telemetry_logger = CaptureTelemetryLogger(bus)
 
         # ---- Sweep config (set via configure_sweep) ----
         self.channel: Optional[str] = None
@@ -2500,6 +2598,7 @@ class CaptureController:
         for topic, cb in self._sync_cbs.items():
             self.bus.remove_listener(topic, cb)
         self._sync_cbs.clear()
+        self.telemetry_logger.stop()
         if self._recorder_running:
             try:
                 self.stop_recorder()
@@ -2957,6 +3056,8 @@ class CaptureController:
         self._active_channel = self.channel
         self._active_sample_rate = self.sample_rate_mhz
         self._recorder_running = True
+        if self.capture_name:
+            self.telemetry_logger.start(self._capture_root_dir())
         return True
 
     def stop_recorder(self):
@@ -2964,6 +3065,7 @@ class CaptureController:
         logging.info("Stopping recorder")
         self.bus.recorder_disable()
         self._recorder_running = False
+        self.telemetry_logger.stop()
 
     def _build_recorder_config(self) -> dict:
         """

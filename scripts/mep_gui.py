@@ -15,6 +15,7 @@ Author: john.marino@colorado.edu
 
 import sys
 import os
+import argparse
 import shutil
 import re
 import math
@@ -58,9 +59,6 @@ from start_mep_rx import (
     TX_CHANNEL_OPTIONS,
     TX_OFFSET_FREQ_MAX_MHZ,
     TX_AMPLITUDE_BINS_MAX,
-    AFE_DEFAULT_LOG_PATH,
-    AFE_DEFAULT_LOG_RATE_S,
-    AFE_DEFAULT_LOG_RATE_RANGE,
     RFSOC_CMD_TOPIC,
     RFSOC_PLL_CONFIG_TOPIC,
     RECORDER_CMD_TOPIC,
@@ -70,6 +68,7 @@ from start_mep_rx import (
     TUNER_RESPONSE_TOPIC,
     RFSOC_STATUS_TOPIC,
     AFE_CMD_TOPIC,
+    AFE_RESPONSE_TOPIC,
     AFE_STATUS_TOPIC,
     AFE_ANNOUNCE_TOPIC,
     AFE_GNSS_TOPIC,
@@ -289,10 +288,12 @@ class SpectrumViewport:
 
 class MEPGui:
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, mqtt_host: str = MQTT_BROKER, mqtt_port: int = MQTT_PORT):
         self.root = root
         self.root.title(f"{get_local_hostname()} MEP Control App")
         self.root.resizable(True, True)
+        self._mqtt_host = mqtt_host
+        self._mqtt_port = mqtt_port
 
         self._sweep_thread: threading.Thread = None
         self._afe_updating = False
@@ -370,7 +371,7 @@ class MEPGui:
 
         # ---- MQTT bus (always-on) ----
         print("  Connecting to MQTT broker...", flush=True)
-        self.bus = MEPBus()
+        self.bus = MEPBus(broker=self._mqtt_host, port=self._mqtt_port)
         self.capture = None  # created on Start click via _get_or_create_capture
         # TX lives independently of RX capture: one controller for the app's life,
         # so transmit works with or without an RX session and RX reconfig cannot
@@ -400,6 +401,7 @@ class MEPGui:
         self.bus.on_status(AFE_HK_TOPIC, self._on_hk)
         self.bus.on_status(AFE_ANNOUNCE_TOPIC, self._on_afe_announce)
         self.bus.on_status(AFE_REGISTERS_TOPIC, self._on_afe_registers)
+        self.bus.on_status(f"{AFE_RESPONSE_TOPIC}/polling", self._on_afe_polling_response)
         self.bus.on_status_pattern(self.bus.spec_topic, self._on_spec_data, subscribe=False)
 
         # Refresh status grid from any cached state.
@@ -421,10 +423,12 @@ class MEPGui:
         """Initialize cross-tab state once, independent of lazy tab construction."""
         self._vars["time_source"] = tk.StringVar(value="")
         self._vars["epoch_mode"] = tk.StringVar(value="")
-        self._vars["poll_interval_s"] = tk.IntVar(value=1)
+        # Blank/0 until the service reports the real value — never guess.
+        self._vars["poll_interval_s"] = tk.IntVar(value=0)
         self._vars["log_enabled"] = tk.StringVar(value="enabled")
-        self._vars["log_path"] = tk.StringVar(value=AFE_DEFAULT_LOG_PATH)
-        self._vars["log_rate"] = tk.IntVar(value=AFE_DEFAULT_LOG_RATE_S)
+        # Blank/0 until afe/announce reports the real state — never guess.
+        self._vars["log_path"] = tk.StringVar(value="")
+        self._vars["log_rate"] = tk.DoubleVar(value=0.0)
         self._vars["conjugate_policy"] = tk.StringVar(value="")
         self._vars["conjugate_actual"] = tk.StringVar(value="—")
 
@@ -505,6 +509,16 @@ class MEPGui:
         self._gui_call(self._afe_apply_state, data)
         self._gui_call(self._refresh_status_grid)
 
+    def _on_afe_polling_response(self, data: dict):
+        """Update poll_interval_s from get_interval/set_interval responses — the only source of truth."""
+        n = data.get("configured_interval_s")
+        if n is None:
+            return
+        try:
+            self._gui_call(self._vars["poll_interval_s"].set, int(n))
+        except (TypeError, ValueError):
+            pass
+
     def _on_afe_announce(self, data: dict):
         """Handle afe/announce retained message — populate dynamic widgets."""
         self._gui_call(self._apply_afe_announce, data)
@@ -517,12 +531,17 @@ class MEPGui:
         # ---- AFE tab (registers, devices) ---- #
         self._afe_populate_from_announce(data)
 
-        # ---- Polling interval default/range (fallback from hk.rate if polling missing) ---- #
-        hk_rate_ref = describe.get("hk", {}).get("reference", {}).get("rate", {})
-        if hk_rate_ref and hasattr(self, "_poll_interval_spin"):
-            r = hk_rate_ref["range"]
-            self._poll_interval_spin.configure(from_=r[0], to=r[1])
-            self._vars["poll_interval_s"].set(hk_rate_ref["default"])
+        # ---- Polling interval range/current (service is the sole source of truth) ---- #
+        polling_ref = describe.get("polling", {}).get("reference", {})
+        poll_range = polling_ref.get("poll_interval_range")
+        if poll_range and hasattr(self, "_poll_interval_spin"):
+            self._poll_interval_spin.configure(from_=poll_range[0], to=poll_range[1])
+        poll_current = polling_ref.get("poll_interval_current")
+        if poll_current is not None:
+            try:
+                self._vars["poll_interval_s"].set(int(poll_current))
+            except (TypeError, ValueError):
+                pass
 
         # ---- Time source radio buttons (dynamic from announce) ---- #
         time_ref = describe.get("time", {}).get("reference", {})
@@ -555,38 +574,22 @@ class MEPGui:
             if labels:
                 self._vars["epoch_mode"].set(labels[0])
 
-        # ---- Logging (rate range) ---- #
+        # ---- Logging ---- #
+        # No range is advertised or enforced client-side; the service validates on set.
         log_ref = describe.get("logging", {}).get("reference", {})
-        log_rate_range = log_ref.get("log_rate_range", [])
-        if not (isinstance(log_rate_range, list) and len(log_rate_range) >= 2):
-            log_rate_range = [AFE_DEFAULT_LOG_RATE_RANGE[0], AFE_DEFAULT_LOG_RATE_RANGE[1]]
 
-        log_path_default = (
-            log_ref.get("log_path_default")
-            or log_ref.get("default_log_path")
-            or log_ref.get("path_default")
-            or AFE_DEFAULT_LOG_PATH
-        )
-        log_rate_default = (
-            log_ref.get("log_rate_default")
-            or log_ref.get("default_log_rate")
-            or log_ref.get("default")
-            or AFE_DEFAULT_LOG_RATE_S
-        )
+        # Only set path/rate fields when the service actually reports them —
+        # no fabricated fallback. If absent, the field stays blank/0 (unknown).
+        log_path_current = log_ref.get("log_path_current")
+        if log_path_current:
+            self._vars["log_path"].set(str(log_path_current))
 
-        try:
-            log_rate_default = int(log_rate_default)
-        except (TypeError, ValueError):
-            log_rate_default = AFE_DEFAULT_LOG_RATE_S
-        log_rate_default = max(int(log_rate_range[0]), min(int(log_rate_range[1]), log_rate_default))
-
-        self._vars["log_path"].set(str(log_path_default))
-        self._vars["log_rate"].set(log_rate_default)
-
-        if log_rate_range and hasattr(self, "_tlm_log_rate_spin"):
-            self._tlm_log_rate_spin.configure(from_=log_rate_range[0], to=log_rate_range[1])
-        if log_rate_range and hasattr(self, "_log_rate_spin"):
-            self._log_rate_spin.configure(from_=log_rate_range[0], to=log_rate_range[1])
+        log_rate_current = log_ref.get("log_rate_current")
+        if log_rate_current is not None:
+            try:
+                self._vars["log_rate"].set(float(log_rate_current))
+            except (TypeError, ValueError):
+                pass
 
         logging.info("GUI: announce data applied to all dynamic widgets")
 
@@ -3707,9 +3710,9 @@ class MEPGui:
         ttk.Label(log_f, text="Log Interval (s)").grid(row=2, column=0, sticky="w", padx=5, pady=2)
         self._tlm_log_rate_spin = ttk.Spinbox(
             log_f,
-            from_=AFE_DEFAULT_LOG_RATE_RANGE[0],
-            to=AFE_DEFAULT_LOG_RATE_RANGE[1],
-            increment=1,
+            from_=0,
+            to=86400,
+            increment=0.1,
             textvariable=self._vars["log_rate"],
             width=10,
         )
@@ -3718,70 +3721,6 @@ class MEPGui:
                    command=self._tlm_get_logging).grid(row=2, column=2, padx=2, pady=2)
         ttk.Button(log_f, text="Set", width=8,
                    command=self._tlm_set_logging).grid(row=2, column=3, padx=(2, 5), pady=2)
-
-    # ---- CONFIG tab (Logging) ---- #
-
-    def _build_config_tab(self, frame: ttk.Frame):
-        frame.columnconfigure(0, weight=1)
-
-        logging_f = ttk.LabelFrame(frame, text="Logging")
-        logging_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
-        logging_f.columnconfigure(1, weight=1)
-
-        # Enable/Disable
-        self._vars["config_log_enabled_ui"] = tk.BooleanVar(value=False)
-        ttk.Checkbutton(logging_f, text="Enable Logging",
-                        variable=self._vars["config_log_enabled_ui"]).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=5, pady=5)
-
-        # Log path
-        ttk.Label(logging_f, text="Log Path").grid(
-            row=1, column=0, sticky="w", padx=5, pady=3)
-        self._config_log_path_entry = ttk.Entry(logging_f, textvariable=self._vars["log_path"])
-        self._config_log_path_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=3)
-        self._bind_copy_menu(self._config_log_path_entry, self._vars["log_path"], allow_paste=True)
-
-        # Log rate (interval in seconds)
-        ttk.Label(logging_f, text="Log Rate (s)").grid(
-            row=2, column=0, sticky="w", padx=5, pady=3)
-        self._log_rate_spin = ttk.Spinbox(logging_f,
-                    from_=AFE_DEFAULT_LOG_RATE_RANGE[0],
-                    to=AFE_DEFAULT_LOG_RATE_RANGE[1],
-                    increment=1,
-                    textvariable=self._vars["log_rate"],
-                    width=12)
-        self._log_rate_spin.grid(row=2, column=1, sticky="w", padx=5, pady=3)
-
-        # Service log mode (populated dynamically from announce)
-        ttk.Label(logging_f, text="Service Log Mode").grid(
-            row=3, column=0, sticky="w", padx=5, pady=3)
-        self._vars["service_log_mode"] = tk.StringVar(value="")
-        self._log_mode_combo = ttk.Combobox(logging_f, textvariable=self._vars["service_log_mode"],
-                     values=[],
-                     state="readonly", width=12)
-        self._log_mode_combo.grid(row=3, column=1, sticky="w", padx=5, pady=3)
-
-        # Buttons
-        btn_f = ttk.Frame(logging_f)
-        btn_f.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
-        btn_f.columnconfigure(0, weight=1)
-        btn_f.columnconfigure(1, weight=1)
-        btn_f.columnconfigure(2, weight=1)
-        ttk.Button(btn_f, text="Enable",
-                   command=self._log_enable).pack(side="left", padx=2)
-        ttk.Button(btn_f, text="Disable",
-                   command=self._log_disable).pack(side="left", padx=2)
-        ttk.Button(btn_f, text="Apply Settings",
-                   command=self._log_apply_settings).pack(side="left", padx=2)
-
-        # Status display
-        status_f = ttk.LabelFrame(frame, text="Status")
-        status_f.grid(row=1, column=0, padx=4, pady=(2, 4), sticky="ew")
-        status_f.columnconfigure(0, weight=1)
-        
-        self._vars["log_status"] = tk.StringVar(value="—")
-        ttk.Entry(status_f, textvariable=self._vars["log_status"],
-                  state="readonly").grid(row=0, column=0, sticky="ew", padx=5, pady=5)
 
     # ---- AFE tab ---- #
 
@@ -4757,37 +4696,9 @@ class MEPGui:
             self.bus.afe_disable_logging()
         self.bus.afe_set_log_path(path)
         self.bus.afe_set_log_rate(rate)
-        logging.info(f"TLM: logging set ({mode}, path={path}, rate={rate} s)")
-
-    # ------------------------------------------------------------------ #
-    #  CONFIG helpers (Logging)
-    # ------------------------------------------------------------------ #
-
-    def _log_enable(self):
-        path = self._vars["log_path"].get()
-        self.bus.afe_enable_logging()
-        logging.info("CONFIG: logging enabled")
-        self._vars["log_status"].set("Logging enabled")
-
-    def _log_disable(self):
-        self.bus.afe_disable_logging()
-        logging.info("CONFIG: logging disabled")
-        self._vars["log_status"].set("Logging disabled")
-
-    def _log_apply_settings(self):
-        try:
-            path = self._vars["log_path"].get()
-            rate = self._vars["log_rate"].get()
-            mode = self._vars["service_log_mode"].get()
-        except tk.TclError as e:
-            logging.error(f"CONFIG: invalid logging setting: {e}")
-            return
-        
-        self.bus.afe_set_log_path(path)
-        self.bus.afe_set_log_rate(rate)
-        self.bus.afe_set_service_log_mode(mode)
-        logging.info(f"CONFIG: logging settings applied (path={path}, rate={rate} s, mode={mode})")
-        self._vars["log_status"].set(f"Settings applied: rate={rate}s, mode={mode}")
+        # Query status to verify the change took effect
+        self.bus.afe_get_log_status()
+        logging.info(f"TLM: logging set ({mode}, path={path}, rate={rate} s) — status query sent")
 
     # ------------------------------------------------------------------ #
     #  DOCKER helpers
@@ -6351,9 +6262,16 @@ class MEPGui:
 # ===== ENTRY POINT ===== #
 
 def main():
+    parser = argparse.ArgumentParser(description="MEP Control GUI")
+    parser.add_argument("--mqtt_host", type=str, default=MQTT_BROKER,
+                        help=f"MQTT broker host (default: {MQTT_BROKER})")
+    parser.add_argument("--mqtt_port", type=int, default=MQTT_PORT,
+                        help=f"MQTT broker port (default: {MQTT_PORT})")
+    args = parser.parse_args()
+
     root = tk.Tk()
     print("Loading MEP Control App...", flush=True)
-    app  = MEPGui(root)
+    app  = MEPGui(root, mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port)
     print("  Initialization complete — starting event loop.", flush=True)
 
     close_state = {"ran": False}
