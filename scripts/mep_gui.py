@@ -1108,57 +1108,75 @@ class MEPGui:
 
         self._tune_notebook = ttk.Notebook(frame)
         self._tune_notebook.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        rx_f = ttk.Frame(self._tune_notebook, padding=8)
+        self._tune_notebook.add(rx_f, text="RX")
+        rx_f.columnconfigure(1, weight=1)
 
-        single_f = ttk.Frame(self._tune_notebook, padding=8)
-        sweep_f  = ttk.Frame(self._tune_notebook, padding=8)
-        self._tune_notebook.add(single_f, text="Single")
-        self._tune_notebook.add(sweep_f,  text="Sweep")
-
-        # Shared vars used by both tabs.
         self._vars["freq_start"] = tk.StringVar(value="7000")
         if "dwell" not in self._vars:
             self._vars["dwell"] = tk.StringVar(value="5")
-        self._vars["single_dwell_enabled"] = tk.BooleanVar(value=False)
 
-        # Single tab
-        single_f.columnconfigure(1, weight=1)
-        single_f.columnconfigure(2, weight=0)
-        ttk.Label(single_f, text="Freq (MHz)").grid(
-            row=0, column=0, sticky="w", padx=5, pady=4)
-        ttk.Entry(single_f, textvariable=self._vars["freq_start"], width=20).grid(
-            row=0, column=1, columnspan=2, sticky="ew", padx=5, pady=4)
+        # RX enable states:
+        #
+        #   End   Step  Dwell   Operation
+        #   ----- ----- -----   -------------------------------
+        #   off   off   off     Single capture; run until Stop
+        #   off   off   on      Single capture for the dwell time
+        #   on    on    on      Sweep from Start through End by Step
+        #
+        # End and Step are separate checkboxes but form one sweep pair.
+        # Enabling either enables both and Dwell. Disabling either clears
+        # both sweep checkboxes and Dwell. Dwell may be enabled by itself.
+        # Disabling Dwell also clears the sweep pair when it is active.
+        self._vars["end_enabled"] = tk.BooleanVar(value=False)
+        self._vars["step_enabled"] = tk.BooleanVar(value=False)
+        self._vars["dwell_enabled"] = tk.BooleanVar(value=False)
 
-        ttk.Label(single_f, text="Dwell (s)").grid(
-            row=1, column=0, sticky="w", padx=5, pady=4)
-        self._single_dwell_entry = ttk.Entry(
-            single_f,
-            textvariable=self._vars["dwell"],
-            width=14,
-            state="disabled",
-        )
-        self._single_dwell_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=4)
-        ttk.Checkbutton(
-            single_f,
-            text="Enable",
-            variable=self._vars["single_dwell_enabled"],
-            command=self._toggle_single_dwell,
-        ).grid(row=1, column=2, sticky="w", padx=5, pady=4)
-
-        # Sweep tab
-        sweep_f.columnconfigure(1, weight=1)
-        sweep_fields = [
+        rx_fields = [
             ("Start (MHz)", "freq_start", "7000"),
             ("End (MHz)",   "freq_end",   "8000"),
             ("Step (MHz)",  "step",       "10"),
-            ("Dwell (s)",   "dwell",      "5"),
         ]
-        for r, (label, key, default) in enumerate(sweep_fields):
+        for row_index, (label, key, default) in enumerate(rx_fields):
             if key not in self._vars:
                 self._vars[key] = tk.StringVar(value=default)
-            ttk.Label(sweep_f, text=label).grid(
-                row=r, column=0, sticky="w", padx=5, pady=4)
-            ttk.Entry(sweep_f, textvariable=self._vars[key], width=20).grid(
-                row=r, column=1, sticky="ew", padx=5, pady=4)
+            ttk.Label(rx_f, text=label).grid(
+                row=row_index, column=0, sticky="w", padx=5, pady=4)
+            entry = ttk.Entry(rx_f, textvariable=self._vars[key], width=20)
+            entry.grid(row=row_index, column=1, sticky="ew", padx=5, pady=4)
+            if key != "freq_start":
+                entry.configure(state="disabled")
+                entry_name = "end" if key == "freq_end" else key
+                setattr(self, f"_rx_{entry_name}_entry", entry)
+        ttk.Checkbutton(
+            rx_f,
+            text="Enable",
+            variable=self._vars["end_enabled"],
+            command=self._toggle_rx_end,
+        ).grid(row=1, column=2, sticky="w", padx=5, pady=4)
+        ttk.Checkbutton(
+            rx_f,
+            text="Enable",
+            variable=self._vars["step_enabled"],
+            command=self._toggle_rx_step,
+        ).grid(row=2, column=2, sticky="w", padx=5, pady=4)
+
+        ttk.Label(rx_f, text="Dwell (s)").grid(
+            row=3, column=0, sticky="w", padx=5, pady=4)
+        dwell_entry = ttk.Entry(
+            rx_f,
+            textvariable=self._vars["dwell"],
+            width=20,
+            state="disabled",
+        )
+        dwell_entry.grid(row=3, column=1, sticky="ew", padx=5, pady=4)
+        self._rx_dwell_entry = dwell_entry
+        ttk.Checkbutton(
+            rx_f,
+            text="Enable",
+            variable=self._vars["dwell_enabled"],
+            command=self._toggle_rx_dwell,
+        ).grid(row=3, column=2, sticky="w", padx=5, pady=4)
 
     def _build_record_section(self, parent: ttk.Frame, row: int):
         frame = ttk.LabelFrame(parent, text="Record")
@@ -6073,7 +6091,7 @@ class MEPGui:
 
         sample_rate_mhz = int(self._vars["sample_rate_mhz"].get())
         injection       = self._vars["injection_mode"].get().lower()
-        dwell_enabled   = self._vars["single_dwell_enabled"].get()
+        dwell_enabled   = self._vars["dwell_enabled"].get()
         dwell_raw       = self._vars["dwell"].get().strip()
 
         try:
@@ -6146,16 +6164,36 @@ class MEPGui:
     #  Button handlers
     # ------------------------------------------------------------------ #
 
-    def _toggle_single_dwell(self):
-        """Enable or disable the Single-tab dwell entry based on the checkbox state."""
-        state = "normal" if self._vars["single_dwell_enabled"].get() else "disabled"
-        self._single_dwell_entry.config(state=state)
+    def _set_rx_sweep_enabled(self, enabled: bool):
+        self._vars["end_enabled"].set(enabled)
+        self._vars["step_enabled"].set(enabled)
+        state = "normal" if enabled else "disabled"
+        self._rx_end_entry.config(state=state)
+        self._rx_step_entry.config(state=state)
+        self._set_rx_dwell_enabled(enabled)
+
+    def _toggle_rx_end(self):
+        self._set_rx_sweep_enabled(self._vars["end_enabled"].get())
+
+    def _toggle_rx_step(self):
+        self._set_rx_sweep_enabled(self._vars["step_enabled"].get())
+
+    def _set_rx_dwell_enabled(self, enabled: bool):
+        self._vars["dwell_enabled"].set(enabled)
+        self._rx_dwell_entry.config(state="normal" if enabled else "disabled")
+
+    def _toggle_rx_dwell(self):
+        enabled = self._vars["dwell_enabled"].get()
+        if not enabled:
+            self._set_rx_sweep_enabled(False)
+        else:
+            self._set_rx_dwell_enabled(True)
 
     def _start(self):
-        if self._tune_notebook.index("current") == 0:
-            self._start_single()
-        else:
+        if self._vars["end_enabled"].get() and self._vars["step_enabled"].get():
             self._start_sweep()
+        else:
+            self._start_single()
 
     def _start_sweep(self):
         if self._sweep_thread and self._sweep_thread.is_alive():
