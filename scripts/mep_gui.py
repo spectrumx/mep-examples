@@ -848,16 +848,24 @@ class MEPGui:
         left.grid(row=0, column=0, sticky="nsew")
         left.grid_propagate(False)
         left.columnconfigure(0, weight=1)
-        left.rowconfigure(5, weight=1)
+        left.rowconfigure(2, weight=1)
 
-        self._build_tune_section(left, row=0)
-        self._build_record_section(left, row=1)
-        self._build_updown_section(left, row=2)
-        self._build_control_section(left, row=3)
+        # ---- Top-level notebook: RX (TX reserved for future use) ---- #
+        self._top_notebook = ttk.Notebook(left)
+        self._top_notebook.grid(row=0, column=0, padx=10, pady=6, sticky="ew")
+
+        rx_tab = ttk.Frame(self._top_notebook, padding=4)
+        self._top_notebook.add(rx_tab, text="RX")
+        rx_tab.columnconfigure(0, weight=1)
+
+        self._build_tune_section(rx_tab, row=0)
+        self._build_record_section(rx_tab, row=1)
+        self._build_updown_section(rx_tab, row=2)
+        self._build_rx_control_section(rx_tab, row=3)
 
         # ---- Status bar ---- #
         status_frame = ttk.LabelFrame(left, text="Status")
-        status_frame.grid(row=4, column=0, padx=10, pady=4, sticky="ew")
+        status_frame.grid(row=1, column=0, padx=10, pady=4, sticky="ew")
         status_frame.columnconfigure(0, weight=1, uniform="status")
         status_frame.columnconfigure(1, weight=1, uniform="status")
         status_frame.columnconfigure(2, weight=1, uniform="status")
@@ -869,7 +877,7 @@ class MEPGui:
 
         # ---- Log box ---- #
         log_frame = ttk.LabelFrame(left, text="Log")
-        log_frame.grid(row=5, column=0, padx=10, pady=6, sticky="nsew")
+        log_frame.grid(row=2, column=0, padx=10, pady=6, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(1, weight=1)
 
@@ -1104,13 +1112,9 @@ class MEPGui:
     def _build_tune_section(self, parent: ttk.Frame, row: int):
         frame = ttk.LabelFrame(parent, text="Tune")
         frame.grid(row=row, column=0, padx=10, pady=6, sticky="ew")
-        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
 
-        self._tune_notebook = ttk.Notebook(frame)
-        self._tune_notebook.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
-        rx_f = ttk.Frame(self._tune_notebook, padding=8)
-        self._tune_notebook.add(rx_f, text="RX")
-        rx_f.columnconfigure(1, weight=1)
+        rx_f = frame
 
         self._vars["freq_start"] = tk.StringVar(value="7000")
         if "dwell" not in self._vars:
@@ -1252,7 +1256,7 @@ class MEPGui:
         self._on_tuner_change()
         self._update_synth_lo()
 
-    def _build_control_section(self, parent: ttk.Frame, row: int):
+    def _build_rx_control_section(self, parent: ttk.Frame, row: int):
         frame = ttk.LabelFrame(parent, text="Control")
         frame.grid(row=row, column=0, padx=10, pady=6, sticky="ew")
         frame.columnconfigure(0, weight=1)
@@ -1264,6 +1268,7 @@ class MEPGui:
         ttk.Button(frame, text="Stop",
                    command=self._stop_all).grid(row=0, column=1, padx=4, pady=3, sticky="ew")
 
+        # Global toggle for the shared Advanced panel; not an RX/TX action.
         self._adv_btn_text = tk.StringVar(value="\u25b6 Advanced")
         ttk.Button(frame, textvariable=self._adv_btn_text,
                    command=self._toggle_advanced).grid(
