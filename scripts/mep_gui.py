@@ -4,7 +4,7 @@ mep_gui.py
 
 Tkinter GUI for MEP RFSoC sweep/record control via X11 forwarding.
 
-All hardware communication goes through MEPBus + CaptureController (start_mep_rx.py).
+All hardware communication goes through MEPBus + ControllerRx (start_mep_rx.py).
 This file is purely presentation: widgets, layout, and callbacks.
 
 Usage:
@@ -36,14 +36,16 @@ from PIL import Image as _PILImage, ImageTk as _PILImageTk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from start_mep_rx import (
     MEPBus,
-    CaptureController,
+    ControllerTuner,
+    ControllerRx,
     DockerManager,
     GPSDMonitor,
-    TxController,
+    ControllerTx,
     get_frequency_list,
     resolve_recorder_preset,
     preview_recorder_settings,
     resolve_injection,
+    resolve_lo_mhz,
     get_local_hostname,
     get_primary_network_info,
     get_primary_network_info_detailed,
@@ -372,11 +374,14 @@ class MEPGui:
         # ---- MQTT bus (always-on) ----
         print("  Connecting to MQTT broker...", flush=True)
         self.bus = MEPBus(broker=self._mqtt_host, port=self._mqtt_port)
+        # Shared tuner state: there is only one physical oscillator, so RX and
+        # TX both hold a reference to the same ControllerTuner instance.
+        self.tuner_ctrl = ControllerTuner(self.bus)
         self.capture = None  # created on Start click via _get_or_create_capture
         # TX lives independently of RX capture: one controller for the app's life,
         # so transmit works with or without an RX session and RX reconfig cannot
         # disturb it.
-        self.tx = TxController(self.bus)
+        self.tx = ControllerTx(self.bus, self.tuner_ctrl)
         self._gps_monitor = None
 
         # ---- Register listeners on bus (always active) ----
@@ -641,9 +646,9 @@ class MEPGui:
     #  Capture controller management (lazy initialization)                #
     # ------------------------------------------------------------------ #
 
-    def _get_or_create_capture(self, params: dict) -> CaptureController:
+    def _get_or_create_capture(self, params: dict) -> ControllerRx:
         """
-        Return a stable CaptureController and update runtime fields in place.
+        Return a stable ControllerRx and update runtime fields in place.
 
         Recreate only when tuner identity/fixed IF changes. Channel, sample rate,
         injection mode, and capture name are runtime parameters and do not require
@@ -664,7 +669,7 @@ class MEPGui:
                     logging.warning(f"Failed to close capture controller: {e}")
 
             logging.info("Creating capture controller")
-            self.capture = CaptureController(self.bus)
+            self.capture = ControllerRx(self.bus, self.tuner_ctrl)
 
             self.capture.configure_sweep(
                 channel=params["channel"],
@@ -850,9 +855,17 @@ class MEPGui:
         left.columnconfigure(0, weight=1)
         left.rowconfigure(2, weight=1)
 
-        # ---- Top-level notebook: RX (TX reserved for future use) ---- #
+        # ---- Top-level notebook: RX / TX (independent operational paths) ---- #
         self._top_notebook = ttk.Notebook(left)
-        self._top_notebook.grid(row=0, column=0, padx=10, pady=6, sticky="ew")
+        self._top_notebook.grid(row=0, column=0, padx=10, pady=(4, 6), sticky="ew")
+
+        # Advanced toggle overlaid at the notebook's top-right corner — same
+        # visual row as the RX/TX tab strip, no extra row or column.
+        ttk.Style().configure("Small.TButton", font=("TkDefaultFont", 8))
+        self._adv_btn_text = tk.StringVar(value="Show Advanced Options \u25b6")
+        adv_btn = ttk.Button(left, textvariable=self._adv_btn_text,
+                              command=self._toggle_advanced, style="Small.TButton")
+        adv_btn.place(in_=self._top_notebook, relx=1.0, x=-2, y=-2, anchor="ne")
 
         rx_tab = ttk.Frame(self._top_notebook, padding=4)
         self._top_notebook.add(rx_tab, text="RX")
@@ -862,6 +875,29 @@ class MEPGui:
         self._build_record_section(rx_tab, row=1)
         self._build_updown_section(rx_tab, row=2)
         self._build_rx_control_section(rx_tab, row=3)
+
+        tx_tab = ttk.Frame(self._top_notebook, padding=4)
+        self._top_notebook.add(tx_tab, text="TX")
+        tx_tab.columnconfigure(0, weight=1)
+
+        # Same flow as RX: Tune, then Up/Down Convert (shared — binds to the
+        # same StringVars as the RX instance above), then Control.
+        self._build_tx_tune_section(tx_tab, row=0)
+        self._build_updown_section(tx_tab, row=1)
+        self._build_tx_control_section(tx_tab, row=2)
+
+        # A ttk.Notebook sizes itself to whichever tab currently has the most
+        # content, which was pushing RX's tab (and the log box below it) around
+        # as TX content changed. Pin both tabs to RX's natural height instead.
+        rx_tab.update_idletasks()
+        fixed_tab_height = rx_tab.winfo_reqheight()
+        for tab in (rx_tab, tx_tab):
+            tab.configure(height=fixed_tab_height)
+            tab.grid_propagate(False)
+
+        # Synth LO preview depends on which tab is active (RX Start vs TX Center
+        # Freq) — switching tabs changes that without changing any variable.
+        self._top_notebook.bind("<<NotebookTabChanged>>", lambda _e: self._update_synth_lo())
 
         # ---- Status bar ---- #
         status_frame = ttk.LabelFrame(left, text="Status")
@@ -1182,6 +1218,53 @@ class MEPGui:
             command=self._toggle_rx_dwell,
         ).grid(row=3, column=2, sticky="w", padx=5, pady=4)
 
+    def _build_placeholder_entry(self, parent, var: tk.StringVar, placeholder: str, width: int = 20):
+        """A tk.Entry showing grayed-out hint text when empty and unfocused.
+
+        The hint is never written into ``var`` — it's a display-only overlay on
+        top of a plain Entry (not bound via textvariable), synced to ``var``
+        manually so callers reading ``var.get()`` always see "" when blank.
+        """
+        normal_fg = "black"
+        placeholder_fg = "grey"
+        entry = tk.Entry(parent, width=width)
+        entry._showing_placeholder = False
+
+        def _show_placeholder():
+            entry.delete(0, "end")
+            entry.insert(0, placeholder)
+            entry.configure(foreground=placeholder_fg)
+            entry._showing_placeholder = True
+
+        def _clear_placeholder():
+            if entry._showing_placeholder:
+                entry.delete(0, "end")
+                entry.configure(foreground=normal_fg)
+                entry._showing_placeholder = False
+
+        def _on_focus_in(_e):
+            _clear_placeholder()
+
+        def _on_focus_out(_e):
+            var.set("" if entry._showing_placeholder else entry.get())
+            if not entry.get():
+                _show_placeholder()
+
+        def _on_keyrelease(_e):
+            if not entry._showing_placeholder:
+                var.set(entry.get())
+
+        entry.bind("<FocusIn>", _on_focus_in)
+        entry.bind("<FocusOut>", _on_focus_out)
+        entry.bind("<KeyRelease>", _on_keyrelease)
+
+        if var.get():
+            entry.insert(0, var.get())
+        else:
+            _show_placeholder()
+
+        return entry
+
     def _build_record_section(self, parent: ttk.Frame, row: int):
         frame = ttk.LabelFrame(parent, text="Record")
         frame.grid(row=row, column=0, padx=10, pady=6, sticky="ew")
@@ -1191,8 +1274,9 @@ class MEPGui:
         ttk.Label(frame, text="Capture Name").grid(
             row=0, column=0, sticky="w", padx=5, pady=4)
         self._vars["capture_name"] = tk.StringVar(value="")
-        ttk.Entry(frame, textvariable=self._vars["capture_name"], width=20).grid(
-            row=0, column=1, columnspan=3, sticky="ew", padx=5, pady=4)
+        self._build_placeholder_entry(
+            frame, self._vars["capture_name"], "leave blank for preview", width=20,
+        ).grid(row=0, column=1, columnspan=3, sticky="ew", padx=5, pady=4)
 
         ttk.Label(frame, text="Channel").grid(
             row=1, column=0, sticky="w", padx=5, pady=4)
@@ -1211,15 +1295,31 @@ class MEPGui:
         ).grid(row=1, column=3, sticky="ew", padx=5, pady=4)
 
     def _build_updown_section(self, parent: ttk.Frame, row: int):
+        """Build one instance of the Up/Down Convert panel.
+
+        Called once per tab (RX, TX) — both instances bind to the same shared
+        StringVars, since there is only one physical tuner/oscillator. Widgets
+        that need their enabled state toggled are tracked in lists so every
+        instance stays in sync via _on_tuner_change.
+        """
+        first_build = "tuner" not in self._vars
+
         frame = ttk.LabelFrame(parent, text="Up/Down Convert")
         frame.grid(row=row, column=0, padx=10, pady=6, sticky="ew")
         frame.columnconfigure(1, weight=1)
         frame.columnconfigure(3, weight=1)
 
+        if first_build:
+            self._vars["tuner"] = tk.StringVar(value="None")
+            self._vars["adc_if_mhz"] = tk.StringVar(value="1090")
+            self._vars["injection_mode"] = tk.StringVar(value="High")
+            self._vars["synth_lo"] = tk.StringVar(value="—")
+            self._if_entries = []
+            self._injection_combos = []
+
         # Row 0: Tuner | RFSoC IF
         ttk.Label(frame, text="Tuner").grid(
             row=0, column=0, sticky="w", padx=5, pady=4)
-        self._vars["tuner"] = tk.StringVar(value="None")
         ttk.Combobox(
             frame, textvariable=self._vars["tuner"],
             values=TUNER_OPTIONS, width=16, state="readonly",
@@ -1227,52 +1327,45 @@ class MEPGui:
 
         ttk.Label(frame, text="RFSoC IF (MHz)").grid(
             row=0, column=2, sticky="w", padx=5, pady=4)
-        self._vars["adc_if_mhz"] = tk.StringVar(value="1090")
-        self._if_entry = ttk.Entry(
+        if_entry = ttk.Entry(
             frame, textvariable=self._vars["adc_if_mhz"], width=16, state="disabled")
-        self._if_entry.grid(row=0, column=3, sticky="ew", padx=5, pady=4)
+        if_entry.grid(row=0, column=3, sticky="ew", padx=5, pady=4)
+        self._if_entries.append(if_entry)
 
         # Row 1: Injection Mode | Synth LO
         ttk.Label(frame, text="Injection Mode").grid(
             row=1, column=0, sticky="w", padx=5, pady=4)
-        self._vars["injection_mode"] = tk.StringVar(value="High")
-        self._injection_combo = ttk.Combobox(
+        injection_combo = ttk.Combobox(
             frame, textvariable=self._vars["injection_mode"],
             values=["High", "Low"], width=16, state="readonly",
         )
-        self._injection_combo.grid(row=1, column=1, sticky="ew", padx=5, pady=4)
+        injection_combo.grid(row=1, column=1, sticky="ew", padx=5, pady=4)
+        self._injection_combos.append(injection_combo)
 
         ttk.Label(frame, text="Synth LO (MHz)").grid(
             row=1, column=2, sticky="w", padx=5, pady=4)
-        self._vars["synth_lo"] = tk.StringVar(value="—")
         ttk.Entry(
             frame, textvariable=self._vars["synth_lo"], width=16, state="disabled",
         ).grid(row=1, column=3, sticky="ew", padx=5, pady=4)
 
-        self._vars["tuner"].trace_add("write", self._on_tuner_change)
-        self._vars["freq_start"].trace_add("write", self._update_synth_lo)
-        self._vars["adc_if_mhz"].trace_add("write", self._update_synth_lo)
-        self._vars["injection_mode"].trace_add("write", self._update_synth_lo)
-        self._on_tuner_change()
-        self._update_synth_lo()
+        if first_build:
+            self._vars["tuner"].trace_add("write", self._on_tuner_change)
+            self._vars["freq_start"].trace_add("write", self._update_synth_lo)
+            self._vars["adc_if_mhz"].trace_add("write", self._update_synth_lo)
+            self._vars["injection_mode"].trace_add("write", self._update_synth_lo)
+            self._on_tuner_change()
+            self._update_synth_lo()
 
     def _build_rx_control_section(self, parent: ttk.Frame, row: int):
-        frame = ttk.LabelFrame(parent, text="Control")
+        frame = ttk.LabelFrame(parent, text="Receive Control")
         frame.grid(row=row, column=0, padx=10, pady=6, sticky="ew")
         frame.columnconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
-        frame.columnconfigure(2, weight=1)
 
-        ttk.Button(frame, text="Start",
+        ttk.Button(frame, text="Start/Update", width=14,
                    command=self._start).grid(row=0, column=0, padx=4, pady=3, sticky="ew")
-        ttk.Button(frame, text="Stop",
+        ttk.Button(frame, text="Stop", width=14,
                    command=self._stop_all).grid(row=0, column=1, padx=4, pady=3, sticky="ew")
-
-        # Global toggle for the shared Advanced panel; not an RX/TX action.
-        self._adv_btn_text = tk.StringVar(value="\u25b6 Advanced")
-        ttk.Button(frame, textvariable=self._adv_btn_text,
-                   command=self._toggle_advanced).grid(
-            row=0, column=2, padx=4, pady=3, sticky="ew")
 
     def _build_advanced_section(self, parent: ttk.Frame):
         frame = ttk.LabelFrame(parent, text="Advanced Options", width=ADV_PANEL_WIDTH)
@@ -1300,7 +1393,6 @@ class MEPGui:
             "SPEC": self._build_spec_tab,
             "TUN":  self._build_tun_tab,
             "MQTT": self._build_mqtt_tab,
-            "TX":   self._build_tx_tab,
         }
         self._tab_frames = {}
         self._tabs_built: set[str] = set()
@@ -3375,64 +3467,72 @@ class MEPGui:
 
         # ---- TX tab ---- #
 
-    def _build_tx_tab(self, frame: ttk.Frame):
-        frame.columnconfigure(0, weight=1)
-
-        def _ro_row(parent, row, label, key, unit=""):
-            sv = tk.StringVar(value="-")
-            self._vars[key] = sv
-            ttk.Label(parent, text=label).grid(
-                row=row, column=0, sticky="w", padx=5, pady=2)
-            e = ttk.Entry(parent, textvariable=sv, state="readonly", width=18)
-            e.grid(row=row, column=1, sticky="ew", padx=5, pady=2)
-            self._bind_copy_menu(e, sv)
-            if unit:
-                ttk.Label(parent, text=unit, foreground="grey").grid(
-                    row=row, column=2, sticky="w")
-
-        st_f = ttk.LabelFrame(frame, text="TX Status")
-        st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
-        st_f.columnconfigure(1, weight=1)
-        _ro_row(st_f, 0, "Inferred Transmit Status", "tx_st_transmitting")
-        _ro_row(st_f, 1, "TX Channels", "tx_st_channels")
-        _ro_row(st_f, 2, "Center Frequency", "tx_st_center_freq", "MHz")
-        _ro_row(st_f, 3, "Offset Frequency", "tx_st_offset_freq", "MHz")
-        _ro_row(st_f, 4, "Amplitude", "tx_st_amplitude", "bins")
-
-        # Settings frame is staging only: editing fields changes local values with
-        # zero hardware effect. Nothing radiates until Start/Update is pressed.
-        set_f = ttk.LabelFrame(frame, text="Manual Control (press Start/Update to apply)")
-        set_f.grid(row=1, column=0, padx=4, pady=2, sticky="ew")
-        set_f.columnconfigure(1, weight=0)
-
+    def _build_tx_tune_section(self, frame: ttk.Frame, row: int):
+        """TX 'Tune' frame: staged center/offset/amplitude/channel plus the one
+        status readout worth keeping at a glance (the rest duplicated the staged
+        fields and added nothing — see _tx_apply, which still updates the other
+        tx_st_* vars for any future consumer, just not shown here).
+        """
         def _range_hint(text):
             return dict(text=text, foreground="grey", font=("TkDefaultFont", 8))
 
-        ttk.Label(set_f, text="Center Freq (MHz)").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        tune_f = ttk.LabelFrame(frame, text="Tune")
+        tune_f.grid(row=row, column=0, padx=10, pady=6, sticky="ew")
+        tune_f.columnconfigure(1, weight=0)
+
+        ttk.Label(tune_f, text="Center Freq (MHz)").grid(row=0, column=0, sticky="w", padx=5, pady=3)
         self._vars["tx_center_freq"] = tk.StringVar(value="0")
-        ttk.Entry(set_f, textvariable=self._vars["tx_center_freq"], width=10).grid(row=0, column=1, sticky="w", padx=5, pady=3)
-        ttk.Label(set_f, **_range_hint("MHz (no enforced limit)")).grid(row=0, column=2, sticky="w", padx=5, pady=3)
+        ttk.Entry(tune_f, textvariable=self._vars["tx_center_freq"], width=10).grid(row=0, column=1, sticky="w", padx=5, pady=3)
+        ttk.Label(tune_f, **_range_hint("MHz (no enforced limit)")).grid(row=0, column=2, sticky="w", padx=5, pady=3)
+        self._vars["tx_center_freq"].trace_add("write", self._update_synth_lo)
 
-        ttk.Label(set_f, text="Offset Freq (MHz)").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(tune_f, text="Offset Freq (MHz)").grid(row=1, column=0, sticky="w", padx=5, pady=3)
         self._vars["tx_offset_freq"] = tk.StringVar(value="0")
-        ttk.Entry(set_f, textvariable=self._vars["tx_offset_freq"], width=10).grid(row=1, column=1, sticky="w", padx=5, pady=3)
-        ttk.Label(set_f, **_range_hint(f"|offset| < {TX_OFFSET_FREQ_MAX_MHZ} MHz")).grid(row=1, column=2, sticky="w", padx=5, pady=3)
+        ttk.Entry(tune_f, textvariable=self._vars["tx_offset_freq"], width=10).grid(row=1, column=1, sticky="w", padx=5, pady=3)
+        ttk.Label(tune_f, **_range_hint(f"|offset| < {TX_OFFSET_FREQ_MAX_MHZ} MHz")).grid(row=1, column=2, sticky="w", padx=5, pady=3)
 
-        ttk.Label(set_f, text="Amplitude (bins)").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(tune_f, text="Amplitude (bins)").grid(row=2, column=0, sticky="w", padx=5, pady=3)
         self._vars["tx_amplitude_bins"] = tk.IntVar(value=0)
-        ttk.Spinbox(set_f, from_=0, to=TX_AMPLITUDE_BINS_MAX, increment=1, textvariable=self._vars["tx_amplitude_bins"], width=8).grid(row=2, column=1, sticky="w", padx=5, pady=3)
-        ttk.Label(set_f, **_range_hint(f"0 to {TX_AMPLITUDE_BINS_MAX}")).grid(row=2, column=2, sticky="w", padx=5, pady=3)
+        ttk.Spinbox(tune_f, from_=0, to=TX_AMPLITUDE_BINS_MAX, increment=1, textvariable=self._vars["tx_amplitude_bins"], width=8).grid(row=2, column=1, sticky="w", padx=5, pady=3)
+        ttk.Label(tune_f, **_range_hint(f"0 to {TX_AMPLITUDE_BINS_MAX}")).grid(row=2, column=2, sticky="w", padx=5, pady=3)
 
-        ttk.Label(set_f, text="Channel").grid(row=3, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(tune_f, text="Channel").grid(row=3, column=0, sticky="w", padx=5, pady=3)
         self._vars["tx_channel"] = tk.StringVar(value=TX_CHANNEL_OPTIONS[0])
-        ttk.Combobox(set_f, textvariable=self._vars["tx_channel"], values=list(TX_CHANNEL_OPTIONS), width=8, state="readonly").grid(row=3, column=1, sticky="w", padx=5, pady=3)
-        ttk.Label(set_f, **_range_hint(", ".join(TX_CHANNEL_OPTIONS))).grid(row=3, column=2, sticky="w", padx=5, pady=3)
+        ttk.Combobox(tune_f, textvariable=self._vars["tx_channel"], values=list(TX_CHANNEL_OPTIONS), width=8, state="readonly").grid(row=3, column=1, sticky="w", padx=5, pady=3)
+        ttk.Label(tune_f, **_range_hint(", ".join(TX_CHANNEL_OPTIONS))).grid(row=3, column=2, sticky="w", padx=5, pady=3)
 
-        # Start/Stop frame: the only controls that touch the radio.
+        ttk.Separator(tune_f, orient="horizontal").grid(row=4, column=0, columnspan=3, sticky="ew", padx=5, pady=(6, 4))
+
+        # Live status now shown in Transmit Control (above the warning), not here.
+        self._vars["tx_st_transmitting"] = tk.StringVar(value="-")
+
+        # No longer displayed (duplicated the staged fields above), but _tx_apply
+        # still updates these from live status — keep the vars so it doesn't KeyError.
+        self._vars["tx_st_channels"] = tk.StringVar(value="-")
+        self._vars["tx_st_center_freq"] = tk.StringVar(value="-")
+        self._vars["tx_st_offset_freq"] = tk.StringVar(value="-")
+        self._vars["tx_st_amplitude"] = tk.StringVar(value="-")
+
+        # Populate with cached data so the tab shows current state immediately on
+        # first open. self.bus doesn't exist yet when this is built eagerly in
+        # _build_ui — the live RFSOC_STATUS_TOPIC listener (registered later in
+        # __init__) populates this shortly after the bus connects either way.
+        if hasattr(self, "bus"):
+            cached = self.bus.get_cached_status(RFSOC_STATUS_TOPIC)
+            if isinstance(cached, dict):
+                self._tx_apply(cached)
+
+    def _build_tx_control_section(self, frame: ttk.Frame, row: int):
         act_f = ttk.LabelFrame(frame, text="Transmit Control")
-        act_f.grid(row=2, column=0, padx=4, pady=(2, 4), sticky="ew")
+        act_f.grid(row=row, column=0, padx=10, pady=6, sticky="ew")
         act_f.columnconfigure(0, weight=1)
         act_f.columnconfigure(1, weight=1)
+
+        ttk.Label(act_f, text="Inferred Transmit Status").grid(
+            row=0, column=0, sticky="w", padx=5, pady=(4, 2))
+        status_entry = ttk.Entry(act_f, textvariable=self._vars["tx_st_transmitting"], state="readonly", width=18)
+        status_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=(4, 2))
+        self._bind_copy_menu(status_entry, self._vars["tx_st_transmitting"])
 
         ttk.Label(
             act_f,
@@ -3441,24 +3541,20 @@ class MEPGui:
                   "The operator bears full responsibility for compliance."),
             foreground="#b30000",
             font=("TkDefaultFont", 9, "bold"),
-            wraplength=420,
-            justify="left",
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 6))
+            wraplength=LEFT_PANEL_WIDTH - 110,
+            justify="center",
+            anchor="center",
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=(4, 6))
 
-        ttk.Button(act_f, text="Start / Update", command=self._tx_start_update_click).grid(
-            row=1, column=0, sticky="ew", padx=5, pady=(0, 4))
-        ttk.Button(act_f, text="Stop", command=self._tx_stop_click).grid(
-            row=1, column=1, sticky="ew", padx=5, pady=(0, 4))
+        ttk.Button(act_f, text="Start / Update", width=14, command=self._tx_start_update_click).grid(
+            row=2, column=0, sticky="ew", padx=5, pady=(0, 4))
+        ttk.Button(act_f, text="Stop", width=14, command=self._tx_stop_click).grid(
+            row=2, column=1, sticky="ew", padx=5, pady=(0, 4))
 
         self._vars["tx_action_status"] = tk.StringVar(value="")
         ttk.Label(act_f, textvariable=self._vars["tx_action_status"],
                   foreground="grey").grid(
-            row=2, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 4))
-
-        # Populate with cached data so tab shows current state immediately on first open.
-        cached = self.bus.get_cached_status(RFSOC_STATUS_TOPIC)
-        if isinstance(cached, dict):
-            self._tx_apply(cached)
+            row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 4))
 
     # ---- TUN tab ---- #
 
@@ -4511,7 +4607,7 @@ class MEPGui:
             self._vars[key].trace_add("write", self._rec_preview_draft)
 
     def _sync_conjugate_policy_ui_from_capture(self):
-        """Sync conjugate policy and effective state from CaptureController."""
+        """Sync conjugate policy and effective state from ControllerRx."""
         if self.capture is None:
             current_policy = self._vars["conjugate_policy"].get()
             if (not self._conjugate_policy_user_override) or (current_policy not in CONJUGATE_POLICY_OPTIONS):
@@ -4527,7 +4623,7 @@ class MEPGui:
         self._vars["conjugate_actual"].set(str(bool(state.get("apply_conjugate"))))
 
     def _conjugate_policy_changed(self, *_):
-        """Apply user-selected policy to CaptureController."""
+        """Apply user-selected policy to ControllerRx."""
         self._conjugate_policy_user_override = True
         policy = self._vars["conjugate_policy"].get()
         if policy not in CONJUGATE_POLICY_OPTIONS:
@@ -4541,7 +4637,7 @@ class MEPGui:
         self._update_conjugate_actual_display()
 
     def _update_conjugate_actual_display(self):
-        """Refresh conjugate display from CaptureController state."""
+        """Refresh conjugate display from ControllerRx state."""
         self._sync_conjugate_policy_ui_from_capture()
 
     # ------------------------------------------------------------------ #
@@ -5524,6 +5620,8 @@ class MEPGui:
             logging.error("TX: invalid staged value; start/update aborted")
             return
         channel = self._vars["tx_channel"].get().strip()
+        tuner, adc_if_mhz, injection = self._parse_tuner_params()
+        self.tx.configure_tuner(tuner, adc_if_mhz, injection)
         if not self.tx.tx_start(channel, center_mhz, offset_mhz, amplitude):
             self._vars["tx_action_status"].set("Failed to start TX")
             logging.error("TX: start failed")
@@ -5885,7 +5983,7 @@ class MEPGui:
         self._vars["rec_status"].set(data.get("state", "—"))
 
     def _profile_holoscan_click(self):
-        """Trigger holoscan profiling via CaptureController."""
+        """Trigger holoscan profiling via ControllerRx."""
         try:
             # Validate required profiling GUI state variables exist
             required_vars = ["prof_trace", "prof_duration", "prof_output_path",
@@ -5917,12 +6015,12 @@ class MEPGui:
             try:
                 self._configure_mep(params)
             except Exception as e:
-                logging.exception("CaptureController init failed")
+                logging.exception("ControllerRx init failed")
                 self._vars["prof_status"].set(f"Failed to initialize: {e}")
                 return
 
             if self.capture is None:
-                self._vars["prof_status"].set("CaptureController not available")
+                self._vars["prof_status"].set("ControllerRx not available")
                 return
 
             freq_hz = int(params["freq_start"] * 1e6)
@@ -6015,8 +6113,10 @@ class MEPGui:
     def _on_tuner_change(self, *_):
         tuner_enabled = self._vars["tuner"].get() != "None"
         state = "normal" if tuner_enabled else "disabled"
-        self._if_entry.configure(state=state)
-        self._injection_combo.configure(state="readonly" if tuner_enabled else "disabled")
+        for if_entry in self._if_entries:
+            if_entry.configure(state=state)
+        for injection_combo in self._injection_combos:
+            injection_combo.configure(state="readonly" if tuner_enabled else "disabled")
         self._update_synth_lo()
 
     def _update_synth_lo(self, *_):
@@ -6024,22 +6124,36 @@ class MEPGui:
             self._vars["synth_lo"].set("—")
             return
         try:
-            rf_mhz = float(self._vars["freq_start"].get())
+            rf_mhz = float(self._synth_lo_rf_source_mhz())
             if_mhz = float(self._vars["adc_if_mhz"].get())
             mode   = self._vars["injection_mode"].get()
-            lo_mhz = rf_mhz + if_mhz if mode == "High" else rf_mhz - if_mhz
+            lo_mhz = resolve_lo_mhz(rf_mhz, if_mhz, mode)
             self._vars["synth_lo"].set(f"{lo_mhz:.3f}")
         except ValueError:
             self._vars["synth_lo"].set("—")
 
+    def _synth_lo_rf_source_mhz(self) -> str:
+        """Frequency feeding the Synth LO preview: TX's center freq when the TX
+        tab is active, RX's Start field otherwise (the field is shared/synced,
+        but the two tabs plan for different legs of the one physical oscillator).
+        """
+        if hasattr(self, "_top_notebook") and "tx_center_freq" in self._vars:
+            try:
+                current = self._top_notebook.tab(self._top_notebook.select(), "text")
+            except tk.TclError:
+                current = "RX"
+            if current == "TX":
+                return self._vars["tx_center_freq"].get()
+        return self._vars["freq_start"].get()
+
     def _toggle_advanced(self):
         if self._adv_frame.winfo_viewable():
             self._adv_frame.grid_remove()
-            self._adv_btn_text.set("\u25b6 Advanced")
+            self._adv_btn_text.set("Show Advanced Options \u25b6")
         else:
             self._ensure_tab_built(self._get_current_tab_text())
             self._adv_frame.grid()
-            self._adv_btn_text.set("\u25c0 Advanced")
+            self._adv_btn_text.set("Hide Advanced Options \u25c0")
 
     # ------------------------------------------------------------------ #
     #  Logging
@@ -6082,20 +6196,24 @@ class MEPGui:
     #  Parameter parsing
     # ------------------------------------------------------------------ #
 
+    def _parse_tuner_params(self) -> tuple:
+        """Return (tuner, adc_if_mhz, injection) from the shared Up/Down Convert vars."""
+        tuner_str = self._vars["tuner"].get()
+        tuner = None if tuner_str == "None" else tuner_str
+        adc_if_s = self._vars["adc_if_mhz"].get().strip()
+        adc_if_mhz = float(adc_if_s) if (adc_if_s and tuner) else None
+        injection = self._vars["injection_mode"].get().lower()
+        return tuner, adc_if_mhz, injection
+
     def _parse_single_params(self) -> dict:
         freq_start = float(self._vars["freq_start"].get())
         channel    = self._vars["channel"].get()
-        tuner_str  = self._vars["tuner"].get()
-        tuner      = None if tuner_str == "None" else tuner_str
-
-        adc_if_s   = self._vars["adc_if_mhz"].get().strip()
-        adc_if_mhz = float(adc_if_s) if (adc_if_s and tuner) else None
+        tuner, adc_if_mhz, injection = self._parse_tuner_params()
 
         capture_name_s = self._vars["capture_name"].get().strip()
         capture_name   = capture_name_s if capture_name_s else None
 
         sample_rate_mhz = int(self._vars["sample_rate_mhz"].get())
-        injection       = self._vars["injection_mode"].get().lower()
         dwell_enabled   = self._vars["dwell_enabled"].get()
         dwell_raw       = self._vars["dwell"].get().strip()
 
@@ -6126,17 +6244,12 @@ class MEPGui:
         dwell      = float(self._vars["dwell"].get())
 
         channel    = self._vars["channel"].get()
-        tuner_str  = self._vars["tuner"].get()
-        tuner      = None if tuner_str == "None" else tuner_str
-
-        adc_if_s   = self._vars["adc_if_mhz"].get().strip()
-        adc_if_mhz = float(adc_if_s) if (adc_if_s and tuner) else None
+        tuner, adc_if_mhz, injection = self._parse_tuner_params()
 
         capture_name_s = self._vars["capture_name"].get().strip()
         capture_name   = capture_name_s if capture_name_s else None
 
         sample_rate_mhz = int(self._vars["sample_rate_mhz"].get())
-        injection       = self._vars["injection_mode"].get().lower()
 
         return {
             "freq_start":       freq_start,
@@ -6156,7 +6269,7 @@ class MEPGui:
     # ------------------------------------------------------------------ #
 
     def _configure_mep(self, params: dict):
-        """Create or update CaptureController with GUI params."""
+        """Create or update ControllerRx with GUI params."""
         self.capture = self._get_or_create_capture(params)
         self.capture.set_recorder_overrides(self._rec_pending_overrides)
         if self._conjugate_policy_user_override:

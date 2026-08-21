@@ -5,21 +5,23 @@ start_mep_rx.py
 MEP system controller — MQTT gateway for RFSoC, recorder, tuner, and AFE.
 
 Architecture:
-    MEPBus            — always-on MQTT connection, listener registry, thin command publishers
-    CaptureController — on-demand sweep/record orchestrator (owns sync-wait + recipes)
-    TxController      — DAC function-generator (transmit) orchestrator, independent of RX
+    MEPBus          — always-on MQTT connection, listener registry, thin command publishers
+    ControllerTuner — shared external-tuner state (one physical oscillator, used by both RX/TX)
+    ControllerRx    — on-demand sweep/record orchestrator (owns sync-wait + recipes)
+    ControllerTx    — DAC function-generator (transmit) orchestrator, independent of RX
     System functions   — pure subprocess utilities (Jetson power, network info, NTP)
 
 Usage (CLI):
     python start_mep_rx.py -f1 7000 -f2 8000 -s 10 -d 60 -c A -r 10
 
 Usage (imported by mep_gui.py):
-    from start_mep_rx import MEPBus, CaptureController, TxController
+    from start_mep_rx import MEPBus, ControllerTuner, ControllerRx, ControllerTx
     bus = MEPBus()
-    cap = CaptureController(bus)
+    tuner_ctrl = ControllerTuner(bus)
+    cap = ControllerRx(bus, tuner_ctrl)
     cap.configure_sweep(channel="A", sample_rate_mhz=10)
     cap.run_sweep(freqs_hz, dwell_s=60)
-    tx = TxController(bus)
+    tx = ControllerTx(bus, tuner_ctrl)
     tx.tx_start(channel="A", center_freq_mhz=2400, offset_freq_mhz=1, amplitude_bins=4096)
     tx.tx_stop()
 
@@ -157,6 +159,15 @@ def resolve_injection(tuner: str, injection_override: str = None) -> str:
     if tuner.upper() in TUNERS:
         return TUNERS[tuner.upper()]["injection_side"]
     raise ValueError(f"Tuner {tuner!r} not in TUNERS — add it or pass --injection")
+
+
+def resolve_lo_mhz(f_mhz: float, if_mhz: float, injection: str) -> float:
+    """External-tuner LO (MHz) for a target RF frequency, given IF and injection side.
+
+    Single source of truth for this formula — shared by RX (tune_and_arm),
+    TX (ControllerTx), capture-settings metadata, and the GUI's Synth LO preview.
+    """
+    return f_mhz + if_mhz if str(injection).lower() == "high" else f_mhz - if_mhz
 
 
 def tuner_type_arg(x: str):
@@ -1795,7 +1806,7 @@ class MEPBus:
         return len(topic_parts) == len(pattern_parts)
 
     def publish_command(self, topic: str, payload: dict, sleep_s: float = 0.1):
-        """Publish a JSON command to a topic. Used by CaptureController and thin publishers."""
+        """Publish a JSON command to a topic. Used by ControllerRx and thin publishers."""
         if not self._connected:
             logging.warning(
                 "MQTT offline: command not sent to %s payload=%s",
@@ -2329,10 +2340,12 @@ class MEPBus:
 
         Owns the RFSoC TX wire-field schema so consumers never read raw keys.
 
-        The firmware reports no explicit "transmitting" flag, so it is INFERRED:
-        a function generator radiates when a channel is selected and amplitude is
-        above zero. Offset 0 still emits a CW carrier, so offset is not part of the
-        test.
+        Prefers the firmware's explicit "tx_enabled" flag when present. Older
+        firmware without that field falls back to inference: a function
+        generator radiates when a channel is selected and amplitude is above
+        zero. That fallback is unreliable across tx_stop, since tx_channels/
+        tx_amplitude_bins are staged config that stop does not clear — offset 0
+        still emits a CW carrier, so offset is not part of either test.
 
         Returns:
           {
@@ -2348,7 +2361,11 @@ class MEPBus:
             return None
         channels = payload.get("tx_channels") or []
         amplitude_bins = payload.get("tx_amplitude_bins")
-        transmitting = bool(channels) and isinstance(amplitude_bins, (int, float)) and amplitude_bins > 0
+        tx_enabled = payload.get("tx_enabled")
+        if isinstance(tx_enabled, bool):
+            transmitting = tx_enabled
+        else:
+            transmitting = bool(channels) and isinstance(amplitude_bins, (int, float)) and amplitude_bins > 0
         return {
             "channels": channels,
             "center_freq": payload.get("tx_center_freq"),
@@ -2357,6 +2374,7 @@ class MEPBus:
             "transmitting": transmitting,
             "raw": payload,
         }
+
 
     @staticmethod
     def _tlm_to_str(tlm) -> str:
@@ -2516,68 +2534,18 @@ class CaptureTelemetryLogger:
         logging.info("Capture telemetry log stopped")
 
 
-class CaptureController:
-    """On-demand sweep/record orchestrator — owns sync-wait infra and recipes.
+class ControllerTuner:
+    """Shared external-tuner state: selection/init/readiness/LO-apply logic.
 
-    Created when the user clicks Start (or from CLI). Takes a MEPBus reference
-    for all MQTT communication. Owns transient session state: sweep config,
-    tuner session tracking, recorder state, stop flag, synchronous wait.
+    Instantiated once and held by both ControllerRx (RX) and ControllerTx (TX)
+    so the two independent operational paths read/apply the same tuner state —
+    there is only one physical oscillator: whichever side last calls apply_lo
+    is what the hardware is actually tuned to.
     """
 
     def __init__(self, bus: MEPBus):
         self.bus = bus
-        self.telemetry_logger = CaptureTelemetryLogger(bus)
-
-        # ---- Sweep config (set via configure_sweep) ----
-        self.channel: Optional[str] = None
-        self.sample_rate_mhz: Optional[int] = None
-        self.tuner: Optional[str] = None
-        self.adc_if_mhz: Optional[float] = None
-        self.injection: Optional[str] = None
-        self.capture_name: Optional[str] = None
-        self.conjugate_policy: str = CONJUGATE_POLICY_DEFAULT
-        self._tuner_request_counter = 0
-
-        # ---- Recorder "what changed" state ----
-        self._active_channel = None
-        self._active_sample_rate = None
-        self._recorder_running = False
-        self.recorder_overrides: dict[str, object] = {}
-
-        # ---- Stop flag for sweeps ----
-        self._stop_flag = threading.Event()
-
-        # ---- Synchronous wait infrastructure (for sweep orchestration) ----
-        self._tlm = None
-        self._tlm_lock = threading.Lock()
-        self._tlm_event = threading.Event()
-
-        self._status = {t: None for t in _SYNC_STATUS_TOPICS}
-        self._status_lock = threading.Lock()
-        self._status_events = {t: threading.Event() for t in _SYNC_STATUS_TOPICS}
-
-        # ---- Register sync-wait listeners on bus ----
-        self._sync_cbs = {}
-
-        def _make_rfsoc_cb():
-            def _cb(data):
-                with self._tlm_lock:
-                    self._tlm = data
-                self._tlm_event.set()
-            return _cb
-
-        self._sync_cbs[RFSOC_STATUS_TOPIC] = _make_rfsoc_cb()
-        self.bus.on_status(RFSOC_STATUS_TOPIC, self._sync_cbs[RFSOC_STATUS_TOPIC])
-
-        for topic in _SYNC_STATUS_TOPICS:
-            def _make_status_cb(t):
-                def _cb(data):
-                    with self._status_lock:
-                        self._status[t] = data
-                    self._status_events[t].set()
-                return _cb
-            self._sync_cbs[topic] = _make_status_cb(topic)
-            self.bus.on_status(topic, self._sync_cbs[topic])
+        self._init_tuner_state()
 
     def _require_mqtt(self, action: str) -> bool:
         """Return False and log once when broker is offline for a control action."""
@@ -2593,147 +2561,22 @@ class CaptureController:
         )
         return False
 
-    def close(self):
-        """Remove sync-wait listeners from bus and stop recorder (best-effort)."""
-        for topic, cb in self._sync_cbs.items():
-            self.bus.remove_listener(topic, cb)
-        self._sync_cbs.clear()
-        self.telemetry_logger.stop()
-        if self._recorder_running:
-            try:
-                self.stop_recorder()
-            except Exception:
-                pass
+    def _init_tuner_state(self):
+        self.tuner: Optional[str] = None
+        self.adc_if_mhz: Optional[float] = None
+        self.injection: Optional[str] = None
+        self._tuner_request_counter = 0
 
-    # ------------------------------------------------------------------ #
-    #  Sweep configuration                                                 #
-    # ------------------------------------------------------------------ #
-
-    def configure_sweep(
-        self,
-        channel: str,
-        sample_rate_mhz: int,
-        tuner: str = None,
-        adc_if_mhz: float = None,
-        injection: str = None,
-        capture_name: str = None,
-    ):
-        """Set parameters used by run_sweep / run_single / start_recorder."""
-        self.channel = channel.upper()
-        self.sample_rate_mhz = sample_rate_mhz
+    def configure(self, tuner: str = None, adc_if_mhz: float = None, injection: str = None):
+        """Stage tuner selection/IF/injection and kick off init if needed."""
         self.tuner = _normalize_tuner(tuner)
         self.adc_if_mhz = adc_if_mhz
-        self.capture_name = capture_name
 
         if self.tuner is None:
             self.injection = None
         else:
             self.injection = resolve_injection(self.tuner, injection)
             self._ensure_tuner_initialized()
-
-    def set_recorder_overrides(self, overrides: dict[str, object]):
-        """Replace the persistent recorder overrides used after config.load."""
-        self.recorder_overrides = dict(overrides)
-
-    def get_recorder_preset_model(self) -> dict:
-        """Return the selected preset resolved with no REC overrides."""
-        return resolve_recorder_preset(self.sample_rate_mhz)
-
-    def preview_recorder_settings(self, draft: dict[str, object]) -> dict:
-        """Resolve draft REC settings without changing staged state."""
-        return preview_recorder_settings(self.sample_rate_mhz, draft)
-
-    def stage_recorder_settings(self, draft: dict[str, object]) -> dict:
-        """Atomically validate and replace staged REC overrides."""
-        model = self.preview_recorder_settings(draft)
-        if not model.get("available"):
-            raise ValueError(model.get("error") or "Recorder settings are unavailable")
-        self.recorder_overrides = dict(model["overrides"])
-        return model
-
-    def get_staged_recorder_model(self) -> dict:
-        """Return the selected preset resolved with current staged overrides."""
-        return resolve_recorder_preset(self.sample_rate_mhz, self.recorder_overrides)
-
-    def clear_recorder_overrides(self):
-        """Clear the persistent recorder overrides."""
-        self.recorder_overrides.clear()
-
-    def apply_recorder_overrides(self):
-        """Reapply the persistent recorder overrides after config.load."""
-        if not self.recorder_overrides:
-            return
-
-        logging.info(
-            "Applying recorder overrides: %s",
-            ", ".join(sorted(self.recorder_overrides.keys())),
-        )
-        for key, value in self.recorder_overrides.items():
-            self.bus.recorder_config_set(key, value)
-
-    # ------------------------------------------------------------------ #
-    #  Synchronous wait helpers (used during sweep orchestration)          #
-    # ------------------------------------------------------------------ #
-
-    def get_tlm(self, timeout_s: float = 2.0):
-        """Request and return the latest RFSoC telemetry, or None on timeout."""
-        if not self.bus.is_connected():
-            return None
-        with self._tlm_lock:
-            self._tlm = None
-        self._tlm_event.clear()
-        self.bus.publish_command(
-            RFSOC_CMD_TOPIC,
-            {"task_name": "get", "arguments": ["tlm"]},
-            sleep_s=0,
-        )
-        if self._tlm_event.wait(timeout=timeout_s):
-            with self._tlm_lock:
-                return self._tlm
-        return None
-
-    def _wait_for_status(self, topic: str, timeout_s: float = 2.0, pre_armed: bool = False):
-        """Block until a status message arrives on topic, return payload or None.
-
-        Set pre_armed=True when the event has already been cleared before the
-        triggering command was sent (avoids missing a fast response).
-        """
-        if topic not in self._status_events:
-            raise ValueError(f"Unknown sync status topic: {topic!r}")
-        if not self.bus.is_connected():
-            logging.warning(f"Cannot wait for {topic}: MQTT offline")
-            return None
-        if not pre_armed:
-            self._status_events[topic].clear()
-            with self._status_lock:
-                self._status[topic] = None
-        if self._status_events[topic].wait(timeout=timeout_s):
-            with self._status_lock:
-                return self._status[topic]
-        logging.warning(f"No status from {topic} within {timeout_s}s — service may not be running")
-        return None
-
-    def wait_for_firmware_ready(self, max_wait_s: int = 30) -> bool:
-        """Poll rfsoc/status until f_s is a valid non-NaN positive number."""
-        if not self._require_mqtt("wait for RFSoC firmware"):
-            return False
-        logging.info("Waiting for RFSoC firmware to be ready...")
-        deadline = time.time() + max_wait_s
-        while time.time() < deadline:
-            tlm = self.get_tlm(timeout_s=2.0)
-            if tlm is not None:
-                f_s = tlm.get("f_s")
-                if isinstance(f_s, (int, float)) and f_s == f_s and f_s > 0:
-                    logging.info(f"RFSoC firmware ready: f_s={f_s / 1e6:.2f} MHz")
-                    return True
-            logging.debug("RFSoC not ready yet, waiting...")
-            time.sleep(1)
-        logging.error(f"RFSoC firmware not ready after {max_wait_s}s")
-        return False
-
-    # ------------------------------------------------------------------ #
-    #  Tuner readiness                                                     #
-    # ------------------------------------------------------------------ #
 
     def _resolved_tuner_name(self) -> Optional[str]:
         """Concrete hardware tuner name, resolving 'auto' via cached status.
@@ -2882,6 +2725,247 @@ class CaptureController:
         else:
             logging.debug(f"Unrecognized lock-status value {resp.get('value')!r}")
 
+    def apply_lo(self, f_mhz: float) -> Optional[float]:
+        """Wait for the tuner, compute LO from f_mhz via configured IF/injection, apply it.
+
+        Caller must ensure self.tuner is not None and self.adc_if_mhz is set.
+        Returns the applied LO (MHz), or None if the tuner never came online.
+        """
+        if not self._wait_for_tuner_ready():
+            return None
+        resolved_tuner = self._resolved_tuner_name()
+        lo_mhz = resolve_lo_mhz(f_mhz, self.adc_if_mhz, self.injection)
+        self.bus.tuner_set_freq(lo_mhz)
+        time.sleep(0.1)
+        if resolved_tuner == "VALON":
+            self._report_tuner_lock()
+        return lo_mhz
+
+
+class ControllerRx:
+    """On-demand sweep/record orchestrator — owns sync-wait infra and recipes.
+
+    Created when the user clicks Start (or from CLI). Takes a MEPBus reference
+    for all MQTT communication, plus a ControllerTuner (shared with ControllerTx
+    when both exist, since there is only one physical tuner). Owns transient
+    session state: sweep config, recorder state, stop flag, synchronous wait.
+    """
+
+    def __init__(self, bus: MEPBus, tuner_ctrl: "ControllerTuner" = None):
+        self.bus = bus
+        self.telemetry_logger = CaptureTelemetryLogger(bus)
+        self.tuner_ctrl = tuner_ctrl if tuner_ctrl is not None else ControllerTuner(bus)
+
+        # ---- Sweep config (set via configure_sweep) ----
+        self.channel: Optional[str] = None
+        self.sample_rate_mhz: Optional[int] = None
+        self.capture_name: Optional[str] = None
+        self.conjugate_policy: str = CONJUGATE_POLICY_DEFAULT
+
+        # ---- Recorder "what changed" state ----
+        self._active_channel = None
+        self._active_sample_rate = None
+        self._recorder_running = False
+        self.recorder_overrides: dict[str, object] = {}
+
+        # ---- Stop flag for sweeps ----
+        self._stop_flag = threading.Event()
+
+        # ---- Synchronous wait infrastructure (for sweep orchestration) ----
+        self._tlm = None
+        self._tlm_lock = threading.Lock()
+        self._tlm_event = threading.Event()
+
+        self._status = {t: None for t in _SYNC_STATUS_TOPICS}
+        self._status_lock = threading.Lock()
+        self._status_events = {t: threading.Event() for t in _SYNC_STATUS_TOPICS}
+
+        # ---- Register sync-wait listeners on bus ----
+        self._sync_cbs = {}
+
+        def _make_rfsoc_cb():
+            def _cb(data):
+                with self._tlm_lock:
+                    self._tlm = data
+                self._tlm_event.set()
+            return _cb
+
+        self._sync_cbs[RFSOC_STATUS_TOPIC] = _make_rfsoc_cb()
+        self.bus.on_status(RFSOC_STATUS_TOPIC, self._sync_cbs[RFSOC_STATUS_TOPIC])
+
+        for topic in _SYNC_STATUS_TOPICS:
+            def _make_status_cb(t):
+                def _cb(data):
+                    with self._status_lock:
+                        self._status[t] = data
+                    self._status_events[t].set()
+                return _cb
+            self._sync_cbs[topic] = _make_status_cb(topic)
+            self.bus.on_status(topic, self._sync_cbs[topic])
+
+    def _require_mqtt(self, action: str) -> bool:
+        """Return False and log once when broker is offline for a control action."""
+        if self.bus.is_connected():
+            return True
+        status = self.bus.get_connection_status()
+        logging.error(
+            "Cannot %s while MQTT is offline (%s:%s). Last error: %s",
+            action,
+            status.get("broker"),
+            status.get("port"),
+            status.get("last_error") or "none",
+        )
+        return False
+
+    # ---- Read-only proxies onto the shared tuner state ----
+
+    @property
+    def tuner(self) -> Optional[str]:
+        return self.tuner_ctrl.tuner
+
+    @property
+    def adc_if_mhz(self) -> Optional[float]:
+        return self.tuner_ctrl.adc_if_mhz
+
+    @property
+    def injection(self) -> Optional[str]:
+        return self.tuner_ctrl.injection
+
+    def close(self):
+        """Remove sync-wait listeners from bus and stop recorder (best-effort)."""
+        for topic, cb in self._sync_cbs.items():
+            self.bus.remove_listener(topic, cb)
+        self._sync_cbs.clear()
+        self.telemetry_logger.stop()
+        if self._recorder_running:
+            try:
+                self.stop_recorder()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+    #  Sweep configuration                                                 #
+    # ------------------------------------------------------------------ #
+
+    def configure_sweep(
+        self,
+        channel: str,
+        sample_rate_mhz: int,
+        tuner: str = None,
+        adc_if_mhz: float = None,
+        injection: str = None,
+        capture_name: str = None,
+    ):
+        """Set parameters used by run_sweep / run_single / start_recorder."""
+        self.channel = channel.upper()
+        self.sample_rate_mhz = sample_rate_mhz
+        self.capture_name = capture_name
+        self.tuner_ctrl.configure(tuner, adc_if_mhz, injection)
+
+    def set_recorder_overrides(self, overrides: dict[str, object]):
+        """Replace the persistent recorder overrides used after config.load."""
+        self.recorder_overrides = dict(overrides)
+
+    def get_recorder_preset_model(self) -> dict:
+        """Return the selected preset resolved with no REC overrides."""
+        return resolve_recorder_preset(self.sample_rate_mhz)
+
+    def preview_recorder_settings(self, draft: dict[str, object]) -> dict:
+        """Resolve draft REC settings without changing staged state."""
+        return preview_recorder_settings(self.sample_rate_mhz, draft)
+
+    def stage_recorder_settings(self, draft: dict[str, object]) -> dict:
+        """Atomically validate and replace staged REC overrides."""
+        model = self.preview_recorder_settings(draft)
+        if not model.get("available"):
+            raise ValueError(model.get("error") or "Recorder settings are unavailable")
+        self.recorder_overrides = dict(model["overrides"])
+        return model
+
+    def get_staged_recorder_model(self) -> dict:
+        """Return the selected preset resolved with current staged overrides."""
+        return resolve_recorder_preset(self.sample_rate_mhz, self.recorder_overrides)
+
+    def clear_recorder_overrides(self):
+        """Clear the persistent recorder overrides."""
+        self.recorder_overrides.clear()
+
+    def apply_recorder_overrides(self):
+        """Reapply the persistent recorder overrides after config.load."""
+        if not self.recorder_overrides:
+            return
+
+        logging.info(
+            "Applying recorder overrides: %s",
+            ", ".join(sorted(self.recorder_overrides.keys())),
+        )
+        for key, value in self.recorder_overrides.items():
+            self.bus.recorder_config_set(key, value)
+
+    # ------------------------------------------------------------------ #
+    #  Synchronous wait helpers (used during sweep orchestration)          #
+    # ------------------------------------------------------------------ #
+
+    def get_tlm(self, timeout_s: float = 2.0):
+        """Request and return the latest RFSoC telemetry, or None on timeout."""
+        if not self.bus.is_connected():
+            return None
+        with self._tlm_lock:
+            self._tlm = None
+        self._tlm_event.clear()
+        self.bus.publish_command(
+            RFSOC_CMD_TOPIC,
+            {"task_name": "get", "arguments": ["tlm"]},
+            sleep_s=0,
+        )
+        if self._tlm_event.wait(timeout=timeout_s):
+            with self._tlm_lock:
+                return self._tlm
+        return None
+
+    def _wait_for_status(self, topic: str, timeout_s: float = 2.0, pre_armed: bool = False):
+        """Block until a status message arrives on topic, return payload or None.
+
+        Set pre_armed=True when the event has already been cleared before the
+        triggering command was sent (avoids missing a fast response).
+        """
+        if topic not in self._status_events:
+            raise ValueError(f"Unknown sync status topic: {topic!r}")
+        if not self.bus.is_connected():
+            logging.warning(f"Cannot wait for {topic}: MQTT offline")
+            return None
+        if not pre_armed:
+            self._status_events[topic].clear()
+            with self._status_lock:
+                self._status[topic] = None
+        if self._status_events[topic].wait(timeout=timeout_s):
+            with self._status_lock:
+                return self._status[topic]
+        logging.warning(f"No status from {topic} within {timeout_s}s — service may not be running")
+        return None
+
+    def wait_for_firmware_ready(self, max_wait_s: int = 30) -> bool:
+        """Poll rfsoc/status until f_s is a valid non-NaN positive number."""
+        if not self._require_mqtt("wait for RFSoC firmware"):
+            return False
+        logging.info("Waiting for RFSoC firmware to be ready...")
+        deadline = time.time() + max_wait_s
+        while time.time() < deadline:
+            tlm = self.get_tlm(timeout_s=2.0)
+            if tlm is not None:
+                f_s = tlm.get("f_s")
+                if isinstance(f_s, (int, float)) and f_s == f_s and f_s > 0:
+                    logging.info(f"RFSoC firmware ready: f_s={f_s / 1e6:.2f} MHz")
+                    return True
+            logging.debug("RFSoC not ready yet, waiting...")
+            time.sleep(1)
+        logging.error(f"RFSoC firmware not ready after {max_wait_s}s")
+        return False
+
+    # ------------------------------------------------------------------ #
+    #  Conjugate policy                                                    #
+    # ------------------------------------------------------------------ #
+
     def _normalized_conjugate_policy(self) -> str:
         """Return a valid conjugate policy from current controller state."""
         policy = str(self.conjugate_policy or "").strip().lower()
@@ -2955,10 +3039,7 @@ class CaptureController:
                 # External tuner mode: RFSoC IF + tuner LO define RF center.
                 if_mhz = float(self.adc_if_mhz) if self.adc_if_mhz is not None else f_mhz
                 injection_mode = str(self.injection or "high").lower()
-                if injection_mode == "high":
-                    lo_mhz = f_mhz + if_mhz
-                else:
-                    lo_mhz = f_mhz - if_mhz
+                lo_mhz = resolve_lo_mhz(f_mhz, if_mhz, injection_mode)
 
             payload = {
                 "capture_name": (self.capture_name or "").strip() or "preview",
@@ -3329,30 +3410,21 @@ class CaptureController:
             if self.adc_if_mhz is None:
                 raise ValueError("adc_if_mhz is required when a tuner is specified")
 
-            # Cold-start guard: only blocks when the tuner isn't yet online
-            # (e.g. first capture after launch). Warm captures pass straight
-            # through because _tuner_ready() is already True.
-            if not self._wait_for_tuner_ready():
-                logging.error(f"Tuner '{self.tuner}' did not come online — aborting capture")
-                return False
-
-            resolved_tuner = self._resolved_tuner_name()
-
             self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_IF {self.adc_if_mhz}"})
             time.sleep(0.1)
 
-            lo_mhz = (f_mhz + self.adc_if_mhz) if injection_mode == "high" else (f_mhz - self.adc_if_mhz)
+            # Cold-start guard: only blocks when the tuner isn't yet online
+            # (e.g. first capture after launch). Warm captures pass straight
+            # through because _tuner_ready() is already True.
+            lo_mhz = self.tuner_ctrl.apply_lo(f_mhz)
+            if lo_mhz is None:
+                logging.error(f"Tuner '{self.tuner}' did not come online — aborting capture")
+                return False
 
             logging.info(
                 f"[TUNER_YES/{injection_mode or 'low'}-side] RF → {GREEN}{f_mhz:.2f} MHz{RESET}  "
                 f"LO={lo_mhz:.2f} MHz  IF={self.adc_if_mhz:.2f} MHz"
             )
-
-            self.bus.tuner_set_freq(lo_mhz)
-            time.sleep(0.1)
-
-            if resolved_tuner == "VALON":
-                self._report_tuner_lock()
 
         # Common tail: metadata → capture → TLM
         # (channel was already set right after reset above)
@@ -3464,7 +3536,7 @@ class CaptureController:
 
 # ===== TX CONTROLLER ===== #
 
-class TxController:
+class ControllerTx:
     """DAC function-generator (transmit) orchestrator.
 
     Owns the TX start/stop policy and lives independently of RX capture: a single
@@ -3472,10 +3544,33 @@ class TxController:
     available with or without an RX session and RX reconfiguration can never
     disturb an active transmit. TX state physically lives in the RFSoC's FPGA
     registers, fully parallel to the RX capture path.
+
+    Takes a ControllerTuner (shared with ControllerRx when both exist, since
+    there is only one physical tuner/oscillator). Whichever side last calls
+    tx_start/tune_and_arm with a tuner selected is what the LO is set to.
     """
 
-    def __init__(self, bus: MEPBus):
+    def __init__(self, bus: MEPBus, tuner_ctrl: "ControllerTuner" = None):
         self.bus = bus
+        self.tuner_ctrl = tuner_ctrl if tuner_ctrl is not None else ControllerTuner(bus)
+
+    def configure_tuner(self, tuner: str = None, adc_if_mhz: float = None, injection: str = None):
+        """Stage tuner selection/IF/injection for the next tx_start call."""
+        self.tuner_ctrl.configure(tuner, adc_if_mhz, injection)
+
+    # ---- Read-only proxies onto the shared tuner state ----
+
+    @property
+    def tuner(self) -> Optional[str]:
+        return self.tuner_ctrl.tuner
+
+    @property
+    def adc_if_mhz(self) -> Optional[float]:
+        return self.tuner_ctrl.adc_if_mhz
+
+    @property
+    def injection(self) -> Optional[str]:
+        return self.tuner_ctrl.injection
 
     def _require_mqtt(self, action: str) -> bool:
         """Return False and log once when broker is offline for a control action."""
@@ -3495,12 +3590,25 @@ class TxController:
                  offset_freq_mhz: float, amplitude_bins: int) -> bool:
         """Apply staged TX settings and begin (or update) transmission.
 
-        Sets the TX parameters (center freq, amplitude, offset freq) then calls
-        the explicit tx_start task, which the firmware now handles atomically.
+        If a tuner is selected, sets the shared LO from center_freq_mhz first
+        (same formula/init/readiness path RX uses). Then sets the TX parameters
+        (center freq, amplitude, offset freq) and calls the explicit tx_start
+        task, which the firmware now handles atomically.
         """
         if not self._require_mqtt("start TX"):
             return False
         try:
+            if self.tuner is not None:
+                if self.adc_if_mhz is None:
+                    raise ValueError("adc_if_mhz is required when a tuner is specified")
+                lo_mhz = self.tuner_ctrl.apply_lo(center_freq_mhz)
+                if lo_mhz is None:
+                    logging.error(f"Tuner '{self.tuner}' did not come online — aborting TX start")
+                    return False
+                logging.info(
+                    "TX tuner LO set: %.3f MHz (IF=%.3f MHz, injection=%s)",
+                    lo_mhz, self.adc_if_mhz, self.injection,
+                )
             self.bus.rfsoc_set_tx_center_freq(center_freq_mhz)
             self.bus.rfsoc_set_tx_amplitude(amplitude_bins)
             self.bus.rfsoc_set_tx_offset_freq(offset_freq_mhz)
@@ -3933,7 +4041,7 @@ if __name__ == "__main__":
 
     # === Build controller === #
     bus = MEPBus()
-    capture = CaptureController(bus)
+    capture = ControllerRx(bus)
 
     capture.configure_sweep(
         channel=args.channel,
