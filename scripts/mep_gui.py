@@ -292,7 +292,7 @@ class MEPGui:
 
     def __init__(self, root: tk.Tk, mqtt_host: str = MQTT_BROKER, mqtt_port: int = MQTT_PORT):
         self.root = root
-        self.root.title(f"{get_local_hostname()} MEP Control App")
+        self.root.title(f"{get_local_hostname()} MEP")
         self.root.resizable(True, True)
         self._mqtt_host = mqtt_host
         self._mqtt_port = mqtt_port
