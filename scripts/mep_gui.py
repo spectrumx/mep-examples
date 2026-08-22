@@ -4,8 +4,10 @@ mep_gui.py
 
 Tkinter GUI for MEP RFSoC sweep/record control via X11 forwarding.
 
-All hardware communication goes through MEPBus + ControllerRx (start_mep_rx.py).
-This file is purely presentation: widgets, layout, and callbacks.
+All hardware communication goes through MEPBus and the RX controller layer in
+start_mep_rx.py. Recorder configuration and lifecycle remain owned by the
+Recorder class there; this GUI remains purely presentation: widgets, layout,
+and callbacks.
 
 Usage:
     ssh -X mep@<jetson> python3 ~/mep-examples/scripts/mep_gui.py
@@ -5335,7 +5337,7 @@ class MEPGui:
             logging.error("SOC: invalid NCO frequency value")
             return
         sweep_active = self._sweep_thread and self._sweep_thread.is_alive()
-        recorder_running = bool(self.capture._recorder_running)
+        recorder_running = bool(self.capture.recorder._recorder_running)
         if sweep_active or recorder_running:
             logging.warning("SOC: setting NCO frequency during active capture/sweep can disrupt capture")
         self.bus.rfsoc_set_if(if_mhz)
@@ -5571,7 +5573,7 @@ class MEPGui:
         if "rec_config_source" not in self._vars:
             return
         self._rec_pending_overrides.clear()
-        self.capture.clear_recorder_overrides()
+        self.capture.recorder.clear_recorder_overrides()
         self._rec_load_preset()
 
     def _rec_sample_rate_mhz(self) -> int:
@@ -5757,13 +5759,13 @@ class MEPGui:
             )
             return
         self._rec_pending_overrides = dict(model["overrides"])
-        self.capture.set_recorder_overrides(self._rec_pending_overrides)
+        self.capture.recorder.set_recorder_overrides(self._rec_pending_overrides)
         self._rec_render_model(model)
         logging.info("REC: settings will apply on next recorder start")
 
     def _rec_reset_config(self):
         self._rec_pending_overrides.clear()
-        self.capture.clear_recorder_overrides()
+        self.capture.recorder.clear_recorder_overrides()
         self._rec_load_preset()
         logging.info("REC: staged overrides cleared; selected preset restored")
 
@@ -6062,12 +6064,12 @@ class MEPGui:
     def _configure_mep(self, params: dict):
         """Apply GUI params to the tuner and the (long-lived) ControllerRx."""
         self.tuner_ctrl.configure(params["tuner"], params["adc_if_mhz"], params["injection"])
-        self.capture.configure_capture(
+        self.capture.recorder.configure_capture(
             channel=params["channel"],
             sample_rate_mhz=params["sample_rate_mhz"],
             capture_name=params["capture_name"],
         )
-        self.capture.set_recorder_overrides(self._rec_pending_overrides)
+        self.capture.recorder.set_recorder_overrides(self._rec_pending_overrides)
         if self._conjugate_policy_user_override:
             policy = self._vars["conjugate_policy"].get()
             if policy in CONJUGATE_POLICY_OPTIONS:

@@ -7,7 +7,9 @@ MEP system controller — MQTT gateway for RFSoC, recorder, tuner, and AFE.
 Architecture:
     MEPBus          — always-on MQTT connection, listener registry, thin command publishers
     ControllerTuner — shared external-tuner state (one physical oscillator, used by both RX/TX)
-    ControllerRx    — on-demand sweep/record orchestrator (owns sync-wait + recipes)
+    Recorder        — recorder-specific configuration, preset resolution, override staging,
+                      live start/stop lifecycle, channel/sample-rate state, and telemetry logging
+    ControllerRx    — on-demand sweep/record orchestrator (owns sync-wait + RFSoC/tuner recipes)
     ControllerTx    — DAC function-generator (transmit) orchestrator, independent of RX
     HostPlatform    — local host identity, health, power, network, and thermal access
     GPSDMonitor     — persistent gpsd connection, parsing, and GPS state callbacks
@@ -23,7 +25,7 @@ Usage (imported by mep_gui.py):
     tuner_ctrl = ControllerTuner(bus)
     tuner_ctrl.configure(tuner="VALON", adc_if_mhz=1090)
     rx = ControllerRx(bus, tuner_ctrl)
-    rx.configure_capture(channel="A", sample_rate_mhz=10)
+    rx.recorder.configure_capture(channel="A", sample_rate_mhz=10)
     rx.start_sweep(freqs_hz, dwell_s=60)
     tx = ControllerTx(bus, tuner_ctrl)
     tx.start(channel="A", center_freq_mhz=2400, offset_freq_mhz=1, amplitude_bins=4096)
@@ -50,7 +52,7 @@ import copy
 import csv
 from fractions import Fraction
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime
 import threading
 from typing import Optional, Callable
 import numpy as np
@@ -544,7 +546,7 @@ def derive_spec_topic_from_primary_mac(spec_topic_prefix: str = "radiohound/clie
                 cols = line.strip().split()
                 if len(cols) < 4:
                     continue
-                iface, dest_hex, _gateway_hex, flags_hex = cols[0], cols[1], cols[2], cols[3]
+                iface, dest_hex, flags_hex = cols[0], cols[1], cols[3]
                 if dest_hex != "00000000":
                     continue
                 flags = int(flags_hex, 16)
@@ -2839,6 +2841,391 @@ class ControllerTuner:
         return lo_mhz
 
 
+class Recorder:
+    """Recorder-specific state and configuration lifecycle.
+
+    This keeps the recorder's selected channel, sample rate, named capture, staged
+    overrides, and live recorder-running observations in one place while leaving
+    ControllerRx responsible for RFSoC, tuner, and sweep orchestration.
+    """
+
+    def __init__(self, bus: MEPBus, controller: "ControllerRx"):
+        self.bus = bus
+        self.controller = controller
+        self.host_platform = HostPlatform()
+        self.telemetry_logger = CaptureTelemetryLogger(bus)
+
+        self.channel: Optional[str] = None
+        self.sample_rate_mhz: Optional[int] = None
+        self.capture_name: Optional[str] = None
+        self._active_channel = None
+        self._active_sample_rate = None
+        self._recorder_running = False
+        self.recorder_overrides: dict[str, object] = {}
+
+    @property
+    def tuner(self):
+        return self.controller.tuner
+
+    @property
+    def adc_if_mhz(self):
+        return self.controller.adc_if_mhz
+
+    @property
+    def injection(self):
+        return self.controller.injection
+
+    def configure_capture(self, channel: str, sample_rate_mhz: int, capture_name: str = None):
+        """Set parameters used by start_sweep / start_single / start_recorder."""
+        self.channel = channel.upper()
+        self.sample_rate_mhz = sample_rate_mhz
+        self.capture_name = capture_name
+
+    def set_recorder_overrides(self, overrides: dict[str, object]):
+        """Replace the persistent recorder overrides used after config.load."""
+        self.recorder_overrides = dict(overrides)
+
+    def get_recorder_preset_model(self) -> dict:
+        """Return the selected preset resolved with no REC overrides."""
+        return resolve_recorder_preset(self.sample_rate_mhz)
+
+    def preview_recorder_settings(self, draft: dict[str, object]) -> dict:
+        """Resolve draft REC settings without changing staged state."""
+        return preview_recorder_settings(self.sample_rate_mhz, draft)
+
+    def stage_recorder_settings(self, draft: dict[str, object]) -> dict:
+        """Atomically validate and replace staged REC overrides."""
+        model = self.preview_recorder_settings(draft)
+        if not model.get("available"):
+            raise ValueError(model.get("error") or "Recorder settings are unavailable")
+        self.recorder_overrides = dict(model["overrides"])
+        return model
+
+    def get_staged_recorder_model(self) -> dict:
+        """Return the selected preset resolved with current staged overrides."""
+        return resolve_recorder_preset(self.sample_rate_mhz, self.recorder_overrides)
+
+    def clear_recorder_overrides(self):
+        """Clear the persistent recorder overrides."""
+        self.recorder_overrides.clear()
+
+    def apply_recorder_overrides(self):
+        """Reapply the persistent recorder overrides after config.load."""
+        if not self.recorder_overrides:
+            return
+
+        logging.info(
+            "Applying recorder overrides: %s",
+            ", ".join(sorted(self.recorder_overrides.keys())),
+        )
+        for key, value in self.recorder_overrides.items():
+            self.bus.recorder_config_set(key, value)
+
+    def prepare_preview_data_dir(self):
+        parent = os.path.dirname(PREVIEW_DATA_DIR)
+        stale_dir = os.path.join(parent, f".preview_data_stale_{int(time.time() * 1000)}")
+        if os.path.isdir(PREVIEW_DATA_DIR):
+            logging.info("Preview sample rate changed: rotating %s", PREVIEW_DATA_DIR)
+            os.replace(PREVIEW_DATA_DIR, stale_dir)
+        os.makedirs(PREVIEW_DATA_DIR, exist_ok=True)
+        if os.path.isdir(stale_dir):
+            shutil.rmtree(stale_dir, ignore_errors=True)
+
+    def _capture_root_dir(self) -> str:
+        """Return capture root folder that contains both settings.json and data/."""
+        capture_folder = (self.capture_name or "").strip() or "preview"
+        return os.path.join(CAPTURES_ROOT_DIR, capture_folder)
+
+    def _format_sds_path(self) -> str:
+        """Generate SDS path token: <capture>_<hostname>_<random6>."""
+        capture_folder = (self.capture_name or "").strip() or "preview"
+        host_token = self.host_platform.get_hostname().strip().lower()
+        host_token = re.sub(r"[^a-z0-9_-]", "", host_token)
+        if not host_token:
+            raise RuntimeError("Unable to derive hostname token for sds_path")
+
+        random6 = uuid.uuid4().hex[:6]
+        return f"{capture_folder}_{host_token}_{random6}"
+
+    def write_capture_settings(self, f_hz: float, sweep: bool) -> None:
+        """Write capture settings.json beside the capture data directory."""
+        try:
+            f_mhz = float(f_hz) / 1e6
+            if self.tuner is None:
+                if_mhz = f_mhz
+                lo_mhz = f_mhz
+            else:
+                if_mhz = float(self.adc_if_mhz) if self.adc_if_mhz is not None else f_mhz
+                injection_mode = str(self.injection or "high").lower()
+                lo_mhz = resolve_lo_mhz(f_mhz, if_mhz, injection_mode)
+
+            payload = {
+                "capture_name": (self.capture_name or "").strip() or "preview",
+                "sds_path": self._format_sds_path(),
+                "f_hz": int(round(float(f_hz))),
+                "channel": self.channel,
+                "sample_rate": int(self.sample_rate_mhz) if self.sample_rate_mhz is not None else None,
+                "sweep": bool(sweep),
+                "tuner": "none" if self.tuner is None else str(self.tuner).lower(),
+                "injection": "none" if self.injection is None else str(self.injection).lower(),
+                "if_mhz": if_mhz,
+                "lo_mhz": lo_mhz,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+
+            capture_root = self._capture_root_dir()
+            os.makedirs(capture_root, exist_ok=True)
+            settings_path = os.path.join(capture_root, "settings.json")
+            with open(settings_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+                fh.write("\n")
+            logging.info("Wrote capture settings: %s", settings_path)
+        except Exception as exc:
+            logging.warning("Failed to write capture settings.json: %s", exc)
+
+    def start_recorder(self, freq_idx_offset: float = 0.0):
+        """Configure and enable the DigitalRF recorder."""
+        if not self.controller._require_mqtt("start recorder"):
+            return False
+
+        recorder_model = self.get_staged_recorder_model()
+        if not recorder_model.get("available"):
+            logging.error(
+                "Recorder preset validation failed before start: %s",
+                recorder_model.get("error") or "unknown error",
+            )
+            return False
+
+        if self.channel not in RECORDER_CHANNEL_PORTS:
+            raise ValueError(f"channel must be one of {list(RECORDER_CHANNEL_PORTS.keys())}")
+
+        dst_port = RECORDER_CHANNEL_PORTS[self.channel]
+        config_name = f"sr{self.sample_rate_mhz}MHz"
+
+        logging.info(
+            f"Starting recorder: channel={self.channel}, config={config_name}, port={dst_port}"
+        )
+
+        self.bus.recorder_disable()
+
+        self.bus.publish_command(RECORDER_CMD_TOPIC, {
+            "task_name": "config.load",
+            "arguments": {"name": config_name},
+            "response_topic": "recorder/config/response",
+        })
+
+        if not self.capture_name:
+            self.prepare_preview_data_dir()
+
+        self.bus.recorder_config_set("packet.freq_idx_offset", str(freq_idx_offset))
+
+        if self.capture_name:
+            channel_dir = f"{self.capture_name}/data/ch{self.channel}"
+            spectrogram_subdir = f"{self.capture_name}/data/ch{self.channel}_spectrogram_images"
+        else:
+            channel_dir = f"preview/data/ch{self.channel}"
+            spectrogram_subdir = f"preview/data/ch{self.channel}_spectrogram_images"
+
+        self.bus.recorder_config_set("drf_sink.channel_dir", channel_dir)
+        self.bus.recorder_config_set("spectrogram_output.plot_subdir", spectrogram_subdir)
+        self.bus.recorder_config_set("basic_network.dst_port", str(dst_port))
+        state = self.controller.get_conjugate_state()
+        apply_conjugate = bool(state["apply_conjugate"])
+        logging.info(
+            "Recorder pre-enable conjugate: policy=%s tuner=%r injection=%r apply_conjugate=%s",
+            state["policy"],
+            state["tuner"],
+            state["injection"],
+            str(apply_conjugate).lower(),
+        )
+        self.bus.recorder_config_set("packet.apply_conjugate", str(apply_conjugate).lower())
+        self.apply_recorder_overrides()
+
+        self.controller.prepare_status_wait(RECORDER_STATUS_TOPIC)
+        self.bus.recorder_enable()
+        status = self.controller.wait_for_status(RECORDER_STATUS_TOPIC, timeout_s=3.0, pre_armed=True)
+        if status is not None:
+            logging.info(f"Recorder enabled — status: {status}")
+        else:
+            logging.warning("Recorder enable sent but no status response received")
+
+        self._active_channel = self.channel
+        self._active_sample_rate = self.sample_rate_mhz
+        self._recorder_running = True
+        if self.capture_name:
+            self.telemetry_logger.start(self._capture_root_dir())
+        return True
+
+    def stop_recorder(self):
+        """Disable the DigitalRF recorder."""
+        logging.info("Stopping recorder")
+        self.bus.recorder_disable()
+        self._recorder_running = False
+        self.telemetry_logger.stop()
+
+    def build_config(self, apply_conjugate: bool) -> dict:
+        """
+        Resolve the recorder configuration for the active channel.
+
+        Loads the authoritative preset for the current sample rate, applies the staged
+        GUI overrides, enforces pipeline dependencies, and sets the channel-specific
+        runtime keys (UDP port, DigitalRF channel directory, spectrogram subdir, conjugate
+        policy). This is the same config the live recorder path resolves; the profiler
+        serializes it to inline JSON and hands it to ``mep_recorder.py``.
+        """
+        preset_path, source = recorder_preset_path(self.sample_rate_mhz)
+        if source == "unavailable":
+            raise FileNotFoundError(f"Recorder preset not found: {preset_path}")
+
+        config = copy.deepcopy(_load_yaml_mapping(preset_path))
+
+        for key, value in self.recorder_overrides.items():
+            _set_dotted_value(config, key, value)
+
+        _normalize_recorder_pipeline(config)
+
+        _set_dotted_value(config, "basic_network.dst_port", RECORDER_CHANNEL_PORTS[self.channel])
+        capture_folder = (self.capture_name or "").strip() or "preview"
+        _set_dotted_value(config, "drf_sink.channel_dir", f"{capture_folder}/data/ch{self.channel}")
+        _set_dotted_value(config, "spectrogram_output.plot_subdir", f"{capture_folder}/data/ch{self.channel}_spectrogram_images")
+        _set_dotted_value(config, "packet.freq_idx_offset", 0)
+
+        _set_dotted_value(config, "packet.apply_conjugate", bool(apply_conjugate))
+
+        return config
+
+    def prepare_holoscan_profile(self):
+        """Stop live recording and prepare the preview data directory."""
+        logging.info("Disabling live recording so the profiler owns the pipeline...")
+        self.stop_recorder()
+        time.sleep(1)
+        self.prepare_preview_data_dir()
+
+    def run_holoscan_profile(
+        self,
+        config: dict,
+        trace: str = "cuda,nvtx,osrt",
+        duration: int = 60,
+        output_path: str = "/data/captures/holoscan_profile",
+        force_overwrite: bool = True,
+        cudabacktrace: str = "all",
+        flush_on_cudaprofilerstop: bool = False,
+    ) -> dict:
+        """Run nsys against one recorder process using a resolved config.
+
+        The caller owns RFSoC preparation and cleanup. This method owns the
+        recorder process lifecycle, profiler invocation, and report metadata.
+        The recorder remains disabled when profiling finishes.
+        """
+        compose_file = "/opt/radiohound/docker/compose.yaml"
+        output_file = f"{output_path}.nsys-rep"
+        yaml_file = f"{output_path}.yaml"
+
+        try:
+            force_flag = "--force-overwrite=true" if force_overwrite else "--force-overwrite=false"
+            flush_flag = f"--flush-on-cudaprofilerstop={'true' if flush_on_cudaprofilerstop else 'false'}"
+            config_json = json.dumps(config)
+            cmd = [
+                "docker", "compose", "-f", compose_file, "exec", "-T",
+                "-e", "HOLOSCAN_ENABLE_PROFILE=1",
+                "recorder",
+                "nsys", "profile",
+                f"--trace={trace}",
+                f"--cudabacktrace={cudabacktrace}",
+                flush_flag,
+                f"--duration={duration}",
+                f"--output={output_path}",
+                force_flag,
+                "python3", "/app/mep_recorder.py",
+                "--config", config_json,
+                "--ram_ringbuffer_path", "/ramdisk",
+                "--output_path", CAPTURES_ROOT_DIR,
+            ]
+
+            reproducible_cmd = (
+                "HOLOSCAN_ENABLE_PROFILE=1 nsys profile \\\n"
+                f"  --trace={trace} \\\n"
+                f"  --cudabacktrace={cudabacktrace} \\\n"
+                f"  {flush_flag} \\\n"
+                f"  --duration={duration} \\\n"
+                f"  --output={output_path} \\\n"
+                f"  {force_flag} \\\n"
+                "  python3 /app/mep_recorder.py \\\n"
+                f"  --config {yaml_file} \\\n"
+                "  --ram_ringbuffer_path /ramdisk \\\n"
+                f"  --output_path {CAPTURES_ROOT_DIR}"
+            )
+            logging.info(
+                "Profiling command (run inside the 'recorder' container to reproduce):\n%s",
+                reproducible_cmd,
+            )
+
+            logging.info("Launching nsys profiling: duration=%ss, output=%s", duration, output_path)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=duration + 60,
+            )
+            if result.stdout:
+                logging.info("nsys stdout:\n%s", result.stdout)
+            if result.stderr:
+                logging.info("nsys stderr:\n%s", result.stderr)
+
+            combined_output = f"{result.stdout or ''}\n{result.stderr or ''}"
+            report_generated = "Generated:" in combined_output and ".nsys-rep" in combined_output
+            if not report_generated:
+                stderr_short = (result.stderr or "(no stderr)").strip()[:1000]
+                logging.error("nsys did not report a generated file (exit %s)", result.returncode)
+                return {
+                    "success": False,
+                    "error": f"No report generated (nsys exit {result.returncode}): {stderr_short}",
+                    "status": "Failed",
+                }
+
+            rc = result.returncode
+            rc_descriptions = {
+                0: "(clean exit)",
+                143: "(recorder stopped by SIGTERM at duration limit)",
+                137: "(recorder killed by SIGKILL at duration limit)",
+                139: "(recorder crashed with segfault)",
+            }
+            rc_note = rc_descriptions.get(rc, "")
+            status = f"Profile saved to {output_file}, exit code {rc} {rc_note}".strip()
+            logging.info(
+                "Profiling complete (nsys reported a generated report, exit %s): %s",
+                rc,
+                output_file,
+            )
+
+            try:
+                yaml_text = _dump_yaml_text(config)
+                subprocess.run(
+                    ["docker", "compose", "-f", compose_file, "exec", "-T", "recorder", "tee", yaml_file],
+                    input=yaml_text,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                logging.info("Saved profiling config: %s", yaml_file)
+            except Exception as exc:
+                logging.warning("Could not save profiling config YAML: %s", exc)
+
+            return {
+                "success": True,
+                "status": status,
+                "output_file": output_file,
+                "returncode": rc,
+            }
+        except subprocess.TimeoutExpired:
+            msg = f"nsys timed out after {duration + 60}s"
+            logging.error(msg)
+            return {"success": False, "error": msg, "status": "Timeout"}
+        except Exception as exc:
+            logging.exception("Profile error")
+            return {"success": False, "error": str(exc), "status": "Error"}
+
+
 class ControllerRx:
     """On-demand sweep/record orchestrator — owns sync-wait infra and recipes.
 
@@ -2851,20 +3238,11 @@ class ControllerRx:
     def __init__(self, bus: MEPBus, tuner_ctrl: "ControllerTuner" = None):
         self.bus = bus
         self.host_platform = HostPlatform()
-        self.telemetry_logger = CaptureTelemetryLogger(bus)
         self.tuner_ctrl = tuner_ctrl if tuner_ctrl is not None else ControllerTuner(bus)
+        self.recorder = Recorder(bus, self)
+        self.telemetry_logger = self.recorder.telemetry_logger
 
-        # ---- Capture config (set via configure_capture) ----
-        self.channel: Optional[str] = None
-        self.sample_rate_mhz: Optional[int] = None
-        self.capture_name: Optional[str] = None
         self.conjugate_policy: str = CONJUGATE_POLICY_DEFAULT
-
-        # ---- Recorder "what changed" state ----
-        self._active_channel = None
-        self._active_sample_rate = None
-        self._recorder_running = False
-        self.recorder_overrides: dict[str, object] = {}
 
         # ---- Stop flag for sweeps ----
         self._stop_flag = threading.Event()
@@ -2921,77 +3299,25 @@ class ControllerRx:
             self.bus.remove_listener(topic, cb)
         self._sync_cbs.clear()
         self.telemetry_logger.stop()
-        if self._recorder_running:
+        if self.recorder._recorder_running:
             try:
-                self.stop_recorder()
+                self.recorder.stop_recorder()
             except Exception:
                 pass
-
-    # ------------------------------------------------------------------ #
-    #  Capture configuration                                               #
-    # ------------------------------------------------------------------ #
-
-    def configure_capture(
-        self,
-        channel: str,
-        sample_rate_mhz: int,
-        capture_name: str = None,
-    ):
-        """Set parameters used by start_sweep / start_single / start_recorder.
-
-        Tuner state is configured separately, directly on the shared
-        ControllerTuner (self.tuner_ctrl) — there is only one physical
-        oscillator, so it isn't part of this capture-specific config.
-        """
-        self.channel = channel.upper()
-        self.sample_rate_mhz = sample_rate_mhz
-        self.capture_name = capture_name
-
-    def set_recorder_overrides(self, overrides: dict[str, object]):
-        """Replace the persistent recorder overrides used after config.load."""
-        self.recorder_overrides = dict(overrides)
-
-    def get_recorder_preset_model(self) -> dict:
-        """Return the selected preset resolved with no REC overrides."""
-        return resolve_recorder_preset(self.sample_rate_mhz)
-
-    def preview_recorder_settings(self, draft: dict[str, object]) -> dict:
-        """Resolve draft REC settings without changing staged state."""
-        return preview_recorder_settings(self.sample_rate_mhz, draft)
-
-    def stage_recorder_settings(self, draft: dict[str, object]) -> dict:
-        """Atomically validate and replace staged REC overrides."""
-        model = self.preview_recorder_settings(draft)
-        if not model.get("available"):
-            raise ValueError(model.get("error") or "Recorder settings are unavailable")
-        self.recorder_overrides = dict(model["overrides"])
-        return model
-
-    def get_staged_recorder_model(self) -> dict:
-        """Return the selected preset resolved with current staged overrides."""
-        return resolve_recorder_preset(self.sample_rate_mhz, self.recorder_overrides)
-
-    def clear_recorder_overrides(self):
-        """Clear the persistent recorder overrides."""
-        self.recorder_overrides.clear()
-
-    def apply_recorder_overrides(self):
-        """Reapply the persistent recorder overrides after config.load."""
-        if not self.recorder_overrides:
-            return
-
-        logging.info(
-            "Applying recorder overrides: %s",
-            ", ".join(sorted(self.recorder_overrides.keys())),
-        )
-        for key, value in self.recorder_overrides.items():
-            self.bus.recorder_config_set(key, value)
 
     # ------------------------------------------------------------------ #
     #  Synchronous wait helpers (used during sweep orchestration)          #
     # ------------------------------------------------------------------ #
 
-    def _wait_for_status(self, topic: str, timeout_s: float = 2.0, pre_armed: bool = False):
+    def prepare_status_wait(self, topic: str):
+        """Clear a status wait before publishing a command that triggers it."""
+        if topic not in self._status_events:
+            raise ValueError(f"Unknown sync status topic: {topic!r}")
+        self._status_events[topic].clear()
+        with self._status_lock:
+            self._status[topic] = None
+
+    def wait_for_status(self, topic: str, timeout_s: float = 2.0, pre_armed: bool = False):
         """Block until a status message arrives on topic, return payload or None.
 
         Set pre_armed=True when the event has already been cleared before the
@@ -3050,189 +3376,6 @@ class ControllerRx:
     #  Recorder recipe (sweep orchestration)                               #
     # ------------------------------------------------------------------ #
 
-    def _clear_preview_data_dir(self):
-        parent = os.path.dirname(PREVIEW_DATA_DIR)
-        stale_dir = os.path.join(parent, f".preview_data_stale_{int(time.time() * 1000)}")
-        if os.path.isdir(PREVIEW_DATA_DIR):
-            logging.info("Preview sample rate changed: rotating %s", PREVIEW_DATA_DIR)
-            os.replace(PREVIEW_DATA_DIR, stale_dir)
-        os.makedirs(PREVIEW_DATA_DIR, exist_ok=True)
-        if os.path.isdir(stale_dir):
-            shutil.rmtree(stale_dir, ignore_errors=True)
-
-    def _capture_root_dir(self) -> str:
-        """Return capture root folder that contains both settings.json and data/."""
-        capture_folder = (self.capture_name or "").strip() or "preview"
-        return os.path.join(CAPTURES_ROOT_DIR, capture_folder)
-
-    def _format_sds_path(self) -> str:
-        """Generate SDS path token: <capture>_<hostname>_<random6>."""
-        capture_folder = (self.capture_name or "").strip() or "preview"
-        host_token = self.host_platform.get_hostname().strip().lower()
-        host_token = re.sub(r"[^a-z0-9_-]", "", host_token)
-        if not host_token:
-            raise RuntimeError("Unable to derive hostname token for sds_path")
-
-        random6 = uuid.uuid4().hex[:6]
-        return f"{capture_folder}_{host_token}_{random6}"
-
-    def _write_capture_settings(self, f_hz: float, sweep: bool) -> None:
-        """Write capture settings.json beside the capture data directory."""
-        try:
-            f_mhz = float(f_hz) / 1e6
-            # Mirror tune_and_arm semantics so settings metadata matches hardware mode.
-            if self.tuner is None:
-                # NCO mode: RFSoC IF is tuned directly to RF center; no external LO.
-                if_mhz = f_mhz
-                lo_mhz = f_mhz
-            else:
-                # External tuner mode: RFSoC IF + tuner LO define RF center.
-                if_mhz = float(self.adc_if_mhz) if self.adc_if_mhz is not None else f_mhz
-                injection_mode = str(self.injection or "high").lower()
-                lo_mhz = resolve_lo_mhz(f_mhz, if_mhz, injection_mode)
-
-            payload = {
-                "capture_name": (self.capture_name or "").strip() or "preview",
-                "sds_path": self._format_sds_path(),
-                "f_hz": int(round(float(f_hz))),
-                "channel": self.channel,
-                "sample_rate": int(self.sample_rate_mhz) if self.sample_rate_mhz is not None else None,
-                "sweep": bool(sweep),
-                "tuner": "none" if self.tuner is None else str(self.tuner).lower(),
-                "injection": "none" if self.injection is None else str(self.injection).lower(),
-                "if_mhz": if_mhz,
-                "lo_mhz": lo_mhz,
-                "created_at": datetime.utcnow().isoformat(),
-            }
-
-            capture_root = self._capture_root_dir()
-            os.makedirs(capture_root, exist_ok=True)
-            settings_path = os.path.join(capture_root, "settings.json")
-            with open(settings_path, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2)
-                fh.write("\n")
-            logging.info("Wrote capture settings: %s", settings_path)
-        except Exception as exc:
-            logging.warning("Failed to write capture settings.json: %s", exc)
-
-    def start_recorder(self, freq_idx_offset: float = 0.0):
-        """Configure and enable the DigitalRF recorder."""
-        if not self._require_mqtt("start recorder"):
-            return False
-
-        recorder_model = self.get_staged_recorder_model()
-        if not recorder_model.get("available"):
-            logging.error(
-                "Recorder preset validation failed before start: %s",
-                recorder_model.get("error") or "unknown error",
-            )
-            return False
-
-        if self.channel not in RECORDER_CHANNEL_PORTS:
-            raise ValueError(f"channel must be one of {list(RECORDER_CHANNEL_PORTS.keys())}")
-
-        dst_port = RECORDER_CHANNEL_PORTS[self.channel]
-        config_name = f"sr{self.sample_rate_mhz}MHz"
-
-        logging.info(
-            f"Starting recorder: channel={self.channel}, config={config_name}, port={dst_port}"
-        )
-
-        self.bus.recorder_disable()
-
-        self.bus.publish_command(RECORDER_CMD_TOPIC, {
-            "task_name": "config.load",
-            "arguments": {"name": config_name},
-            "response_topic": "recorder/config/response",
-        })
-
-        if not self.capture_name:
-            self._clear_preview_data_dir()
-
-        self.bus.recorder_config_set("packet.freq_idx_offset", str(freq_idx_offset))
-
-        # channel_dir must stay relative: drf_sink joins it onto output_path (the RAM
-        # ringbuffer), so an absolute path silently bypasses the tmpfs staging.
-        if self.capture_name:
-            channel_dir = f"{self.capture_name}/data/ch{self.channel}"
-            spectrogram_subdir = f"{self.capture_name}/data/ch{self.channel}_spectrogram_images"
-        else:
-            channel_dir = f"preview/data/ch{self.channel}"
-            spectrogram_subdir = f"preview/data/ch{self.channel}_spectrogram_images"
-
-        self.bus.recorder_config_set("drf_sink.channel_dir", channel_dir)
-        self.bus.recorder_config_set("spectrogram_output.plot_subdir", spectrogram_subdir)
-        self.bus.recorder_config_set("basic_network.dst_port", str(dst_port))
-        state = self.get_conjugate_state()
-        apply_conjugate = bool(state["apply_conjugate"])
-        logging.info(
-            "Recorder pre-enable conjugate: policy=%s tuner=%r injection=%r apply_conjugate=%s",
-            state["policy"],
-            state["tuner"],
-            state["injection"],
-            str(apply_conjugate).lower(),
-        )
-        self.bus.recorder_config_set("packet.apply_conjugate", str(apply_conjugate).lower())
-        self.apply_recorder_overrides()
-
-        # Arm the wait BEFORE sending enable to avoid missing a fast response
-        self._status_events[RECORDER_STATUS_TOPIC].clear()
-        with self._status_lock:
-            self._status[RECORDER_STATUS_TOPIC] = None
-        self.bus.recorder_enable()
-        status = self._wait_for_status(RECORDER_STATUS_TOPIC, timeout_s=3.0, pre_armed=True)
-        if status is not None:
-            logging.info(f"Recorder enabled — status: {status}")
-        else:
-            logging.warning("Recorder enable sent but no status response received")
-
-        self._active_channel = self.channel
-        self._active_sample_rate = self.sample_rate_mhz
-        self._recorder_running = True
-        if self.capture_name:
-            self.telemetry_logger.start(self._capture_root_dir())
-        return True
-
-    def stop_recorder(self):
-        """Disable the DigitalRF recorder."""
-        logging.info("Stopping recorder")
-        self.bus.recorder_disable()
-        self._recorder_running = False
-        self.telemetry_logger.stop()
-
-    def _build_recorder_config(self) -> dict:
-        """
-        Resolve the recorder configuration for the active channel.
-
-        Loads the authoritative preset for the current sample rate, applies the staged
-        GUI overrides, enforces pipeline dependencies, and sets the channel-specific
-        runtime keys (UDP port, DigitalRF channel directory, spectrogram subdir, conjugate
-        policy). This is the same config the live recorder path resolves; the profiler
-        serializes it to inline JSON and hands it to ``mep_recorder.py``.
-
-        Returns the resolved config mapping. Pure: no MQTT, no filesystem side effects.
-        """
-        preset_path, source = recorder_preset_path(self.sample_rate_mhz)
-        if source == "unavailable":
-            raise FileNotFoundError(f"Recorder preset not found: {preset_path}")
-
-        config = copy.deepcopy(_load_yaml_mapping(preset_path))
-
-        for key, value in self.recorder_overrides.items():
-            _set_dotted_value(config, key, value)
-
-        _normalize_recorder_pipeline(config)
-
-        _set_dotted_value(config, "basic_network.dst_port", RECORDER_CHANNEL_PORTS[self.channel])
-        _set_dotted_value(config, "drf_sink.channel_dir", f"preview/data/ch{self.channel}")
-        _set_dotted_value(config, "spectrogram_output.plot_subdir", f"preview/data/ch{self.channel}_spectrogram_images")
-        _set_dotted_value(config, "packet.freq_idx_offset", 0)
-
-        conj_state = self.get_conjugate_state()
-        _set_dotted_value(config, "packet.apply_conjugate", bool(conj_state["apply_conjugate"]))
-
-        return config
-
     def profile_holoscan(
         self,
         freq_hz: float,
@@ -3243,192 +3386,47 @@ class ControllerRx:
         cudabacktrace: str = "all",
         flush_on_cudaprofilerstop: bool = False,
     ) -> dict:
-        """
-        Profile the Holoscan recorder with nsys.
+        """Tune and arm RFSoC, then run the recorder-owned Holoscan profile."""
+        if not self._require_mqtt("profile holoscan"):
+            return {"success": False, "error": "MQTT not connected", "status": "Error"}
+        if self.recorder.channel not in RECORDER_CHANNEL_PORTS:
+            return {
+                "success": False,
+                "error": f"Invalid channel: {self.recorder.channel}",
+                "status": "Failed",
+            }
 
-        Profiling owns the recorder exclusively. The live recording is disabled first so
-        that exactly ONE ``mep_recorder`` exists during the profile — two pipelines would
-        contend for the same UDP port and ``/ramdisk`` and double the memory footprint,
-        which can freeze the host. The ``recorder_service`` process itself stays alive and
-        listening; only its recording is stopped, and it is left disabled when we finish
-        (the operator's next main-tab Start re-enables it normally).
-
-        The recorder config is passed to ``--config`` as an inline JSON string (jsonargparse
-        parses JSON as YAML); ``--ram_ringbuffer_path`` / ``--output_path`` are passed as
-        separate linked arguments — the same contract recorder_service.run_recorder uses.
-        The whole thing is wrapped by ``nsys profile`` and run inside the recorder container
-        via ``docker compose exec``. The RFSoC is tuned and armed via ``tune_and_arm`` so the
-        profiled pipeline ingests the operator-selected RF, and is reset afterward.
-
-        Args:
-            freq_hz: Center/RF frequency to tune and arm before profiling (Hz)
-            trace: Comma-separated trace categories (e.g. "cuda,nvtx,osrt")
-            duration: Profile duration in seconds
-            output_path: nsys report output prefix (inside the container)
-            force_overwrite: If True, pass --force-overwrite=true to nsys
-            cudabacktrace: cudabacktrace depth (e.g., "all", "32")
-            flush_on_cudaprofilerstop: Value for nsys --flush-on-cudaprofilerstop
-
-        Returns:
-            dict with keys: success (bool), status (str), output_file (str), error (str)
-        """
-        compose_file = "/opt/radiohound/docker/compose.yaml"
-        output_file = f"{output_path}.nsys-rep"
-        yaml_file = f"{output_path}.yaml"
+        config = self.recorder.build_config(
+            apply_conjugate=self.get_conjugate_state()["apply_conjugate"]
+        )
         armed = False
-
         try:
-            if not self._require_mqtt("profile holoscan"):
-                return {"success": False, "error": "MQTT not connected", "status": "Error"}
-            if self.channel not in RECORDER_CHANNEL_PORTS:
-                return {"success": False, "error": f"Invalid channel: {self.channel}", "status": "Failed"}
-
-            config = self._build_recorder_config()
-            config_json = json.dumps(config)
-
-            # Stop any live recording so the profiler is the sole recorder. recorder_disable()
-            # cancels recorder_service's recording scope (SIGINT to its mep_recorder child and
-            # /ramdisk cleanup); the service stays up. This frees the UDP port and ramdisk and
-            # halves memory so nsys's cudabacktrace buffers have headroom.
-            logging.info("Disabling live recording so the profiler owns the pipeline...")
-            self.bus.recorder_disable()
-            self._recorder_running = False
-            time.sleep(1)
-
-            # Fresh preview data dir so the DigitalRF / metadata sinks can create their HDF5
-            # files (a missing parent crashes dmd_sink).
-            self._clear_preview_data_dir()
-
-            # Tune and arm the RFSoC like a main-tab capture so the profiled pipeline ingests
-            # the operator-selected RF instead of stale FPGA state.
-            logging.info(f"Tuning and arming RFSoC for profiling at {freq_hz / 1e6:.2f} MHz...")
+            self.recorder.prepare_holoscan_profile()
+            logging.info("Tuning and arming RFSoC for profiling at %.2f MHz...", freq_hz / 1e6)
             if not self.tune_and_arm(freq_hz):
-                return {"success": False, "error": "RFSoC tune/arm failed; aborting profile", "status": "Failed"}
-            armed = True
-            time.sleep(1)
-
-            # Build the docker compose exec command. No shell, no temp file: the config travels
-            # as a single argv element so there are no quoting/path problems.
-            force_flag = "--force-overwrite=true" if force_overwrite else "--force-overwrite=false"
-            flush_flag = f"--flush-on-cudaprofilerstop={'true' if flush_on_cudaprofilerstop else 'false'}"
-            cmd = [
-                "docker", "compose", "-f", compose_file, "exec", "-T",
-                "-e", "HOLOSCAN_ENABLE_PROFILE=1",
-                "recorder",
-                "nsys", "profile",
-                f"--trace={trace}",
-                f"--cudabacktrace={cudabacktrace}",
-                flush_flag,
-                f"--duration={duration}",
-                f"--output={output_path}",
-                force_flag,
-                "python3", "/app/mep_recorder.py",
-                "--config", config_json,
-                "--ram_ringbuffer_path", "/ramdisk",
-                "--output_path", CAPTURES_ROOT_DIR,
-            ]
-
-            # Log a copy-pasteable equivalent. The real cmd passes the config as a huge inline
-            # JSON blob, so for reproducibility we reference the resolved YAML saved below.
-            reproducible_cmd = (
-                "HOLOSCAN_ENABLE_PROFILE=1 nsys profile \\\n"
-                f"  --trace={trace} \\\n"
-                f"  --cudabacktrace={cudabacktrace} \\\n"
-                f"  {flush_flag} \\\n"
-                f"  --duration={duration} \\\n"
-                f"  --output={output_path} \\\n"
-                f"  {force_flag} \\\n"
-                "  python3 /app/mep_recorder.py \\\n"
-                f"  --config {yaml_file} \\\n"
-                "  --ram_ringbuffer_path /ramdisk \\\n"
-                f"  --output_path {CAPTURES_ROOT_DIR}"
-            )
-            logging.info(
-                "Profiling command (run inside the 'recorder' container to reproduce):\n%s",
-                reproducible_cmd,
-            )
-
-            logging.info(f"Launching nsys profiling: duration={duration}s, output={output_path}")
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=duration + 60,
-            )
-
-            if result.stdout:
-                logging.info(f"nsys stdout:\n{result.stdout}")
-            if result.stderr:
-                logging.info(f"nsys stderr:\n{result.stderr}")
-
-            # Success is judged by nsys's own report output from THIS run, not the exit code
-            # and not a file-existence check (which a stale report could spoof). When nsys
-            # writes the report it prints "Generated:\n  <path>.nsys-rep".
-            combined_output = f"{result.stdout or ''}\n{result.stderr or ''}"
-            report_generated = "Generated:" in combined_output and ".nsys-rep" in combined_output
-
-            if not report_generated:
-                stderr_short = (result.stderr or "(no stderr)").strip()[:1000]
-                logging.error(f"nsys did not report a generated file (exit {result.returncode})")
                 return {
                     "success": False,
-                    "error": f"No report generated (nsys exit {result.returncode}): {stderr_short}",
+                    "error": "RFSoC tune/arm failed; aborting profile",
                     "status": "Failed",
                 }
-
-            # The recorder's teardown is racy: it may exit 0, 143 (SIGTERM, the normal
-            # duration-stop path), 137 (SIGKILL), or 139 (segfault during shutdown). The
-            # report is already written by then, so none are profiler failures — but the exit
-            # code is reported so a crash is visible.
-            rc = result.returncode
-            rc_descriptions = {
-                0: "(clean exit)",
-                143: "(recorder stopped by SIGTERM at duration limit)",
-                137: "(recorder killed by SIGKILL at duration limit)",
-                139: "(recorder crashed with segfault)",
-            }
-            rc_note = rc_descriptions.get(rc, "")
-            status = f"Profile saved to {output_file}, exit code {rc} {rc_note}".strip()
-            logging.info(f"Profiling complete (nsys reported a generated report, exit {rc}): {output_file}")
-
-            # Save the resolved config as YAML next to the report for reproducibility. Written
-            # inside the container (where output_path lives) via tee.
-            try:
-                yaml_text = _dump_yaml_text(config)
-                subprocess.run(
-                    ["docker", "compose", "-f", compose_file, "exec", "-T", "recorder", "tee", yaml_file],
-                    input=yaml_text,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                logging.info(f"Saved profiling config: {yaml_file}")
-            except Exception as e:
-                logging.warning(f"Could not save profiling config YAML: {e}")
-
-            return {
-                "success": True,
-                "status": status,
-                "output_file": output_file,
-                "returncode": rc,
-            }
-
-        except subprocess.TimeoutExpired:
-            msg = f"nsys timed out after {duration + 60}s"
-            logging.error(msg)
-            return {"success": False, "error": msg, "status": "Timeout"}
-        except Exception as e:
-            logging.exception("Profile error")
-            return {"success": False, "error": str(e), "status": "Error"}
+            armed = True
+            time.sleep(1)
+            return self.recorder.run_holoscan_profile(
+                config=config,
+                trace=trace,
+                duration=duration,
+                output_path=output_path,
+                force_overwrite=force_overwrite,
+                cudabacktrace=cudabacktrace,
+                flush_on_cudaprofilerstop=flush_on_cudaprofilerstop,
+            )
         finally:
-            # nsys only stops the recorder; the RFSoC keeps streaming UDP. Reset it so
-            # profiling always leaves the hardware idle, regardless of how the run ended.
             if armed:
                 try:
                     logging.info("Stopping RFSoC UDP stream after profiling...")
                     self.bus.rfsoc_reset()
-                except Exception as e:
-                    logging.warning(f"Could not reset RFSoC after profiling: {e}")
+                except Exception as exc:
+                    logging.warning("Could not reset RFSoC after profiling: %s", exc)
 
     # ------------------------------------------------------------------ #
     #  Tune and Arm recipe (from "Tune and Capture" flowchart)             #
@@ -3447,7 +3445,7 @@ class ControllerRx:
         # freq_IF and freq_metadata write to whichever channel is currently
         # active in the FPGA — if channel is set after freq commands the
         # metadata ends up on the old channel's registers.
-        self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"channel {self.channel}"})
+        self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"channel {self.recorder.channel}"})
         time.sleep(0.05)
 
         injection_mode = (self.injection or "").lower()
@@ -3502,32 +3500,32 @@ class ControllerRx:
         if not self._require_mqtt("run single capture"):
             return False
 
-        self._write_capture_settings(f_hz=f_hz, sweep=False)
+        self.recorder.write_capture_settings(f_hz=f_hz, sweep=False)
 
-        sample_rate_changed = (self.sample_rate_mhz != self._active_sample_rate)
-        channel_changed = (self.channel != self._active_channel)
+        sample_rate_changed = (self.recorder.sample_rate_mhz != self.recorder._active_sample_rate)
+        channel_changed = (self.recorder.channel != self.recorder._active_channel)
 
-        if self._recorder_running and (sample_rate_changed or channel_changed):
+        if self.recorder._recorder_running and (sample_rate_changed or channel_changed):
             logging.info(
                 "Sample rate or channel changed — restarting recorder "
-                f"(sr: {self._active_sample_rate}→{self.sample_rate_mhz}, "
-                f"ch: {self._active_channel}→{self.channel})"
+                f"(sr: {self.recorder._active_sample_rate}→{self.recorder.sample_rate_mhz}, "
+                f"ch: {self.recorder._active_channel}→{self.recorder.channel})"
             )
-            self.stop_recorder()
+            self.recorder.stop_recorder()
             if not self.tune_and_arm(f_hz):
                 return False
-            if not self.start_recorder():
+            if not self.recorder.start_recorder():
                 return False
         else:
             if not self.tune_and_arm(f_hz):
                 return False
-            if not self._recorder_running:
-                if not self.start_recorder():
+            if not self.recorder._recorder_running:
+                if not self.recorder.start_recorder():
                     return False
 
         if dwell_s is not None and dwell_s > 0:
             self._dwell(dwell_s)
-            self.stop_recorder()
+            self.recorder.stop_recorder()
         return True
 
     def start_sweep(self, freqs_hz, dwell_s: float):
@@ -3537,7 +3535,7 @@ class ControllerRx:
 
         logging.info(f"Sweep: {len(freqs_hz)} steps, dwell={dwell_s}s")
 
-        if not self.start_recorder():
+        if not self.recorder.start_recorder():
             return False
         wrote_settings = False
 
@@ -3548,14 +3546,14 @@ class ControllerRx:
                     break
 
                 if not wrote_settings:
-                    self._write_capture_settings(f_hz=f_hz, sweep=True)
+                    self.recorder.write_capture_settings(f_hz=f_hz, sweep=True)
                     wrote_settings = True
 
                 if not self.tune_and_arm(f_hz):
                     return False
                 self._dwell(dwell_s)
         finally:
-            self.stop_recorder()
+            self.recorder.stop_recorder()
         return True
 
     # ------------------------------------------------------------------ #
@@ -3583,7 +3581,7 @@ class ControllerRx:
         reset the RFSoC. Safe to call even if nothing is currently running.
         """
         self.request_stop()
-        self.stop_recorder()
+        self.recorder.stop_recorder()
         self.bus.rfsoc_reset()
 
 
@@ -4085,7 +4083,7 @@ if __name__ == "__main__":
     tuner_ctrl.configure(tuner=args.tuner, adc_if_mhz=args.adc_if_mhz, injection=args.injection)
     capture = ControllerRx(bus, tuner_ctrl)
 
-    capture.configure_capture(
+    capture.recorder.configure_capture(
         channel=args.channel,
         sample_rate_mhz=args.sample_rate_mhz,
         capture_name=args.capture_name,
@@ -4109,6 +4107,6 @@ if __name__ == "__main__":
             capture.start_single(freqs_hz[0])
     finally:
         logging.info("Stopping recorder")
-        capture.stop_recorder()
+        capture.recorder.stop_recorder()
         capture.close()
         bus.disconnect()
