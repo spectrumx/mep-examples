@@ -409,6 +409,7 @@ class MEPGui:
         self.bus.on_status(AFE_ANNOUNCE_TOPIC, self._on_afe_announce)
         self.bus.on_status(AFE_REGISTERS_TOPIC, self._on_afe_registers)
         self.bus.on_status(f"{AFE_RESPONSE_TOPIC}/polling", self._on_afe_polling_response)
+        self.bus.on_status(f"{AFE_RESPONSE_TOPIC}/logging", self._on_afe_logging_response)
         self.bus.on_status_pattern(self.bus.spec_topic, self._on_spec_data, subscribe=False)
 
         # Refresh status grid from any cached state.
@@ -525,6 +526,27 @@ class MEPGui:
             self._gui_call(self._vars["poll_interval_s"].set, int(n))
         except (TypeError, ValueError):
             pass
+
+    def _on_afe_logging_response(self, data: dict):
+        """Update logging widgets from afe/response/logging — the only source of truth."""
+        if "exception" in data:
+            logging.error(f"TLM logging command failed: {data['exception']}")
+            return
+
+        enabled = data.get("telemetry_logging_enabled")
+        if enabled is not None:
+            self._gui_call(self._vars["log_enabled"].set, "enabled" if enabled else "disabled")
+
+        log_dir = data.get("telemetry_log_dir")
+        if log_dir is not None:
+            self._gui_call(self._vars["log_path"].set, str(log_dir))
+
+        rate = data.get("telemetry_log_rate_s")
+        if rate is not None:
+            try:
+                self._gui_call(self._vars["log_rate"].set, float(rate))
+            except (TypeError, ValueError):
+                pass
 
     def _on_afe_announce(self, data: dict):
         """Handle afe/announce retained message — populate dynamic widgets."""
@@ -1390,6 +1412,14 @@ class MEPGui:
         frame = self._tab_frames[tab_text]
         builder(frame)
         self._tabs_built.add(tab_text)
+        # afe/announce is retained and already fired before this tab existed, so replay
+        # it now to populate widgets the builder just created (epoch, time source, ...).
+        cached = self.bus.get_cached_status(AFE_ANNOUNCE_TOPIC)
+        if isinstance(cached, dict):
+            try:
+                self._apply_afe_announce(cached)
+            except Exception:
+                logging.exception("Announce replay failed for tab %s", tab_text)
 
     def _get_current_tab_text(self) -> str:
         """Return the text label of the currently selected advanced tab."""
@@ -3490,10 +3520,8 @@ class MEPGui:
         ttk.Combobox(tune_f, textvariable=self._vars["tx_channel"], values=list(TX_CHANNEL_OPTIONS), width=8, state="readonly").grid(row=3, column=1, sticky="w", padx=5, pady=3)
         ttk.Label(tune_f, **_range_hint(", ".join(TX_CHANNEL_OPTIONS))).grid(row=3, column=2, sticky="w", padx=5, pady=3)
 
-        ttk.Separator(tune_f, orient="horizontal").grid(row=4, column=0, columnspan=3, sticky="ew", padx=5, pady=(6, 4))
-
         # Live status now shown in Transmit Control (above the warning), not here.
-        self._vars["tx_st_transmitting"] = tk.StringVar(value="-")
+        self._vars["tx_st_transmitting"] = tk.StringVar(value="Unknown")
 
         # No longer displayed (duplicated the staged fields above), but _tx_apply
         # still updates these from live status — keep the vars so it doesn't KeyError.
@@ -3517,10 +3545,12 @@ class MEPGui:
         act_f.columnconfigure(0, weight=1)
         act_f.columnconfigure(1, weight=1)
 
-        ttk.Label(act_f, text="Inferred Transmit Status").grid(
-            row=0, column=0, sticky="w", padx=5, pady=(4, 2))
-        status_entry = ttk.Entry(act_f, textvariable=self._vars["tx_st_transmitting"], state="readonly", width=18)
-        status_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=(4, 2))
+        status_f = ttk.Frame(act_f)
+        status_f.grid(row=0, column=0, columnspan=2, sticky="ew", padx=5, pady=(4, 2))
+        status_f.columnconfigure(1, weight=1)
+        ttk.Label(status_f, text="DAC Status").grid(row=0, column=0, sticky="w")
+        status_entry = ttk.Entry(status_f, textvariable=self._vars["tx_st_transmitting"], state="readonly")
+        status_entry.grid(row=0, column=1, sticky="ew", padx=(6, 0))
         self._bind_copy_menu(status_entry, self._vars["tx_st_transmitting"])
 
         ttk.Label(
@@ -3694,66 +3724,38 @@ class MEPGui:
         self._epoch_combo.grid(row=3, column=0, columnspan=2, sticky="w")
         self._epoch_combo.bind("<<ComboboxSelected>>", lambda _e: self._tlm_apply_time_config())
 
-        # ---- IMU ---- #
-        imu_f = ttk.LabelFrame(frame, text="IMU")
-        imu_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
-        imu_f.columnconfigure(1, weight=1)
-        imu_f.columnconfigure(3, weight=1)
+        # ---- IMU + MAG ---- #
+        sensor_f = ttk.LabelFrame(frame, text="IMU + MAG")
+        sensor_f.grid(row=1, column=0, padx=4, pady=(2, 2), sticky="ew")
+        sensor_f.columnconfigure(1, weight=1)
+        sensor_f.columnconfigure(2, weight=1)
+        sensor_f.columnconfigure(3, weight=1)
 
-        ttk.Label(imu_f, text="Accelerometer [g]", font=("TkDefaultFont", 9, "bold")).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=(7, 2), pady=(4, 2))
-        ttk.Label(imu_f, text="Gyroscope [deg/sec]", font=("TkDefaultFont", 9, "bold")).grid(
-            row=0, column=2, columnspan=2, sticky="w", padx=(16, 2), pady=(4, 2))
+        sensor_headers = ("Accelerometer [g]", "Gyroscope [deg/s]", "Magnetometer")
+        for column, label in enumerate(sensor_headers, start=1):
+            ttk.Label(sensor_f, text=label, font=("TkDefaultFont", 9, "bold")).grid(
+                row=0, column=column, sticky="w", padx=(7, 6), pady=(4, 2)
+            )
 
-        ttk.Label(imu_f, text="X").grid(row=1, column=0, sticky="w", padx=(7, 2), pady=1)
-        _ro_value(imu_f, 1, 1, "tlm_acc_x", width=12)
-        ttk.Label(imu_f, text="g").grid(row=1, column=2, sticky="w", padx=(2, 10), pady=1)
-        ttk.Label(imu_f, text="X").grid(row=1, column=3, sticky="w", padx=(12, 2), pady=1)
-        _ro_value(imu_f, 1, 4, "tlm_gyr_x", width=12)
-        ttk.Label(imu_f, text="deg/s").grid(row=1, column=5, sticky="w", padx=(2, 6), pady=1)
-
-        ttk.Label(imu_f, text="Y").grid(row=2, column=0, sticky="w", padx=(7, 2), pady=1)
-        _ro_value(imu_f, 2, 1, "tlm_acc_y", width=12)
-        ttk.Label(imu_f, text="g").grid(row=2, column=2, sticky="w", padx=(2, 10), pady=1)
-        ttk.Label(imu_f, text="Y").grid(row=2, column=3, sticky="w", padx=(12, 2), pady=1)
-        _ro_value(imu_f, 2, 4, "tlm_gyr_y", width=12)
-        ttk.Label(imu_f, text="deg/s").grid(row=2, column=5, sticky="w", padx=(2, 6), pady=1)
-
-        ttk.Label(imu_f, text="Z").grid(row=3, column=0, sticky="w", padx=(7, 2), pady=1)
-        _ro_value(imu_f, 3, 1, "tlm_acc_z", width=12)
-        ttk.Label(imu_f, text="g").grid(row=3, column=2, sticky="w", padx=(2, 10), pady=1)
-        ttk.Label(imu_f, text="Z").grid(row=3, column=3, sticky="w", padx=(12, 2), pady=1)
-        _ro_value(imu_f, 3, 4, "tlm_gyr_z", width=12)
-        ttk.Label(imu_f, text="deg/s").grid(row=3, column=5, sticky="w", padx=(2, 6), pady=1)
-
-        ttk.Label(imu_f, text="ACC ODR").grid(row=4, column=0, sticky="w", padx=(7, 2), pady=(6, 1))
-        _ro_value(imu_f, 4, 1, "tlm_imu_acc_odr", width=12)
-        ttk.Label(imu_f, text="GYR ODR").grid(row=4, column=3, sticky="w", padx=(12, 2), pady=(6, 1))
-        _ro_value(imu_f, 4, 4, "tlm_imu_gyr_odr", width=12)
-
-        # ---- Magnetometer ---- #
-        mag_f = ttk.LabelFrame(frame, text="Magnetometer")
-        mag_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="ew")
-        mag_f.columnconfigure(1, weight=1)
-
-        ttk.Label(mag_f, text="Magnetometer", font=("TkDefaultFont", 9, "bold")).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=(7, 2), pady=(4, 2))
-
-        ttk.Label(mag_f, text="X").grid(row=1, column=0, sticky="w", padx=(7, 2), pady=1)
-        _ro_value(mag_f, 1, 1, "tlm_mag_x", width=14)
-        ttk.Label(mag_f, text="Y").grid(row=2, column=0, sticky="w", padx=(7, 2), pady=1)
-        _ro_value(mag_f, 2, 1, "tlm_mag_y", width=14)
-        ttk.Label(mag_f, text="Z").grid(row=3, column=0, sticky="w", padx=(7, 2), pady=1)
-        _ro_value(mag_f, 3, 1, "tlm_mag_z", width=14)
-
-        ttk.Label(mag_f, text="CCR").grid(row=4, column=0, sticky="w", padx=(7, 2), pady=(6, 1))
-        _ro_value(mag_f, 4, 1, "tlm_mag_ccr", width=18)
-        ttk.Label(mag_f, text="UPDR").grid(row=5, column=0, sticky="w", padx=(7, 2), pady=1)
-        _ro_value(mag_f, 5, 1, "tlm_mag_updr", width=18)
+        sensor_rows = (
+            ("X", "tlm_acc_x", "tlm_gyr_x", "tlm_mag_x"),
+            ("Y", "tlm_acc_y", "tlm_gyr_y", "tlm_mag_y"),
+            ("Z", "tlm_acc_z", "tlm_gyr_z", "tlm_mag_z"),
+            ("ODR", "tlm_imu_acc_odr", "tlm_imu_gyr_odr", None),
+            ("CCR", None, None, "tlm_mag_ccr"),
+            ("UPDR", None, None, "tlm_mag_updr"),
+        )
+        for row_index, (label, acc_key, gyr_key, mag_key) in enumerate(sensor_rows, start=1):
+            ttk.Label(sensor_f, text=label).grid(
+                row=row_index, column=0, sticky="w", padx=(7, 8), pady=1
+            )
+            for column, key in enumerate((acc_key, gyr_key, mag_key), start=1):
+                if key is not None:
+                    _ro_value(sensor_f, row_index, column, key, width=12)
 
         # ---- Housekeeping ---- #
-        hk_f = ttk.LabelFrame(frame, text="Housekeeping")
-        hk_f.grid(row=3, column=0, padx=4, pady=(2, 2), sticky="ew")
+        hk_f = ttk.LabelFrame(frame, text="Housekeeping (HK)")
+        hk_f.grid(row=2, column=0, padx=4, pady=(2, 2), sticky="ew")
         hk_f.columnconfigure(0, weight=1)
         hk_f.columnconfigure(1, weight=1)
         hk_f.columnconfigure(2, weight=1)
@@ -3778,8 +3780,8 @@ class MEPGui:
             ttk.Label(cell, text=label).grid(row=0, column=0, sticky="w", padx=1)
             _ro_value(cell, 0, 1, f"tlm_hk_{key}", width=12)
 
-        # ---- Polling ---- #
-        poll_f = ttk.LabelFrame(frame, text="Polling")
+        # ---- Polling rate for IMU+MAG+HK ---- #
+        poll_f = ttk.LabelFrame(frame, text="Polling rate for IMU+MAG+HK")
         poll_f.grid(row=4, column=0, padx=4, pady=(2, 2), sticky="ew")
         poll_f.columnconfigure(1, weight=1)
         ttk.Label(poll_f, text="Interval (s)").grid(row=0, column=0, sticky="w", padx=5, pady=4)
@@ -3794,22 +3796,36 @@ class MEPGui:
         ttk.Button(poll_f, text="Refresh", width=8,
                command=self._tlm_refresh_telemetry).grid(row=0, column=4, padx=(2, 5), pady=4)
 
-        # ---- Logging ---- #
-        log_f = ttk.LabelFrame(frame, text="Logging")
-        log_f.grid(row=5, column=0, padx=4, pady=(2, 4), sticky="ew")
+        # ---- Always-on Log Telemetry to CSV ---- #
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=5, column=0, sticky="ew", padx=6, pady=(8, 6)
+        )
+        log_f = ttk.LabelFrame(frame, text="Always-on Log Telemetry to CSV")
+        log_f.grid(row=6, column=0, padx=4, pady=(2, 4), sticky="ew")
         log_f.columnconfigure(1, weight=1)
 
+        ttk.Label(
+            log_f,
+            text="Includes GPS, IMU, MAG, HK, and AFE register information.",
+            foreground="gray50",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=5, pady=(4, 0))
+        ttk.Label(
+            log_f,
+            text="Independent of Capture-triggered telemetry logging.",
+            foreground="gray50",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 2))
+
         rb_f = ttk.Frame(log_f)
-        rb_f.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
+        rb_f.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
         ttk.Radiobutton(rb_f, text="Enable", variable=self._vars["log_enabled"], value="enabled").pack(side="left", padx=(0, 8))
         ttk.Radiobutton(rb_f, text="Disable", variable=self._vars["log_enabled"], value="disabled").pack(side="left")
 
-        ttk.Label(log_f, text="Log Path").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(log_f, text="Log Path").grid(row=3, column=0, sticky="w", padx=5, pady=2)
         self._tlm_log_path_entry = ttk.Entry(log_f, textvariable=self._vars["log_path"])
-        self._tlm_log_path_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+        self._tlm_log_path_entry.grid(row=3, column=1, sticky="ew", padx=5, pady=2)
         self._bind_copy_menu(self._tlm_log_path_entry, self._vars["log_path"], allow_paste=True)
 
-        ttk.Label(log_f, text="Log Interval (s)").grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(log_f, text="Log Interval (s)").grid(row=4, column=0, sticky="w", padx=5, pady=2)
         self._tlm_log_rate_spin = ttk.Spinbox(
             log_f,
             from_=0,
@@ -3818,11 +3834,11 @@ class MEPGui:
             textvariable=self._vars["log_rate"],
             width=10,
         )
-        self._tlm_log_rate_spin.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+        self._tlm_log_rate_spin.grid(row=4, column=1, sticky="w", padx=5, pady=2)
         ttk.Button(log_f, text="Get", width=8,
-                   command=self._tlm_get_logging).grid(row=2, column=2, padx=2, pady=2)
+                   command=self._tlm_get_logging).grid(row=4, column=2, padx=2, pady=2)
         ttk.Button(log_f, text="Set", width=8,
-                   command=self._tlm_set_logging).grid(row=2, column=3, padx=(2, 5), pady=2)
+                   command=self._tlm_set_logging).grid(row=4, column=3, padx=(2, 5), pady=2)
 
     # ---- AFE tab ---- #
 
@@ -5580,14 +5596,21 @@ class MEPGui:
             return  # TX tab not yet built
         status = MEPBus.normalize_tx_status(tlm)
         if status is None:
+            # Never leave a stale transmit claim on screen when the payload is unusable.
+            self._vars["tx_st_transmitting"].set("Unknown")
             return
 
-        if status["transmitting"]:
-            self._vars["tx_st_transmitting"].set("TRANSMITTING")
-        else:
-            self._vars["tx_st_transmitting"].set("Not transmitting")
-
         ch = status["channels"]
+        if status["tx_state"] == "transmitting":
+            names = ",".join(str(c) for c in ch)
+            self._vars["tx_st_transmitting"].set(
+                f"Transmitting on {names}" if names else "Transmitting"
+            )
+        elif status["tx_state"] == "idle":
+            self._vars["tx_st_transmitting"].set("Not transmitting")
+        else:
+            self._vars["tx_st_transmitting"].set("Unknown")
+
         self._vars["tx_st_channels"].set(str(ch) if ch else "-")
 
         cf = status["center_freq"]

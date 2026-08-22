@@ -2448,6 +2448,8 @@ class MEPBus:
         Owns the RFSoC TX wire-field schema so consumers never read raw keys.
 
         Uses the firmware's explicit "state_DAC" field for transmission state.
+        Reports only what the DAC itself is doing — nothing downstream of the RFSoC
+        output connector is observable, so a caller must not read "idle" as "no RF".
 
         Returns:
           {
@@ -2455,6 +2457,7 @@ class MEPBus:
             "center_freq": float|None,
             "offset_freq": float|None,
             "amplitude_bins": int|None,
+            "tx_state": "transmitting"|"idle"|"unknown",
             "transmitting": bool,
             "raw": dict,
           }
@@ -2463,13 +2466,22 @@ class MEPBus:
             return None
         channels = payload.get("tx_channels") or []
         amplitude_bins = payload.get("tx_amplitude_bins")
-        transmitting = payload.get("state_DAC") == "active"
+        dac = payload.get("state_DAC")
+        # A dead service (retained LWT) or a payload with no DAC field proves nothing;
+        # report unknown rather than letting it read as "not transmitting".
+        if payload.get("state") == "offline" or dac is None:
+            tx_state = "unknown"
+        elif dac == "active":
+            tx_state = "transmitting"
+        else:
+            tx_state = "idle"
         return {
             "channels": channels,
             "center_freq": payload.get("tx_center_freq"),
             "offset_freq": payload.get("tx_offset_freq"),
             "amplitude_bins": amplitude_bins,
-            "transmitting": transmitting,
+            "tx_state": tx_state,
+            "transmitting": tx_state == "transmitting",
             "raw": payload,
         }
 
