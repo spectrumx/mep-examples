@@ -6154,6 +6154,10 @@ class MEPGui:
             self._ensure_tab_built(self._get_current_tab_text())
             self._adv_frame.grid()
             self._adv_btn_text.set("Hide Advanced Options \u25c0")
+        # Tk freezes the toplevel at its last actual size once mapped/resized;
+        # releasing the geometry lets it recompute to fit current content.
+        self.root.update_idletasks()
+        self.root.geometry("")
 
     # ------------------------------------------------------------------ #
     #  Logging
