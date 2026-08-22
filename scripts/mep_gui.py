@@ -550,6 +550,7 @@ class MEPGui:
 
     def _on_afe_announce(self, data: dict):
         """Handle afe/announce retained message — populate dynamic widgets."""
+        logging.info("GUI: announce data applied to all dynamic widgets")
         self._gui_call(self._apply_afe_announce, data)
         self._gui_call(self._afe_refresh)
 
@@ -624,8 +625,6 @@ class MEPGui:
                 self._vars["log_rate"].set(float(log_rate_current))
             except (TypeError, ValueError):
                 pass
-
-        logging.info("GUI: announce data applied to all dynamic widgets")
 
     def _on_spec_data(self, topic: str, data: dict):
         """Pattern listener: MQTT thread → spectrum ingestion."""
