@@ -2601,18 +2601,29 @@ class CaptureTelemetryLogger:
             return
         self._schema = schema
 
-        os.makedirs(capture_dir, exist_ok=True)
-        path = os.path.join(capture_dir, "gps_telemetry.csv")
+        data_dir = os.path.join(capture_dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        path = os.path.join(data_dir, "gps_telemetry.csv")
         header = []
         for stream, prefix in (("gps", "gnss"), ("mag", "mag"), ("imu", "imu"), ("hk", "hk")):
             header.extend(f"{prefix}_{k}" for k in self._schema[stream])
         header.append("registers_json")
 
-        self._fh = open(path, "w", newline="", encoding="utf-8")
+        # Append so a resumed capture extends its track instead of truncating it.
+        existing = None
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            with open(path, newline="", encoding="utf-8") as fh:
+                existing = next(csv.reader(fh), None)
+        if existing is not None and existing != header:
+            logging.error("Capture telemetry not logged: %s was written with a different schema", path)
+            return
+
+        self._fh = open(path, "a", newline="", encoding="utf-8")
         self._writer = csv.writer(self._fh)
-        self._writer.writerow(header)
-        self._fh.flush()
-        os.fsync(self._fh.fileno())
+        if existing is None:
+            self._writer.writerow(header)
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
 
         self._imu_cb = lambda data: self._last_imu.update(data)
         self._mag_cb = lambda data: self._last_mag.update(data)
@@ -3187,10 +3198,10 @@ class ControllerRx:
 
         if self.capture_name:
             channel_dir = f"{self.capture_name}/data/ch{self.channel}"
-            spectrogram_subdir = f"{self.capture_name}/data/ch{self.channel}/spectrograms"
+            spectrogram_subdir = f"{self.capture_name}/data/ch{self.channel}_spectrogram_images"
         else:
             channel_dir = f"/data/captures/preview/data/ch{self.channel}"
-            spectrogram_subdir = f"preview/data/ch{self.channel}/spectrograms"
+            spectrogram_subdir = f"preview/data/ch{self.channel}_spectrogram_images"
 
         self.bus.recorder_config_set("drf_sink.channel_dir", channel_dir)
         self.bus.recorder_config_set("spectrogram_output.plot_subdir", spectrogram_subdir)
@@ -3257,7 +3268,7 @@ class ControllerRx:
 
         _set_dotted_value(config, "basic_network.dst_port", RECORDER_CHANNEL_PORTS[self.channel])
         _set_dotted_value(config, "drf_sink.channel_dir", f"{PREVIEW_DATA_DIR}/ch{self.channel}")
-        _set_dotted_value(config, "spectrogram_output.plot_subdir", f"preview/data/ch{self.channel}/spectrograms")
+        _set_dotted_value(config, "spectrogram_output.plot_subdir", f"preview/data/ch{self.channel}_spectrogram_images")
         _set_dotted_value(config, "packet.freq_idx_offset", 0)
 
         conj_state = self.get_conjugate_state()
