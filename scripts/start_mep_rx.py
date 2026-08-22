@@ -18,12 +18,13 @@ Usage (imported by mep_gui.py):
     from start_mep_rx import MEPBus, ControllerTuner, ControllerRx, ControllerTx
     bus = MEPBus()
     tuner_ctrl = ControllerTuner(bus)
-    cap = ControllerRx(bus, tuner_ctrl)
-    cap.configure_sweep(channel="A", sample_rate_mhz=10)
-    cap.run_sweep(freqs_hz, dwell_s=60)
+    tuner_ctrl.configure(tuner="VALON", adc_if_mhz=1090)
+    rx = ControllerRx(bus, tuner_ctrl)
+    rx.configure_capture(channel="A", sample_rate_mhz=10)
+    rx.start_sweep(freqs_hz, dwell_s=60)
     tx = ControllerTx(bus, tuner_ctrl)
-    tx.tx_start(channel="A", center_freq_mhz=2400, offset_freq_mhz=1, amplitude_bins=4096)
-    tx.tx_stop()
+    tx.start(channel="A", center_freq_mhz=2400, offset_freq_mhz=1, amplitude_bins=4096)
+    tx.stop()
 
 Author: john.marino@colorado.edu
 """
@@ -1513,6 +1514,12 @@ class MEPBus:
         self._status_cache: dict[str, dict] = {}
         self._cache_lock = threading.Lock()
 
+        # ---- Synchronous wait plumbing (lazy, persistent per topic) ----
+        # Listener is registered once per topic and kept for the bus's life —
+        # never re-registered per call.
+        self._sync_data: dict[str, dict] = {}
+        self._sync_events: dict[str, threading.Event] = {}
+
         # ---- MQTT connection state ----
         self._connected = False
         self._last_error: Optional[str] = None
@@ -1638,6 +1645,104 @@ class MEPBus:
     def get_tuner_status_normalized(self) -> Optional[dict]:
         """Return normalized tuner status from cached MQTT payload, or None."""
         return self.normalize_tuner_status(self.get_cached_status(TUNER_STATUS_TOPIC))
+
+    def _ensure_sync_topic(self, topic: str):
+        """Lazily register a persistent listener for topic (idempotent).
+
+        Registered once and kept for the bus's life — never re-registered per
+        wait call.
+        """
+        if topic in self._sync_events:
+            return
+        self._sync_events[topic] = threading.Event()
+        self._sync_data[topic] = None
+
+        def _cb(data):
+            self._sync_data[topic] = data
+            self._sync_events[topic].set()
+
+        self.on_status(topic, _cb)
+
+    def wait_for_status(self, topic: str, timeout_s: float = 2.0, pre_armed: bool = False) -> Optional[dict]:
+        """Block until a message arrives on topic, return payload or None on timeout.
+
+        Set pre_armed=True when the event has already been cleared before the
+        triggering command was sent (avoids missing a fast response).
+        """
+        self._ensure_sync_topic(topic)
+        if not pre_armed:
+            self._sync_events[topic].clear()
+            self._sync_data[topic] = None
+        if self._sync_events[topic].wait(timeout=timeout_s):
+            return self._sync_data[topic]
+        return None
+
+    def get_tlm(self, timeout_s: float = 2.0, expected_state: str = None) -> Optional[dict]:
+        """Publish a "get tlm" request and wait for the reply.
+
+        Used by RX (arm verification, dwell polling) and firmware readiness.
+        When expected_state is set, intermediate status messages are ignored.
+        """
+        if not self.is_connected():
+            return None
+        self._ensure_sync_topic(RFSOC_STATUS_TOPIC)
+        self._sync_events[RFSOC_STATUS_TOPIC].clear()
+        self._sync_data[RFSOC_STATUS_TOPIC] = None
+        self.publish_command(
+            RFSOC_CMD_TOPIC,
+            {"task_name": "get", "arguments": ["tlm"]},
+            sleep_s=0,
+        )
+        deadline = time.time() + timeout_s
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            tlm = self.wait_for_status(
+                RFSOC_STATUS_TOPIC,
+                timeout_s=remaining,
+                pre_armed=True,
+            )
+            if expected_state is None or (
+                isinstance(tlm, dict) and tlm.get("state") == expected_state
+            ):
+                return tlm
+            self._sync_events[RFSOC_STATUS_TOPIC].clear()
+            self._sync_data[RFSOC_STATUS_TOPIC] = None
+
+    def wait_for_firmware_ready(self, max_wait_s: int = 30) -> bool:
+        """Poll rfsoc/status until f_s is a valid non-NaN positive number.
+
+        Bus-level (not RX-specific): TX depends on RFSoC firmware being up too.
+        """
+        if not self.is_connected():
+            logging.error("Cannot wait for RFSoC firmware while MQTT is offline")
+            return False
+
+        def _f_s_ready(tlm) -> Optional[float]:
+            if not isinstance(tlm, dict):
+                return None
+            f_s = tlm.get("f_s")
+            if isinstance(f_s, (int, float)) and f_s == f_s and f_s > 0:
+                return f_s
+            return None
+
+        logging.info("Waiting for RFSoC firmware to be ready...")
+        f_s = _f_s_ready(self.get_cached_status(RFSOC_STATUS_TOPIC))
+        if f_s is not None:
+            logging.info(f"RFSoC firmware ready: f_s={f_s / 1e6:.2f} MHz")
+            return True
+
+        deadline = time.time() + max_wait_s
+        while time.time() < deadline:
+            f_s = _f_s_ready(self.get_tlm(timeout_s=2.0))
+            if f_s is not None:
+                logging.info(f"RFSoC firmware ready: f_s={f_s / 1e6:.2f} MHz")
+                return True
+            logging.debug("RFSoC not ready yet, waiting...")
+            time.sleep(1)
+        logging.error(f"RFSoC firmware not ready after {max_wait_s}s")
+        return False
 
     def is_connected(self) -> bool:
         """Return True when MQTT client is currently connected to the broker."""
@@ -2756,7 +2861,7 @@ class ControllerRx:
         self.telemetry_logger = CaptureTelemetryLogger(bus)
         self.tuner_ctrl = tuner_ctrl if tuner_ctrl is not None else ControllerTuner(bus)
 
-        # ---- Sweep config (set via configure_sweep) ----
+        # ---- Capture config (set via configure_capture) ----
         self.channel: Optional[str] = None
         self.sample_rate_mhz: Optional[int] = None
         self.capture_name: Optional[str] = None
@@ -2772,26 +2877,12 @@ class ControllerRx:
         self._stop_flag = threading.Event()
 
         # ---- Synchronous wait infrastructure (for sweep orchestration) ----
-        self._tlm = None
-        self._tlm_lock = threading.Lock()
-        self._tlm_event = threading.Event()
-
         self._status = {t: None for t in _SYNC_STATUS_TOPICS}
         self._status_lock = threading.Lock()
         self._status_events = {t: threading.Event() for t in _SYNC_STATUS_TOPICS}
 
         # ---- Register sync-wait listeners on bus ----
         self._sync_cbs = {}
-
-        def _make_rfsoc_cb():
-            def _cb(data):
-                with self._tlm_lock:
-                    self._tlm = data
-                self._tlm_event.set()
-            return _cb
-
-        self._sync_cbs[RFSOC_STATUS_TOPIC] = _make_rfsoc_cb()
-        self.bus.on_status(RFSOC_STATUS_TOPIC, self._sync_cbs[RFSOC_STATUS_TOPIC])
 
         for topic in _SYNC_STATUS_TOPICS:
             def _make_status_cb(t):
@@ -2844,23 +2935,24 @@ class ControllerRx:
                 pass
 
     # ------------------------------------------------------------------ #
-    #  Sweep configuration                                                 #
+    #  Capture configuration                                               #
     # ------------------------------------------------------------------ #
 
-    def configure_sweep(
+    def configure_capture(
         self,
         channel: str,
         sample_rate_mhz: int,
-        tuner: str = None,
-        adc_if_mhz: float = None,
-        injection: str = None,
         capture_name: str = None,
     ):
-        """Set parameters used by run_sweep / run_single / start_recorder."""
+        """Set parameters used by start_sweep / start_single / start_recorder.
+
+        Tuner state is configured separately, directly on the shared
+        ControllerTuner (self.tuner_ctrl) — there is only one physical
+        oscillator, so it isn't part of this capture-specific config.
+        """
         self.channel = channel.upper()
         self.sample_rate_mhz = sample_rate_mhz
         self.capture_name = capture_name
-        self.tuner_ctrl.configure(tuner, adc_if_mhz, injection)
 
     def set_recorder_overrides(self, overrides: dict[str, object]):
         """Replace the persistent recorder overrides used after config.load."""
@@ -2906,23 +2998,6 @@ class ControllerRx:
     #  Synchronous wait helpers (used during sweep orchestration)          #
     # ------------------------------------------------------------------ #
 
-    def get_tlm(self, timeout_s: float = 2.0):
-        """Request and return the latest RFSoC telemetry, or None on timeout."""
-        if not self.bus.is_connected():
-            return None
-        with self._tlm_lock:
-            self._tlm = None
-        self._tlm_event.clear()
-        self.bus.publish_command(
-            RFSOC_CMD_TOPIC,
-            {"task_name": "get", "arguments": ["tlm"]},
-            sleep_s=0,
-        )
-        if self._tlm_event.wait(timeout=timeout_s):
-            with self._tlm_lock:
-                return self._tlm
-        return None
-
     def _wait_for_status(self, topic: str, timeout_s: float = 2.0, pre_armed: bool = False):
         """Block until a status message arrives on topic, return payload or None.
 
@@ -2943,24 +3018,6 @@ class ControllerRx:
                 return self._status[topic]
         logging.warning(f"No status from {topic} within {timeout_s}s — service may not be running")
         return None
-
-    def wait_for_firmware_ready(self, max_wait_s: int = 30) -> bool:
-        """Poll rfsoc/status until f_s is a valid non-NaN positive number."""
-        if not self._require_mqtt("wait for RFSoC firmware"):
-            return False
-        logging.info("Waiting for RFSoC firmware to be ready...")
-        deadline = time.time() + max_wait_s
-        while time.time() < deadline:
-            tlm = self.get_tlm(timeout_s=2.0)
-            if tlm is not None:
-                f_s = tlm.get("f_s")
-                if isinstance(f_s, (int, float)) and f_s == f_s and f_s > 0:
-                    logging.info(f"RFSoC firmware ready: f_s={f_s / 1e6:.2f} MHz")
-                    return True
-            logging.debug("RFSoC not ready yet, waiting...")
-            time.sleep(1)
-        logging.error(f"RFSoC firmware not ready after {max_wait_s}s")
-        return False
 
     # ------------------------------------------------------------------ #
     #  Conjugate policy                                                    #
@@ -3431,7 +3488,10 @@ class ControllerRx:
         self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "set", "arguments": f"freq_metadata {f_hz}"})
         self.bus.publish_command(RFSOC_CMD_TOPIC, {"task_name": "capture_next_pps"})
 
-        tlm = self.get_tlm()
+        # Ignore status packets from the reset/configuration sequence; this
+        # command's postcondition is an active RFSoC capture.
+        tlm = self.bus.get_tlm(timeout_s=2.0, expected_state="active")
+
         if not tlm or tlm.get("state") != "active":
             logging.error(f"RFSoC capture failed or inactive: {MEPBus._tlm_to_str(tlm)}")
             return False
@@ -3442,7 +3502,7 @@ class ControllerRx:
     #  Scan recipes (from "Start Scan" flowchart)                          #
     # ------------------------------------------------------------------ #
 
-    def run_single(self, f_hz: float, dwell_s: float = None):
+    def start_single(self, f_hz: float, dwell_s: float = None):
         """Single-frequency capture with optional dwell-based auto-stop."""
         if not self._require_mqtt("run single capture"):
             return False
@@ -3475,19 +3535,15 @@ class ControllerRx:
             self.stop_recorder()
         return True
 
-    def run_sweep(self, freqs_hz, dwell_s: float, restart_interval: int = None):
+    def start_sweep(self, freqs_hz, dwell_s: float):
         """Sweep: start recorder once, tune_and_arm + dwell per step."""
         if not self._require_mqtt("run sweep"):
             return False
 
-        logging.info(
-            f"Sweep: {len(freqs_hz)} steps, dwell={dwell_s}s, "
-            f"restart_interval={restart_interval}s"
-        )
+        logging.info(f"Sweep: {len(freqs_hz)} steps, dwell={dwell_s}s")
 
         if not self.start_recorder():
             return False
-        last_restart = time.time()
         wrote_settings = False
 
         try:
@@ -3499,12 +3555,6 @@ class ControllerRx:
                 if not wrote_settings:
                     self._write_capture_settings(f_hz=f_hz, sweep=True)
                     wrote_settings = True
-
-                if restart_interval and time.time() - last_restart >= restart_interval:
-                    logging.info("Restart interval reached — restarting recorder")
-                    if not self.start_recorder():
-                        return False
-                    last_restart = time.time()
 
                 if not self.tune_and_arm(f_hz):
                     return False
@@ -3524,7 +3574,7 @@ class ControllerRx:
             if self._stop_flag.is_set():
                 logging.info("Dwell interrupted by stop flag")
                 return
-            tlm = self.get_tlm(timeout_s=1.5)
+            tlm = self.bus.get_tlm(timeout_s=1.5)
             logging.debug(MEPBus._tlm_to_str(tlm))
             time.sleep(1)
 
@@ -3532,6 +3582,14 @@ class ControllerRx:
         """Signal the current sweep or dwell to exit early."""
         logging.info("Stop requested")
         self._stop_flag.set()
+
+    def stop(self):
+        """Full stop: break any running sweep/dwell, disable the recorder, and
+        reset the RFSoC. Safe to call even if nothing is currently running.
+        """
+        self.request_stop()
+        self.stop_recorder()
+        self.bus.rfsoc_reset()
 
 
 # ===== TX CONTROLLER ===== #
@@ -3547,16 +3605,12 @@ class ControllerTx:
 
     Takes a ControllerTuner (shared with ControllerRx when both exist, since
     there is only one physical tuner/oscillator). Whichever side last calls
-    tx_start/tune_and_arm with a tuner selected is what the LO is set to.
+    start/tune_and_arm with a tuner selected is what the LO is set to.
     """
 
     def __init__(self, bus: MEPBus, tuner_ctrl: "ControllerTuner" = None):
         self.bus = bus
         self.tuner_ctrl = tuner_ctrl if tuner_ctrl is not None else ControllerTuner(bus)
-
-    def configure_tuner(self, tuner: str = None, adc_if_mhz: float = None, injection: str = None):
-        """Stage tuner selection/IF/injection for the next tx_start call."""
-        self.tuner_ctrl.configure(tuner, adc_if_mhz, injection)
 
     # ---- Read-only proxies onto the shared tuner state ----
 
@@ -3586,8 +3640,8 @@ class ControllerTx:
         )
         return False
 
-    def tx_start(self, channel: str, center_freq_mhz: float,
-                 offset_freq_mhz: float, amplitude_bins: int) -> bool:
+    def start(self, channel: str, center_freq_mhz: float,
+              offset_freq_mhz: float, amplitude_bins: int) -> bool:
         """Apply staged TX settings and begin (or update) transmission.
 
         If a tuner is selected, sets the shared LO from center_freq_mhz first
@@ -3623,7 +3677,7 @@ class ControllerTx:
             logging.error(f"TX start failed: {e}")
             return False
 
-    def tx_stop(self) -> bool:
+    def stop(self) -> bool:
         """Disable all TX output (authoritative hardware-off).
 
         Publishes the explicit tx_stop command to the firmware.
@@ -4009,8 +4063,6 @@ if __name__ == "__main__":
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--skip_ntp",          action="store_true",
                         help="Skip NTP sync step")
-    parser.add_argument("--restart_interval",  type=int,   default=None,
-                        help="Force recorder restart every N seconds (sweep only)")
     parser.add_argument("--capture_name",      type=str,   default=None,
                         help="Save data under captures/{name}/... (default: ringbuffer)")
     args = parser.parse_args()
@@ -4041,19 +4093,18 @@ if __name__ == "__main__":
 
     # === Build controller === #
     bus = MEPBus()
-    capture = ControllerRx(bus)
+    tuner_ctrl = ControllerTuner(bus)
+    tuner_ctrl.configure(tuner=args.tuner, adc_if_mhz=args.adc_if_mhz, injection=args.injection)
+    capture = ControllerRx(bus, tuner_ctrl)
 
-    capture.configure_sweep(
+    capture.configure_capture(
         channel=args.channel,
         sample_rate_mhz=args.sample_rate_mhz,
-        tuner=args.tuner,
-        adc_if_mhz=args.adc_if_mhz,
-        injection=args.injection,
         capture_name=args.capture_name,
     )
 
     # === Wait for RFSoC firmware === #
-    if not capture.wait_for_firmware_ready(max_wait_s=30):
+    if not bus.wait_for_firmware_ready(max_wait_s=30):
         logging.error("RFSoC firmware not ready — aborting")
         capture.close()
         bus.disconnect()
@@ -4065,9 +4116,9 @@ if __name__ == "__main__":
 
     try:
         if is_sweep:
-            capture.run_sweep(freqs_hz, dwell_s=args.dwell, restart_interval=args.restart_interval)
+            capture.start_sweep(freqs_hz, dwell_s=args.dwell)
         else:
-            capture.run_single(freqs_hz[0])
+            capture.start_single(freqs_hz[0])
     finally:
         logging.info("Stopping recorder")
         capture.stop_recorder()

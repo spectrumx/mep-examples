@@ -302,6 +302,8 @@ class MEPGui:
         self._afe_atten_pending = {}
         self._afe_atten_initialized = set()
         self._afe_atten_request_counter = 0
+        self._afe_schema_signature = None
+        self._afe_time_source_signature = None
         
         # Jetson Health state
         self._jetson_nvpmodel_modes, self._jetson_nvpmodel_default_id = self._read_nvpmodel_config()
@@ -377,10 +379,10 @@ class MEPGui:
         # Shared tuner state: there is only one physical oscillator, so RX and
         # TX both hold a reference to the same ControllerTuner instance.
         self.tuner_ctrl = ControllerTuner(self.bus)
-        self.capture = None  # created on Start click via _get_or_create_capture
-        # TX lives independently of RX capture: one controller for the app's life,
-        # so transmit works with or without an RX session and RX reconfig cannot
-        # disturb it.
+        # RX/TX controllers live for the app's life, same as ControllerTuner —
+        # tuner state moved out of ControllerRx, so nothing ever requires
+        # recreating it (channel/sample-rate/capture-name just get reconfigured).
+        self.capture = ControllerRx(self.bus, self.tuner_ctrl)
         self.tx = ControllerTx(self.bus, self.tuner_ctrl)
         self._gps_monitor = None
 
@@ -552,23 +554,28 @@ class MEPGui:
         time_ref = describe.get("time", {}).get("reference", {})
         source_opts = time_ref.get("time_source_options", {})
         if source_opts and hasattr(self, "_time_source_frame"):
-            for w in self._time_source_frame.winfo_children():
-                w.destroy()
-            col = 0
-            first_val = None
-            for _code, label in sorted(source_opts.items()):
-                val = label.lower()
-                if val == "notset":
-                    continue
-                if first_val is None:
-                    first_val = val
-                ttk.Radiobutton(self._time_source_frame, text=label,
-                                variable=self._vars["time_source"],
-                                value=val,
-                                command=self._tlm_apply_time_config).grid(row=0, column=col, sticky="w", padx=2)
-                col += 1
-            if first_val:
-                self._vars["time_source"].set(first_val)
+            time_source_options = tuple(
+                (str(code), str(label))
+                for code, label in sorted(source_opts.items())
+                if str(label).lower() != "notset"
+            )
+            if time_source_options != self._afe_time_source_signature:
+                for w in self._time_source_frame.winfo_children():
+                    w.destroy()
+                col = 0
+                first_val = None
+                for _code, label in time_source_options:
+                    val = label.lower()
+                    if first_val is None:
+                        first_val = val
+                    ttk.Radiobutton(self._time_source_frame, text=label,
+                                    variable=self._vars["time_source"],
+                                    value=val,
+                                    command=self._tlm_apply_time_config).grid(row=0, column=col, sticky="w", padx=2)
+                    col += 1
+                self._afe_time_source_signature = time_source_options
+                if first_val:
+                    self._vars["time_source"].set(first_val)
 
         # ---- Epoch combobox (from announce dict) ---- #
         epoch_opts = time_ref.get("time_epoch_options", {})
@@ -641,55 +648,6 @@ class MEPGui:
             self.root.after(0, self._pump_gui_queue)
         except tk.TclError:
             self._gui_queue_closed = True
-
-    # ------------------------------------------------------------------ #
-    #  Capture controller management (lazy initialization)                #
-    # ------------------------------------------------------------------ #
-
-    def _get_or_create_capture(self, params: dict) -> ControllerRx:
-        """
-        Return a stable ControllerRx and update runtime fields in place.
-
-        Recreate only when tuner identity/fixed IF changes. Channel, sample rate,
-        injection mode, and capture name are runtime parameters and do not require
-        recreating the capture controller.
-        """
-        needs_new = (
-            self.capture is None
-            or self.capture.tuner      != params["tuner"]
-            or self.capture.adc_if_mhz != params["adc_if_mhz"]
-        )
-
-        if needs_new:
-            if self.capture is not None:
-                logging.info("Configuration changed — recreating capture controller")
-                try:
-                    self.capture.close()
-                except Exception as e:
-                    logging.warning(f"Failed to close capture controller: {e}")
-
-            logging.info("Creating capture controller")
-            self.capture = ControllerRx(self.bus, self.tuner_ctrl)
-
-            self.capture.configure_sweep(
-                channel=params["channel"],
-                sample_rate_mhz=params["sample_rate_mhz"],
-                tuner=params["tuner"],
-                adc_if_mhz=params["adc_if_mhz"],
-                injection=params["injection"],
-                capture_name=params["capture_name"],
-            )
-        else:
-            self.capture.configure_sweep(
-                channel=params["channel"],
-                sample_rate_mhz=params["sample_rate_mhz"],
-                tuner=params["tuner"],
-                adc_if_mhz=params["adc_if_mhz"],
-                injection=params["injection"],
-                capture_name=params["capture_name"],
-            )
-
-        return self.capture
 
     # ------------------------------------------------------------------ #
     #  TLM tab updaters (run on GUI thread)
@@ -3536,11 +3494,10 @@ class MEPGui:
 
         ttk.Label(
             act_f,
-            text=("\u26a0 TRANSMIT WARNING. Do not transmit unless you hold a valid "
-                  "license or authorization for the selected frequency and power. "
-                  "The operator bears full responsibility for compliance."),
+            text=("\u26a0 TRANSMIT WARNING \u26a0 \nDO NOT TRANSMIT unless you are legally permitted "
+      "to do so on the selected frequency and at the selected power. "),
             foreground="#b30000",
-            font=("TkDefaultFont", 9, "bold"),
+            font=("TkDefaultFont", 8, "bold"),
             wraplength=LEFT_PANEL_WIDTH - 110,
             justify="center",
             anchor="center",
@@ -3550,11 +3507,6 @@ class MEPGui:
             row=2, column=0, sticky="ew", padx=5, pady=(0, 4))
         ttk.Button(act_f, text="Stop", width=14, command=self._tx_stop_click).grid(
             row=2, column=1, sticky="ew", padx=5, pady=(0, 4))
-
-        self._vars["tx_action_status"] = tk.StringVar(value="")
-        ttk.Label(act_f, textvariable=self._vars["tx_action_status"],
-                  foreground="grey").grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 4))
 
     # ---- TUN tab ---- #
 
@@ -3996,6 +3948,23 @@ class MEPGui:
             logging.warning("AFE: announce has no register_pins — cannot populate tab")
             return
         tx_devices = [d for d in devices if d.startswith("tx")]
+        schema_signature = json.dumps(
+            {
+                "register_pins": reg_pins,
+                "devices": devices,
+                "rx_devices": rx_devices,
+                "tx_devices": tx_devices,
+                "attenuation_db_range": atten_range,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        self._afe_reg_pins = reg_pins
+        self._afe_atten_range = atten_range
+        if schema_signature == self._afe_schema_signature:
+            return
+        self._afe_schema_signature = schema_signature
 
         # Remove placeholder
         if hasattr(self, "_afe_placeholder") and self._afe_placeholder.winfo_exists():
@@ -4008,10 +3977,6 @@ class MEPGui:
                 w.destroy()
 
         frame = self._afe_frame
-
-        # Cache the register_pins for apply_state and reset_defaults
-        self._afe_reg_pins = reg_pins
-        self._afe_atten_range = atten_range
 
         # ---- Main Block (misc) ---- #
         misc_pins = reg_pins.get("misc", [])
@@ -4608,13 +4573,6 @@ class MEPGui:
 
     def _sync_conjugate_policy_ui_from_capture(self):
         """Sync conjugate policy and effective state from ControllerRx."""
-        if self.capture is None:
-            current_policy = self._vars["conjugate_policy"].get()
-            if (not self._conjugate_policy_user_override) or (current_policy not in CONJUGATE_POLICY_OPTIONS):
-                self._vars["conjugate_policy"].set(CONJUGATE_POLICY_DEFAULT)
-            self._vars["conjugate_actual"].set("—")
-            return
-
         state = self.capture.get_conjugate_state()
         policy = state.get("policy", CONJUGATE_POLICY_DEFAULT)
         if policy not in CONJUGATE_POLICY_OPTIONS:
@@ -4631,9 +4589,8 @@ class MEPGui:
             self._sync_conjugate_policy_ui_from_capture()
             return
 
-        if self.capture is not None:
-            self.capture.conjugate_policy = policy
-            logging.info(f"Conjugate policy set to: {policy}")
+        self.capture.conjugate_policy = policy
+        logging.info(f"Conjugate policy set to: {policy}")
         self._update_conjugate_actual_display()
 
     def _update_conjugate_actual_display(self):
@@ -5543,7 +5500,7 @@ class MEPGui:
             logging.error("SOC: invalid NCO frequency value")
             return
         sweep_active = self._sweep_thread and self._sweep_thread.is_alive()
-        recorder_running = bool(self.capture is not None and self.capture._recorder_running)
+        recorder_running = bool(self.capture._recorder_running)
         if sweep_active or recorder_running:
             logging.warning("SOC: setting NCO frequency during active capture/sweep can disrupt capture")
         self.bus.rfsoc_set_if(if_mhz)
@@ -5616,23 +5573,18 @@ class MEPGui:
             offset_mhz = float(self._vars["tx_offset_freq"].get().strip())
             amplitude = int(self._vars["tx_amplitude_bins"].get())
         except (ValueError, tk.TclError):
-            self._vars["tx_action_status"].set("Invalid staged value; nothing sent")
             logging.error("TX: invalid staged value; start/update aborted")
             return
         channel = self._vars["tx_channel"].get().strip()
         tuner, adc_if_mhz, injection = self._parse_tuner_params()
-        self.tx.configure_tuner(tuner, adc_if_mhz, injection)
-        if not self.tx.tx_start(channel, center_mhz, offset_mhz, amplitude):
-            self._vars["tx_action_status"].set("Failed to start TX")
+        self.tuner_ctrl.configure(tuner, adc_if_mhz, injection)
+        if not self.tx.start(channel, center_mhz, offset_mhz, amplitude):
             logging.error("TX: start failed")
             return
-        self._vars["tx_action_status"].set(
-            f"Start/Update sent (channel={channel})")
 
     def _tx_stop_click(self):
         """Disable all TX output."""
-        self.tx.tx_stop()
-        self._vars["tx_action_status"].set("Stop sent (TX off)")
+        self.tx.stop()
 
     # ------------------------------------------------------------------ #
     #  TUN helpers
@@ -5777,8 +5729,7 @@ class MEPGui:
         if "rec_config_source" not in self._vars:
             return
         self._rec_pending_overrides.clear()
-        if self.capture is not None:
-            self.capture.clear_recorder_overrides()
+        self.capture.clear_recorder_overrides()
         self._rec_load_preset()
 
     def _rec_sample_rate_mhz(self) -> int:
@@ -5964,15 +5915,13 @@ class MEPGui:
             )
             return
         self._rec_pending_overrides = dict(model["overrides"])
-        if self.capture is not None:
-            self.capture.set_recorder_overrides(self._rec_pending_overrides)
+        self.capture.set_recorder_overrides(self._rec_pending_overrides)
         self._rec_render_model(model)
         logging.info("REC: settings will apply on next recorder start")
 
     def _rec_reset_config(self):
         self._rec_pending_overrides.clear()
-        if self.capture is not None:
-            self.capture.clear_recorder_overrides()
+        self.capture.clear_recorder_overrides()
         self._rec_load_preset()
         logging.info("REC: staged overrides cleared; selected preset restored")
 
@@ -6017,10 +5966,6 @@ class MEPGui:
             except Exception as e:
                 logging.exception("ControllerRx init failed")
                 self._vars["prof_status"].set(f"Failed to initialize: {e}")
-                return
-
-            if self.capture is None:
-                self._vars["prof_status"].set("ControllerRx not available")
                 return
 
             freq_hz = int(params["freq_start"] * 1e6)
@@ -6273,8 +6218,13 @@ class MEPGui:
     # ------------------------------------------------------------------ #
 
     def _configure_mep(self, params: dict):
-        """Create or update ControllerRx with GUI params."""
-        self.capture = self._get_or_create_capture(params)
+        """Apply GUI params to the tuner and the (long-lived) ControllerRx."""
+        self.tuner_ctrl.configure(params["tuner"], params["adc_if_mhz"], params["injection"])
+        self.capture.configure_capture(
+            channel=params["channel"],
+            sample_rate_mhz=params["sample_rate_mhz"],
+            capture_name=params["capture_name"],
+        )
         self.capture.set_recorder_overrides(self._rec_pending_overrides)
         if self._conjugate_policy_user_override:
             policy = self._vars["conjugate_policy"].get()
@@ -6332,7 +6282,7 @@ class MEPGui:
             try:
                 self._configure_mep(params)
                 self.capture._stop_flag.clear()
-                if not self.capture.wait_for_firmware_ready(max_wait_s=10):
+                if not self.bus.wait_for_firmware_ready(max_wait_s=10):
                     logging.error("RFSoC firmware not ready — aborting sweep")
                     self._gui_call(self._status_var.set, "Idle")
                     return
@@ -6341,7 +6291,7 @@ class MEPGui:
                 )
                 n = len(freqs_hz) if hasattr(freqs_hz, "__len__") else "?"
                 logging.info(f"Starting sweep: {n} steps, dwell={params['dwell']}s")
-                self.capture.run_sweep(freqs_hz, params["dwell"])
+                self.capture.start_sweep(freqs_hz, params["dwell"])
             except Exception as e:
                 logging.error(f"Sweep error: {e}", exc_info=True)
             finally:
@@ -6374,7 +6324,7 @@ class MEPGui:
                     )
                 else:
                     logging.info(f"Starting single capture at {params['freq_start']} MHz (no dwell)")
-                self.capture.run_single(f_hz, dwell_s=dwell_s)
+                self.capture.start_single(f_hz, dwell_s=dwell_s)
                 self._gui_call(
                     self._status_var.set,
                     "Idle" if dwell_s is not None else "Single capture running",
@@ -6390,8 +6340,7 @@ class MEPGui:
     def _stop_all(self):
         def _worker():
             logging.info("Stop All — requesting sweep stop")
-            if self.capture:
-                self.capture.request_stop()
+            self.capture.request_stop()
 
             if self._sweep_thread and self._sweep_thread.is_alive():
                 logging.info("Waiting for sweep thread to exit...")
@@ -6399,9 +6348,7 @@ class MEPGui:
                 if self._sweep_thread.is_alive():
                     logging.warning("Sweep thread did not exit within 5s")
 
-            if self.capture:
-                self.capture.stop_recorder()
-            self.bus.rfsoc_reset()
+            self.capture.stop()
             self._gui_call(self._status_var.set, "Idle")
             logging.info("Stop All complete")
 
@@ -6452,7 +6399,7 @@ def main():
                 pass
         try:
             if getattr(app, "tx", None) is not None:
-                app.tx.tx_stop()
+                app.tx.stop()
         except Exception as e:
             logging.debug(f"Exception stopping TX during cleanup: {e}")
         try:
@@ -6497,7 +6444,7 @@ def main():
                 and bus is not None
                 and bus.is_connected()
             ):
-                app.tx.tx_stop()
+                app.tx.stop()
         except Exception as e:
             logging.debug(f"Exception stopping TX during final cleanup: {e}")
 
