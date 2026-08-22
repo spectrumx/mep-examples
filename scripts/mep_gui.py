@@ -41,17 +41,13 @@ from start_mep_rx import (
     DockerManager,
     GPSDMonitor,
     ControllerTx,
+    HostPlatform,
     get_frequency_list,
     resolve_recorder_preset,
     preview_recorder_settings,
     resolve_injection,
     resolve_lo_mhz,
-    get_local_hostname,
-    get_primary_network_info,
-    get_primary_network_info_detailed,
-    get_thermal_info_detailed,
-    get_jetson_power_mode,
-    set_jetson_power_mode_detailed,
+    HostPlatform,
     CHANNEL_OPTIONS,
     RECORDER_CHANNEL_PORTS,
     TUNER_OPTIONS,
@@ -292,7 +288,8 @@ class MEPGui:
 
     def __init__(self, root: tk.Tk, mqtt_host: str = MQTT_BROKER, mqtt_port: int = MQTT_PORT):
         self.root = root
-        self.root.title(f"{get_local_hostname()} MEP")
+        self.host = HostPlatform()
+        self.root.title(f"{self.host.get_hostname()} MEP")
         self.root.resizable(True, True)
         self._mqtt_host = mqtt_host
         self._mqtt_port = mqtt_port
@@ -306,7 +303,7 @@ class MEPGui:
         self._afe_time_source_signature = None
         
         # Jetson Health state
-        self._jetson_nvpmodel_modes, self._jetson_nvpmodel_default_id = self._read_nvpmodel_config()
+        self._jetson_nvpmodel_modes, self._jetson_nvpmodel_default_id = self.host.get_power_modes()
         self._jetson_health_busy = False
         self._jetson_nvpmodel_busy = False
         self._jetson_cpu_prev = None
@@ -2768,7 +2765,7 @@ class MEPGui:
 
         self._add_copyable_note(
             frame,
-            "System rows auto-update from /proc, /sys/class/thermal, nvpmodel, and /etc/nvpmodel.conf. Applying a new mode may require root or passwordless sudo. Power rows update only when Query tegrastats is pressed.",
+            "System rows are supplied by HostPlatform. Applying a new mode may require root or passwordless sudo. Power rows update only when Query tegrastats is pressed.",
             row=6,
             wraplength=420,
         )
@@ -2791,31 +2788,6 @@ class MEPGui:
             return
         for key, value in data.items():
             self._jetson_health_set(key, value)
-
-    def _read_nvpmodel_config(self, path: str = "/etc/nvpmodel.conf"):
-        modes = []
-        default_id = None
-        mode_re = re.compile(r"<\s*POWER_MODEL\s+ID\s*=\s*(\d+)\s+NAME\s*=\s*([^>]+?)\s*>", re.IGNORECASE)
-        default_re = re.compile(r"<\s*PM_CONFIG\s+DEFAULT\s*=\s*(\d+)\s*>", re.IGNORECASE)
-
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    s = line.strip()
-                    if not s or s.startswith("#"):
-                        continue
-                    m = mode_re.search(s)
-                    if m:
-                        modes.append((m.group(1), m.group(2).strip()))
-                        continue
-                    m = default_re.search(s)
-                    if m:
-                        default_id = m.group(1)
-        except Exception as e:
-            logging.debug(f"Failed to read nvpmodel modes from {path}: {e}")
-            return [], None
-
-        return modes, default_id
 
     def _jetson_nvpmodel_choice_values(self) -> list[str]:
         return [f"{mode_id}: {name}" for mode_id, name in self._jetson_nvpmodel_modes]
@@ -2851,240 +2823,56 @@ class MEPGui:
             return f"ID {mode_id}"
         return None
 
-    def _read_thermal_sysfs(self, limit: int = 6) -> list[tuple[str, float]]:
-        out = []
-        base = "/sys/class/thermal"
-        try:
-            entries = sorted(name for name in os.listdir(base) if name.startswith("thermal_zone"))
-        except Exception as e:
-            logging.debug(f"Failed to list thermal zones from {base}: {e}")
-            return out
-
-        for name in entries:
-            t_path = os.path.join(base, name, "temp")
-            ty_path = os.path.join(base, name, "type")
-            try:
-                with open(t_path, "r", encoding="utf-8") as f:
-                    raw = f.read().strip()
-                with open(ty_path, "r", encoding="utf-8") as f:
-                    tname = f.read().strip()
-                temp_c = float(raw) / 1000.0
-                if -100.0 <= temp_c <= 250.0:
-                    out.append((tname or name, temp_c))
-            except Exception as e:
-                logging.debug(f"Failed to read thermal zone {name}: {e}")
-                continue
-
-            if len(out) >= limit:
-                break
-
-        return out
-
-    def _read_meminfo(self):
-        total_kb = None
-        avail_kb = None
-        try:
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        total_kb = int(line.split()[1])
-                    elif line.startswith("MemAvailable:"):
-                        avail_kb = int(line.split()[1])
-        except Exception as e:
-            logging.warning(f"Failed to read memory info from /proc/meminfo: {e}")
-            return None
-
-        if total_kb is None or avail_kb is None or total_kb <= 0:
-            return None
-        used_kb = max(total_kb - avail_kb, 0)
-        return used_kb, total_kb
-
-    def _read_disk_usage(self, path: str = "/"):
-        try:
-            usage = shutil.disk_usage(path)
-        except Exception as e:
-            logging.warning(f"Failed to read disk usage for '{path}': {e}")
-            return None
-        return usage.free, usage.total
-
-    def _read_cpu_usage(self):
-        try:
-            with open("/proc/stat", "r", encoding="utf-8") as f:
-                first = f.readline().strip()
-        except Exception as e:
-            logging.warning(f"Failed to read CPU usage from /proc/stat: {e}")
-            return None
-
-        parts = first.split()
-        if len(parts) < 5 or parts[0] != "cpu":
-            return None
-
-        try:
-            vals = [int(x) for x in parts[1:]]
-        except Exception as e:
-            logging.warning(f"Failed to parse CPU stats: {e}")
-            return None
-
-        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
-        total = sum(vals)
-
-        prev = self._jetson_cpu_prev
-        self._jetson_cpu_prev = (total, idle)
-        if prev is None:
-            return None
-
-        dt = total - prev[0]
-        di = idle - prev[1]
-        if dt <= 0:
-            return None
-        return (dt - di) * 100.0 / dt
-
-    def _read_nvpmodel(self):
-        result = get_jetson_power_mode()
-        if result:
-            mode_id, mode_name = result
-        else:
-            mode_id, mode_name = None, None
-        return self._format_nvpmodel_display(mode_id, mode_name)
-
-    def _read_tegrastats_snapshot(self):
-        """Return one tegrastats line parsed into rails and temp tokens."""
-        try:
-            out = subprocess.check_output(
-                ["tegrastats", "--interval", "1000"],
-                stderr=subprocess.DEVNULL,
-                timeout=3.0,
-                text=True,
-            )
-        except subprocess.TimeoutExpired as e:
-            out = e.output or ""
-        except Exception as e:
-            logging.debug(f"Failed to read tegrastats snapshot: {e}")
-            return {}, []
-
-        if isinstance(out, bytes):
-            out = out.decode(errors="ignore")
-
-        blob = " ".join(s.strip() for s in out.splitlines() if s.strip())
-        if not blob:
-            return {}, []
-
-        rails = {}
-        for m in re.finditer(r"([A-Z0-9_]+)\s+(\d+)mW/(\d+)mW", blob):
-            name = m.group(1)
-            inst = m.group(2)
-            avg = m.group(3)
-            rails[name] = f"{inst}/{avg} mW"
-
-        temp_map = {}
-        for m in re.finditer(r"([A-Za-z0-9_]+)@(-?\d+(?:\.\d+)?)C", blob):
-            temp_map[m.group(1)] = f"{float(m.group(2)):.1f} C"
-
-        temps = list(temp_map.items())
-
-        return rails, temps
-
     def _jetson_health_collect(self, include_tegrastats: bool = False) -> dict:
-        data = {}
-
-        missing_host_paths = []
-        if not os.path.exists("/proc/stat"):
-            missing_host_paths.append("/proc/stat")
-        if not os.path.exists("/proc/meminfo"):
-            missing_host_paths.append("/proc/meminfo")
-        if missing_host_paths:
-            data["jh_host_metrics_status"] = (
-                "Host metrics unavailable on this OS: " + ", ".join(missing_host_paths)
-            )
-        else:
-            data["jh_host_metrics_status"] = ""
-
-        mode = self._read_nvpmodel()
-        if mode:
-            data["jh_nvpmodel"] = mode
-
-        default_choice = self._jetson_nvpmodel_choice_for_id(self._jetson_nvpmodel_default_id)
-        if default_choice:
-            data["jh_nvpmodel_default"] = default_choice
-
-        cpu = self._read_cpu_usage()
+        resources = self.host.get_resources()
+        network = self.host.get_network()
+        thermal = self.host.get_thermal()
+        power = self.host.get_power(include_tegrastats)
+        data = {
+            "jh_host_metrics_status": "",
+            "jh_net_status": network.get("status", "Offline"),
+            "jh_net_mac": network.get("mac", "-"),
+            "jh_net_ip": network.get("ipv4", "-"),
+            "jh_net_reason": "",
+            "jh_thermal_reason": thermal.get("detail", "") if thermal.get("error_code") else "",
+            "jh_nvpmodel": self._format_nvpmodel_display(
+                (power.get("mode") or {}).get("id"), (power.get("mode") or {}).get("name")
+            ),
+            "jh_nvpmodel_default": self._jetson_nvpmodel_choice_for_id(power.get("default_mode_id")),
+        }
+        cpu = resources.get("cpu_usage_percent")
         if cpu is not None:
             data["jh_cpu_usage"] = f"{cpu:.1f}%"
-
-        mem = self._read_meminfo()
-        if mem is not None:
-            used_kb, total_kb = mem
-            used_mb = used_kb / 1024.0
-            total_mb = total_kb / 1024.0
-            pct = (used_kb * 100.0 / total_kb) if total_kb > 0 else 0.0
-            data["jh_ram"] = f"{used_mb:.0f}/{total_mb:.0f} MB ({pct:.1f}%)"
-
-        disk = self._read_disk_usage("/")
-        if disk is not None:
-            free_b, total_b = disk
-            free_gb = free_b / (1024.0 ** 3)
-            total_gb = total_b / (1024.0 ** 3)
-            used_pct = ((total_b - free_b) * 100.0 / total_b) if total_b > 0 else 0.0
-            data["jh_disk"] = f"{free_gb:.1f}/{total_gb:.1f} GiB free ({used_pct:.1f}% used)"
-
-        net_details = get_primary_network_info_detailed()
-        data["jh_net_status"] = net_details.get("status", "Offline")
-        data["jh_net_mac"] = net_details.get("mac", "-")
-        data["jh_net_ip"] = net_details.get("ipv4", "-")
-        if net_details.get("error_code"):
-            data["jh_net_reason"] = (
-                f"Reason: {net_details.get('error_code')}"
-                + (f" ({net_details.get('detail')})" if net_details.get("detail") else "")
-            )
-        else:
-            data["jh_net_reason"] = ""
-
-        thermal_details = get_thermal_info_detailed(limit=6)
-        temps = [(name, f"{temp:.1f} C") for name, temp in thermal_details.get("temps", [])]
-        rails = {}
-
-        if thermal_details.get("error_code") and thermal_details.get("error_code") != "thermal_partial":
-            data["jh_thermal_reason"] = (
-                f"Reason: {thermal_details.get('error_code')}"
-                + (f" ({thermal_details.get('detail')})" if thermal_details.get("detail") else "")
-            )
-        else:
-            data["jh_thermal_reason"] = ""
-
+        memory = resources.get("memory", {})
+        if memory.get("total_kb"):
+            used_kb = memory.get("used_kb", 0)
+            total_kb = memory["total_kb"]
+            data["jh_ram"] = f"{used_kb / 1024:.0f}/{total_kb / 1024:.0f} MB ({used_kb * 100 / total_kb:.1f}%)"
+        disk = resources.get("disk", {})
+        if disk.get("total_bytes"):
+            free_bytes = disk.get("free_bytes", 0)
+            total_bytes = disk["total_bytes"]
+            data["jh_disk"] = f"{free_bytes / (1024 ** 3):.1f}/{total_bytes / (1024 ** 3):.1f} GiB free ({(total_bytes - free_bytes) * 100 / total_bytes:.1f}% used)"
+        for index in range(1, 7):
+            zone_index = index - 1
+            if zone_index < len(thermal.get("temps", [])):
+                name, value = thermal["temps"][zone_index]
+                data[f"jh_temp_name_{index}"] = name
+                data[f"jh_temp_val_{index}"] = f"{value:.1f} C"
+            else:
+                data[f"jh_temp_name_{index}"] = f"Temp {index}"
+                data[f"jh_temp_val_{index}"] = "-"
         if include_tegrastats:
-            ts_rails, ts_temps = self._read_tegrastats_snapshot()
-            rails = ts_rails
-            if not temps and ts_temps:
-                temps = ts_temps[:6]
-
-        for i in range(1, 7):
-            if i <= len(temps):
-                tname, tval = temps[i - 1]
-                data[f"jh_temp_name_{i}"] = tname
-                data[f"jh_temp_val_{i}"] = tval
-            else:
-                data[f"jh_temp_name_{i}"] = f"Temp {i}"
-                data[f"jh_temp_val_{i}"] = "-"
-
-        if include_tegrastats:
-            data["jh_pwr_name_1"] = "VDD_IN"
-            data["jh_pwr_val_1"] = rails.get("VDD_IN", "-")
-            other = [name for name in sorted(rails.keys()) if name != "VDD_IN"]
-
-            if other:
-                data["jh_pwr_name_2"] = other[0]
-                data["jh_pwr_val_2"] = rails.get(other[0], "-")
-            else:
-                data["jh_pwr_name_2"] = "Rail 1"
-                data["jh_pwr_val_2"] = "-"
-
-            if len(other) > 1:
-                data["jh_pwr_name_3"] = other[1]
-                data["jh_pwr_val_3"] = rails.get(other[1], "-")
-            else:
-                data["jh_pwr_name_3"] = "Rail 2"
-                data["jh_pwr_val_3"] = "-"
-
+            data["jh_tegrastats_last"] = datetime.datetime.now().strftime("Last queried: %Y-%m-%d %H:%M:%S")
+            for index in range(1, 4):
+                rail_index = index - 1
+                if rail_index < len(power.get("rails", [])):
+                    rail = power["rails"][rail_index]
+                    data[f"jh_pwr_name_{index}"] = rail["name"]
+                    data[f"jh_pwr_val_{index}"] = rail["value"]
+                else:
+                    data[f"jh_pwr_name_{index}"] = f"Rail {rail_index}"
+                    data[f"jh_pwr_val_{index}"] = "-"
         return data
 
     def _jetson_health_poll(self):
@@ -3130,7 +2918,7 @@ class MEPGui:
 
     def _jetson_health_sync_nvpmodel_choice(self):
         def _worker():
-            result = get_jetson_power_mode()
+            result = self.host.get_current_power_mode()
             if result:
                 mode_id, mode_name = result
             else:
@@ -3182,7 +2970,7 @@ class MEPGui:
         def _worker():
             display = self._jetson_nvpmodel_choice_for_id(mode_id) or f"ID {mode_id}"
             try:
-                result = set_jetson_power_mode_detailed(mode_id)
+                result = self.host.set_power_mode(mode_id)
                 if not result.get("ok"):
                     logging.error(
                         "JET: failed to set nvpmodel mode %s (%s): %s",
@@ -3217,7 +3005,7 @@ class MEPGui:
         def _worker():
             import datetime
 
-            rails, _temps = self._read_tegrastats_snapshot()
+            rails, _temps = self.host.get_power_snapshot()
             queried = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             data = {
                 "jh_pwr_name_1": "VDD_IN",

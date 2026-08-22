@@ -9,7 +9,10 @@ Architecture:
     ControllerTuner — shared external-tuner state (one physical oscillator, used by both RX/TX)
     ControllerRx    — on-demand sweep/record orchestrator (owns sync-wait + recipes)
     ControllerTx    — DAC function-generator (transmit) orchestrator, independent of RX
-    System functions   — pure subprocess utilities (Jetson power, network info, NTP)
+    HostPlatform    — local host identity, health, power, network, and thermal access
+    GPSDMonitor     — persistent gpsd connection, parsing, and GPS state callbacks
+    CaptureTelemetryLogger — capture-scoped AFE telemetry CSV writer
+    DockerManager   — Docker Compose status, actions, and log streaming
 
 Usage (CLI):
     python start_mep_rx.py -f1 7000 -f2 8000 -s 10 -d 60 -c A -r 10
@@ -580,362 +583,313 @@ SAMPLE_RATE_OPTIONS = discover_sample_rate_options()
 
 # ===== SYSTEM-LEVEL FUNCTIONS (pure subprocess, no MQTT) ===== #
 
-def sync_ntp_on_rfsoc(scripts_dir: str = None) -> bool:
-    """Run NTP sync script on RFSoC. Returns True if successful."""
-    if scripts_dir is None:
-        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+class HostPlatform:
+    """Local host health and platform-management interface."""
 
-    script_path = os.path.join(scripts_dir, "rfsoc_update_ntp.bash")
-    try:
-        result = os.system(script_path)
-        if result == 0:
-            logging.info("NTP sync completed successfully")
-            return True
-        else:
-            logging.warning(f"NTP sync script exited with code {result}")
-            return False
-    except Exception as e:
-        logging.warning(f"Failed to run NTP sync: {e}")
-        return False
+    def __init__(self, nvpmodel_config_path: str = "/etc/nvpmodel.conf"):
+        self._nvpmodel_config_path = nvpmodel_config_path
+        self._cpu_previous = None
 
-
-def get_local_hostname() -> str:
-    """Return a short local hostname for UI display."""
-    try:
-        host = socket.gethostname().strip()
-    except Exception:
-        host = ""
-    if not host:
-        return "unknown-host"
-    return host.split(".", 1)[0] or "unknown-host"
-
-
-def get_primary_network_info_detailed() -> dict:
-    """Query primary network interface info with structured diagnostics.
-
-    Returns:
-      {
-        "status": str,
-        "mac": str,
-        "ipv4": str,
-        "error_code": str|None,
-        "detail": str|None,
-      }
-    """
-    result = {
-        "status": "Offline",
-        "mac": "-",
-        "ipv4": "-",
-        "error_code": None,
-        "detail": None,
-    }
-
-    iface = None
-    try:
-        out = subprocess.check_output(["ip", "route", "show", "default"], text=True, timeout=1.0)
-        m = re.search(r"\bdev\s+(\S+)", out)
-        if m:
-            iface = m.group(1)
-    except Exception as e:
-        logging.debug(f"Failed to get primary interface via 'ip route': {e}")
-        result["error_code"] = "ip_route_failed"
-        result["detail"] = str(e)
-
-    if not iface:
+    def get_hostname(self) -> str:
         try:
-            ifaces = [n for n in os.listdir("/sys/class/net") if n != "lo"]
-            if ifaces:
-                iface = sorted(ifaces)[0]
-        except Exception as e:
-            logging.debug(f"Failed to list network interfaces: {e}")
-            result["error_code"] = "list_interfaces_failed"
-            result["detail"] = str(e)
+            host = socket.gethostname().strip()
+        except Exception:
+            host = ""
+        return host.split(".", 1)[0] if host else "unknown-host"
 
-    if not iface:
-        if result["error_code"] is None:
-            result["error_code"] = "no_interface"
-            result["detail"] = "No primary network interface found"
-        return result
+    def get_power_modes(self):
+        return self._read_nvpmodel_config()
 
-    mac = "-"
-    ip4 = "-"
-    oper = "unknown"
-
-    try:
-        with open(f"/sys/class/net/{iface}/address", "r", encoding="utf-8") as f:
-            mac = f.read().strip() or "-"
-    except Exception as e:
-        logging.debug(f"Failed to read MAC for {iface}: {e}")
-        if result["error_code"] is None:
-            result["error_code"] = "read_mac_failed"
-            result["detail"] = str(e)
-
-    try:
-        with open(f"/sys/class/net/{iface}/operstate", "r", encoding="utf-8") as f:
-            oper = (f.read().strip() or "unknown").lower()
-    except Exception as e:
-        logging.debug(f"Failed to read operstate for {iface}: {e}")
-        if result["error_code"] is None:
-            result["error_code"] = "read_operstate_failed"
-            result["detail"] = str(e)
-
-    try:
-        out = subprocess.check_output(["ip", "-4", "addr", "show", "dev", iface], text=True, timeout=1.0)
-        m = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)\/", out)
-        if m:
-            ip4 = m.group(1)
-    except Exception as e:
-        logging.debug(f"Failed to get IPv4 address for {iface}: {e}")
-        if result["error_code"] is None:
-            result["error_code"] = "read_ipv4_failed"
-            result["detail"] = str(e)
-
-    online = (oper == "up") and (ip4 != "-")
-    result["status"] = f"{'Online' if online else 'Offline'} ({iface})"
-    result["mac"] = mac
-    result["ipv4"] = ip4
-    if not online and result["error_code"] is None:
-        result["error_code"] = "interface_not_online"
-        result["detail"] = f"operstate={oper}, ipv4={ip4}"
-    return result
-
-
-def get_primary_network_info() -> tuple[str, str, str]:
-    """Query primary network interface info. Returns (status, mac, ipv4)."""
-    details = get_primary_network_info_detailed()
-    return details["status"], details["mac"], details["ipv4"]
-
-
-def get_thermal_info_detailed(limit: int = 6) -> dict:
-    """Read thermal zones with structured diagnostics.
-
-    Returns:
-      {
-        "temps": list[tuple[str, float]],
-        "error_code": str|None,
-        "detail": str|None,
-      }
-    """
-    result = {
-        "temps": [],
-        "error_code": None,
-        "detail": None,
-    }
-    base = "/sys/class/thermal"
-    try:
-        entries = sorted(name for name in os.listdir(base) if name.startswith("thermal_zone"))
-    except Exception as e:
-        result["error_code"] = "list_thermal_failed"
-        result["detail"] = str(e)
-        return result
-
-    if not entries:
-        result["error_code"] = "no_thermal_zones"
-        result["detail"] = "No thermal_zone entries found"
-        return result
-
-    read_errors = []
-    temps = []
-    for name in entries:
-        t_path = os.path.join(base, name, "temp")
-        ty_path = os.path.join(base, name, "type")
+    def get_current_power_mode(self) -> Optional[tuple[str, str]]:
         try:
-            with open(t_path, "r", encoding="utf-8") as f:
-                raw = f.read().strip()
-            with open(ty_path, "r", encoding="utf-8") as f:
-                tname = f.read().strip()
-            temp_c = float(raw) / 1000.0
-            if -100.0 <= temp_c <= 250.0:
-                temps.append((tname or name, temp_c))
-        except Exception as e:
-            read_errors.append(f"{name}: {e}")
-            continue
+            output = subprocess.check_output(
+                ["nvpmodel", "-q"], stderr=subprocess.DEVNULL, timeout=1.5, text=True
+            )
+        except Exception as exc:
+            logging.debug("Failed to query nvpmodel: %s", exc)
+            return None
+        mode_id = None
+        mode_name = None
+        for line in output.splitlines():
+            text = line.strip()
+            match = re.search(r"NV\s*Power\s*Mode\s*:\s*(.+)$", text, re.IGNORECASE)
+            if match:
+                mode_name = match.group(1).strip()
+                continue
+            match = re.search(r"Power\s*Mode\s*:\s*(.+)$", text, re.IGNORECASE)
+            if match:
+                mode_name = match.group(1).strip()
+                continue
+            if text.isdigit():
+                mode_id = text
+        return (mode_id, mode_name) if mode_id or mode_name else None
 
-        if len(temps) >= limit:
-            break
-
-    result["temps"] = temps
-    if not temps:
-        result["error_code"] = "thermal_read_failed"
-        result["detail"] = "; ".join(read_errors) if read_errors else "No valid thermal readings"
-    elif read_errors:
-        result["error_code"] = "thermal_partial"
-        result["detail"] = "; ".join(read_errors)
-    return result
-
-
-def get_docker_status() -> dict:
-    """Query docker engine and compose service status."""
-    result = {
-        "engine_status": "unavailable",
-        "services_summary": "0/0",
-        "last_refresh": datetime.now().strftime("%H:%M:%S"),
-    }
-
-    try:
-        subprocess.run(
-            ["docker", "ps", "-q"],
-            capture_output=True, text=True, timeout=5,
-        )
-        result["engine_status"] = "running"
-    except Exception as e:
-        logging.debug(f"Docker query failed: {e}")
-        return result
-
-    try:
-        compose_output = subprocess.run(
-            ["docker", "compose", "-f", "/opt/radiohound/docker/compose.yaml", "ps", "--format=json"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if compose_output.returncode == 0:
-            try:
-                services = json.loads(compose_output.stdout) if compose_output.stdout.strip() else []
-                running = sum(1 for s in services if isinstance(s, dict) and s.get("State") == "running")
-                total = len(services)
-                result["services_summary"] = f"{running}/{total}"
-            except Exception:
-                result["services_summary"] = "?/?"
-    except Exception as e:
-        logging.debug(f"Docker compose query failed: {e}")
-
-    return result
-
-
-def get_jetson_power_mode() -> Optional[tuple[str, str]]:
-    """Query Jetson nvpmodel power mode. Returns (mode_id, mode_name) or None."""
-    try:
-        out = subprocess.check_output(
-            ["nvpmodel", "-q"],
-            stderr=subprocess.DEVNULL,
-            timeout=1.5,
-            text=True,
-        )
-    except Exception as e:
-        logging.debug(f"Failed to query nvpmodel: {e}")
-        return None
-
-    mode_name = None
-    mode_id = None
-    for line in out.splitlines():
-        s = line.strip()
-        m = re.search(r"NV\s*Power\s*Mode\s*:\s*(.+)$", s, re.IGNORECASE)
-        if m:
-            mode_name = m.group(1).strip()
-            continue
-        m = re.search(r"Power\s*Mode\s*:\s*(.+)$", s, re.IGNORECASE)
-        if m:
-            mode_name = m.group(1).strip()
-            continue
-        if s.isdigit():
-            mode_id = s
-
-    return (mode_id, mode_name) if mode_id or mode_name else None
-
-
-def set_jetson_power_mode(mode_id: str) -> bool:
-    """Set Jetson nvpmodel power mode. Returns True if successful."""
-    result = set_jetson_power_mode_detailed(mode_id)
-    if result.get("ok"):
-        return True
-
-    logging.error(
-        "Failed to set Jetson power mode %s (%s): %s",
-        mode_id,
-        result.get("error_code") or "unknown",
-        result.get("detail") or "no detail",
-    )
-    return False
-
-
-def set_jetson_power_mode_detailed(mode_id: str) -> dict:
-    """Set Jetson nvpmodel mode with structured diagnostics.
-
-    Returns a dict:
-      {"ok": bool, "mode_id": str, "error_code": str|None, "detail": str|None}
-    """
-    result = {
-        "ok": False,
-        "mode_id": str(mode_id),
-        "error_code": None,
-        "detail": None,
-    }
-
-    try:
-        cmd = ["nvpmodel", "-m", str(mode_id)]
-        cmd_prefix = []
-
-        if os.geteuid() != 0:
-            try:
-                check = subprocess.run(
-                    ["sudo", "-n", "true"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=2.0,
+    def set_power_mode(self, mode_id: str) -> dict:
+        result = {
+            "ok": False,
+            "mode_id": str(mode_id),
+            "error_code": None,
+            "detail": None,
+        }
+        try:
+            command_prefix = []
+            command = ["nvpmodel", "-m", str(mode_id)]
+            if os.geteuid() != 0:
+                sudo_check = subprocess.run(
+                    ["sudo", "-n", "true"], stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True, timeout=2.0
                 )
-            except subprocess.TimeoutExpired:
-                result["error_code"] = "sudo_check_timeout"
-                result["detail"] = "sudo availability check timed out"
-                return result
-
-            if check.returncode != 0:
-                result["error_code"] = "sudo_not_available"
-                result["detail"] = (check.stderr or check.stdout or "passwordless sudo unavailable").strip()
-                return result
-
-            cmd_prefix = ["sudo", "-n"]
-            cmd = [*cmd_prefix, *cmd]
-
-        try:
+                if sudo_check.returncode != 0:
+                    result["error_code"] = "sudo_not_available"
+                    result["detail"] = (sudo_check.stderr or sudo_check.stdout or "passwordless sudo unavailable").strip()
+                    return result
+                command_prefix = ["sudo", "-n"]
+                command = [*command_prefix, *command]
             probe = subprocess.run(
-                [*cmd_prefix, "nvpmodel", "-q"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=8.0,
+                [*command_prefix, "nvpmodel", "-q"], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, timeout=8.0
             )
-        except subprocess.TimeoutExpired:
-            result["error_code"] = "probe_timeout"
-            result["detail"] = "nvpmodel probe timed out"
+            if probe.returncode != 0:
+                result["error_code"] = "probe_failed"
+                result["detail"] = (probe.stderr or probe.stdout or "nvpmodel -q failed").strip()
+                return result
+            applied = subprocess.run(
+                command, input="YES\n", stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, timeout=15.0
+            )
+            if applied.returncode != 0:
+                result["error_code"] = "apply_failed"
+                result["detail"] = (applied.stderr or applied.stdout or "nvpmodel -m failed").strip()
+                return result
+            result["ok"] = True
+            result["detail"] = ((applied.stdout or "") + " " + (applied.stderr or "")).strip() or "nvpmodel accepted mode"
+            return result
+        except subprocess.TimeoutExpired as exc:
+            result["error_code"] = "timeout"
+            result["detail"] = str(exc)
+            return result
+        except FileNotFoundError:
+            result["error_code"] = "nvpmodel_not_found"
+            result["detail"] = "nvpmodel command not found"
+            return result
+        except Exception as exc:
+            result["error_code"] = "exception"
+            result["detail"] = str(exc)
             return result
 
-        if probe.returncode != 0:
-            result["error_code"] = "probe_failed"
-            result["detail"] = (probe.stderr or probe.stdout or "nvpmodel -q failed").strip()
-            return result
+    def get_power_snapshot(self) -> tuple[dict, list]:
+        """Return one tegrastats power snapshot as (rails, temperatures)."""
+        return self._read_tegrastats()
 
+    def _read_nvpmodel_config(self):
+        modes = []
+        default_id = None
+        mode_re = re.compile(r"<\s*POWER_MODEL\s+ID\s*=\s*(\d+)\s+NAME\s*=\s*([^>]+?)\s*>", re.IGNORECASE)
+        default_re = re.compile(r"<\s*PM_CONFIG\s+DEFAULT\s*=\s*(\d+)\s*>", re.IGNORECASE)
         try:
-            proc = subprocess.run(
-                cmd,
-                input="YES\n",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+            with open(self._nvpmodel_config_path, "r", encoding="utf-8", errors="ignore") as file_handle:
+                for line in file_handle:
+                    text = line.strip()
+                    if not text or text.startswith("#"):
+                        continue
+                    match = mode_re.search(text)
+                    if match:
+                        modes.append((match.group(1), match.group(2).strip()))
+                        continue
+                    match = default_re.search(text)
+                    if match:
+                        default_id = match.group(1)
+        except Exception as exc:
+            logging.debug("Failed to read nvpmodel modes from %s: %s", self._nvpmodel_config_path, exc)
+            return [], None
+        return modes, default_id
+
+    def read_thermal(self, limit: int = 6):
+        result = {"temps": [], "error_code": None, "detail": None}
+        base = "/sys/class/thermal"
+        try:
+            entries = sorted(name for name in os.listdir(base) if name.startswith("thermal_zone"))
+        except Exception as exc:
+            result["error_code"], result["detail"] = "list_thermal_failed", str(exc)
+            return result
+        read_errors = []
+        for name in entries:
+            try:
+                with open(os.path.join(base, name, "temp"), "r", encoding="utf-8") as file_handle:
+                    temperature = float(file_handle.read().strip()) / 1000.0
+                with open(os.path.join(base, name, "type"), "r", encoding="utf-8") as file_handle:
+                    label = file_handle.read().strip()
+                if -100.0 <= temperature <= 250.0:
+                    result["temps"].append((label or name, temperature))
+            except Exception as exc:
+                read_errors.append(f"{name}: {exc}")
+            if len(result["temps"]) >= limit:
+                break
+        if not result["temps"]:
+            result["error_code"] = "thermal_read_failed"
+            result["detail"] = "; ".join(read_errors) or "No valid thermal readings"
+        elif read_errors:
+            result["error_code"] = "thermal_partial"
+            result["detail"] = "; ".join(read_errors)
+        return result
+
+    def read_memory(self):
+        total_kb = None
+        available_kb = None
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as file_handle:
+                for line in file_handle:
+                    if line.startswith("MemTotal:"):
+                        total_kb = int(line.split()[1])
+                    elif line.startswith("MemAvailable:"):
+                        available_kb = int(line.split()[1])
+        except Exception as exc:
+            logging.warning("Failed to read memory info: %s", exc)
+            return None
+        if total_kb is None or available_kb is None or total_kb <= 0:
+            return None
+        return max(total_kb - available_kb, 0), total_kb
+
+    def read_disk(self, path: str = "/"):
+        try:
+            usage = shutil.disk_usage(path)
+        except Exception as exc:
+            logging.warning("Failed to read disk usage for %s: %s", path, exc)
+            return None
+        return usage.free, usage.total
+
+    def read_cpu(self):
+        try:
+            with open("/proc/stat", "r", encoding="utf-8") as file_handle:
+                parts = file_handle.readline().strip().split()
+            if len(parts) < 5 or parts[0] != "cpu":
+                return None
+            values = [int(value) for value in parts[1:]]
+        except Exception as exc:
+            logging.warning("Failed to read CPU stats: %s", exc)
+            return None
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        total = sum(values)
+        previous = self._cpu_previous
+        self._cpu_previous = (total, idle)
+        if previous is None:
+            return None
+        total_delta = total - previous[0]
+        idle_delta = idle - previous[1]
+        if total_delta <= 0:
+            return None
+        return (total_delta - idle_delta) * 100.0 / total_delta
+
+    def _read_tegrastats(self):
+        try:
+            output = subprocess.check_output(
+                ["tegrastats", "--interval", "1000"],
+                stderr=subprocess.DEVNULL,
+                timeout=3.0,
                 text=True,
-                timeout=15.0,
             )
-        except subprocess.TimeoutExpired:
-            result["error_code"] = "apply_timeout"
-            result["detail"] = "nvpmodel apply timed out"
-            return result
+        except subprocess.TimeoutExpired as exc:
+            output = exc.output or ""
+        except Exception as exc:
+            logging.debug("Failed to read tegrastats snapshot: %s", exc)
+            return {}, []
+        if isinstance(output, bytes):
+            output = output.decode(errors="ignore")
+        blob = " ".join(line.strip() for line in output.splitlines() if line.strip())
+        rails = {
+            match.group(1): f"{match.group(2)}/{match.group(3)} mW"
+            for match in re.finditer(r"([A-Z0-9_]+)\s+(\d+)mW/(\d+)mW", blob)
+        }
+        temperatures = [
+            (match.group(1), f"{float(match.group(2)):.1f} C")
+            for match in re.finditer(r"([A-Za-z0-9_]+)@(-?\d+(?:\.\d+)?)C", blob)
+        ]
+        return rails, temperatures
 
-        if proc.returncode != 0:
-            result["error_code"] = "apply_failed"
-            result["detail"] = (proc.stderr or proc.stdout or "nvpmodel -m failed").strip()
-            return result
+    def get_status(self) -> dict:
+        return {"state": "online", "hostname": self.get_hostname(), "timestamp": time.time()}
 
-        result["ok"] = True
-        output = ((proc.stdout or "") + " " + (proc.stderr or "")).strip()
-        result["detail"] = output or "nvpmodel accepted mode"
-        logging.info(f"Jetson power mode set to {mode_id}")
+    def get_resources(self) -> dict:
+        memory = self.read_memory()
+        disk = self.read_disk()
+        return {
+            "timestamp": time.time(),
+            "cpu_usage_percent": self.read_cpu(),
+            "memory": {
+                "used_kb": memory[0] if memory else None,
+                "total_kb": memory[1] if memory else None,
+            },
+            "disk": {
+                "path": "/",
+                "free_bytes": disk[0] if disk else None,
+                "total_bytes": disk[1] if disk else None,
+            },
+        }
+
+    def get_network(self) -> dict:
+        result = {"status": "Offline", "mac": "-", "ipv4": "-", "error_code": None, "detail": None}
+        interface = None
+        try:
+            output = subprocess.check_output(["ip", "route", "show", "default"], text=True, timeout=1.0)
+            match = re.search(r"\bdev\s+(\S+)", output)
+            interface = match.group(1) if match else None
+        except Exception as exc:
+            result["error_code"], result["detail"] = "ip_route_failed", str(exc)
+        if not interface:
+            try:
+                interfaces = sorted(name for name in os.listdir("/sys/class/net") if name != "lo")
+                interface = interfaces[0] if interfaces else None
+            except Exception as exc:
+                result["error_code"], result["detail"] = "list_interfaces_failed", str(exc)
+        if not interface:
+            result["error_code"] = result["error_code"] or "no_interface"
+            result["detail"] = result["detail"] or "No primary network interface found"
+            return {"timestamp": time.time(), **result}
+        try:
+            with open(f"/sys/class/net/{interface}/address", "r", encoding="utf-8") as file_handle:
+                result["mac"] = file_handle.read().strip() or "-"
+            with open(f"/sys/class/net/{interface}/operstate", "r", encoding="utf-8") as file_handle:
+                operstate = (file_handle.read().strip() or "unknown").lower()
+            output = subprocess.check_output(["ip", "-4", "addr", "show", "dev", interface], text=True, timeout=1.0)
+            match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", output)
+            result["ipv4"] = match.group(1) if match else "-"
+            online = operstate == "up" and result["ipv4"] != "-"
+            result["status"] = f"{'Online' if online else 'Offline'} ({interface})"
+            if not online and result["error_code"] is None:
+                result["error_code"] = "interface_not_online"
+                result["detail"] = f"operstate={operstate}, ipv4={result['ipv4']}"
+        except Exception as exc:
+            result["error_code"] = result["error_code"] or "network_read_failed"
+            result["detail"] = result["detail"] or str(exc)
+        return {"timestamp": time.time(), **result}
+
+    def get_thermal(self, limit: int = 6) -> dict:
+        result = self.read_thermal(limit)
+        return {"timestamp": time.time(), **result}
+
+    def get_power(self, include_tegrastats: bool = False) -> dict:
+        modes, default_id = self.get_power_modes()
+        current = self.get_current_power_mode()
+        result = {
+            "timestamp": time.time(),
+            "mode": {"id": current[0], "name": current[1]} if current else None,
+            "default_mode_id": default_id,
+            "available_modes": [{"id": mode_id, "name": name} for mode_id, name in modes],
+            "rails": [],
+        }
+        if include_tegrastats:
+            rails, temperatures = self.get_power_snapshot()
+            result["rails"] = [{"name": name, "value": value} for name, value in rails.items()]
+            result["tegrastats_temperatures"] = [
+                {"name": name, "value": value} for name, value in temperatures
+            ]
         return result
-    except FileNotFoundError:
-        result["error_code"] = "nvpmodel_not_found"
-        result["detail"] = "nvpmodel command not found"
-        return result
-    except Exception as e:
-        result["error_code"] = "exception"
-        result["detail"] = str(e)
-        return result
+
+    @staticmethod
+    def _format_power_mode(mode_id, mode_name):
+        if mode_name and mode_id:
+            return f"{mode_name} (ID {mode_id})"
+        return mode_name or (f"ID {mode_id}" if mode_id else None)
 
 
 # ===== GPSD MONITOR (business logic; GUI-agnostic) ===== #
@@ -2896,6 +2850,7 @@ class ControllerRx:
 
     def __init__(self, bus: MEPBus, tuner_ctrl: "ControllerTuner" = None):
         self.bus = bus
+        self.host_platform = HostPlatform()
         self.telemetry_logger = CaptureTelemetryLogger(bus)
         self.tuner_ctrl = tuner_ctrl if tuner_ctrl is not None else ControllerTuner(bus)
 
@@ -3113,7 +3068,7 @@ class ControllerRx:
     def _format_sds_path(self) -> str:
         """Generate SDS path token: <capture>_<hostname>_<random6>."""
         capture_folder = (self.capture_name or "").strip() or "preview"
-        host_token = (get_local_hostname() or "").strip().lower()
+        host_token = self.host_platform.get_hostname().strip().lower()
         host_token = re.sub(r"[^a-z0-9_-]", "", host_token)
         if not host_token:
             raise RuntimeError("Unable to derive hostname token for sds_path")
@@ -4101,8 +4056,6 @@ if __name__ == "__main__":
                         help="Override injection side (default: from TUNERS table)")
     parser.add_argument("--log-level",  "-l",  type=str,   default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
-    parser.add_argument("--skip_ntp",          action="store_true",
-                        help="Skip NTP sync step")
     parser.add_argument("--capture_name",      type=str,   default=None,
                         help="Save data under captures/{name}/... (default: ringbuffer)")
     args = parser.parse_args()
@@ -4125,11 +4078,6 @@ if __name__ == "__main__":
         filename=log_path,
     )
     logging.getLogger().addHandler(logging.StreamHandler())
-
-    # === NTP sync === #
-    if not args.skip_ntp:
-        logging.info("Updating NTP on RFSoC")
-        sync_ntp_on_rfsoc(os.getcwd())
 
     # === Build controller === #
     bus = MEPBus()
