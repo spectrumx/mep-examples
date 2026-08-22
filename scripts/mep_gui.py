@@ -423,7 +423,6 @@ class MEPGui:
 
         # ---- Startup sequence with intentional delays ----
         self.root.after(50, self._schedule_housekeeping)
-        self.root.after(3000, self._afe_refresh)
         self.root.after(20, self._pump_gui_queue)
         self.root.after(50, self._pump_text_log)
 
@@ -4713,7 +4712,7 @@ class MEPGui:
                 self._afe_update_atten_ui_state(device, confirmed=confirmed)
         finally:
             self._afe_updating = False
-        logging.info("AFE widgets updated from MQTT register data")
+        logging.debug("AFE widgets updated from MQTT register data")
 
     def _afe_reset_defaults(self):
         """Restore all AFE widget vars to defaults from cached announce data."""

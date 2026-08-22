@@ -2552,18 +2552,20 @@ class CaptureTelemetryLogger:
     with afe_service.py is required — it never redirects or controls the AFE
     service's own always-on logging, it just listens to the same public topics.
     Every row is flushed+fsynced immediately; nothing here depends on a clean stop.
+
+    Columns come from afe/announce's "schema" block, never from a local field list:
+    a second copy of the schema is what silently blanked lat/lon for months. No
+    timestamp is generated here — rows carry only the service and device clocks, so
+    the writing process's clock never enters the data.
     """
 
-    # Field names mirror the JSON keys afe_service.py publishes on afe/data/*.
-    _FIELDS_GPS = ("timestamp", "utc_time", "latitude", "longitude", "altitude_m", "speed_knots", "fix_valid", "fix")
-    _FIELDS_IMU = ("acc_x", "acc_y", "acc_z", "gyr_x", "gyr_y", "gyr_z")
-    _FIELDS_MAG = ("mag_x", "mag_y", "mag_z")
-    _FIELDS_HK = ("ocxo_locked", "spi_ok", "mag_ok", "imu_ok", "sw_temp_c", "mag_temp_c", "imu_temp_c", "imu_active", "imu_tilt")
+    _STREAMS = ("gps", "mag", "imu", "hk")
 
     def __init__(self, bus: "MEPBus"):
         self.bus = bus
         self._fh = None
         self._writer = None
+        self._schema: dict = {}
         self._last_imu: dict = {}
         self._last_mag: dict = {}
         self._last_hk: dict = {}
@@ -2573,19 +2575,39 @@ class CaptureTelemetryLogger:
         self._hk_cb = None
         self._active = False
 
+    @staticmethod
+    def schema_from_announce(announce: Optional[dict]) -> Optional[dict]:
+        """Return the telemetry column schema, or None if this service predates it."""
+        if not isinstance(announce, dict):
+            return None
+        schema = announce.get("schema")
+        if not isinstance(schema, dict):
+            return None
+        if not all(isinstance(schema.get(s), list) and schema[s] for s in CaptureTelemetryLogger._STREAMS):
+            return None
+        return schema
+
     def start(self, capture_dir: str):
-        """Begin logging a GPS/telemetry track into capture_dir. Idempotent."""
+        """Begin logging a GPS/telemetry track into capture_dir. Idempotent.
+
+        Telemetry is supporting metadata, never a precondition for recording: if the
+        schema is unavailable this logs and returns, and the RF capture proceeds.
+        """
         if self._active:
             return
+        schema = self.schema_from_announce(self.bus.get_cached_status(AFE_ANNOUNCE_TOPIC))
+        if schema is None:
+            logging.error("Capture telemetry not logged: no schema in afe/announce")
+            return
+        self._schema = schema
+
         os.makedirs(capture_dir, exist_ok=True)
         path = os.path.join(capture_dir, "gps_telemetry.csv")
-        header = (
-            ["snapshot_utc"]
-            + [f"gnss_{k}" for k in self._FIELDS_GPS]
-            + [f"mag_{k}" for k in self._FIELDS_MAG]
-            + [f"imu_{k}" for k in self._FIELDS_IMU]
-            + [f"hk_{k}" for k in self._FIELDS_HK]
-        )
+        header = []
+        for stream, prefix in (("gps", "gnss"), ("mag", "mag"), ("imu", "imu"), ("hk", "hk")):
+            header.extend(f"{prefix}_{k}" for k in self._schema[stream])
+        header.append("registers_json")
+
         self._fh = open(path, "w", newline="", encoding="utf-8")
         self._writer = csv.writer(self._fh)
         self._writer.writerow(header)
@@ -2607,12 +2629,12 @@ class CaptureTelemetryLogger:
     def _on_gps(self, gps: dict):
         if not self._active or self._writer is None:
             return
-        now = datetime.now(timezone.utc)
-        row = [now.isoformat()]
-        row.extend(gps.get(k) for k in self._FIELDS_GPS)
-        row.extend(self._last_mag.get(k) for k in self._FIELDS_MAG)
-        row.extend(self._last_imu.get(k) for k in self._FIELDS_IMU)
-        row.extend(self._last_hk.get(k) for k in self._FIELDS_HK)
+        row = []
+        for source, stream in ((gps, "gps"), (self._last_mag, "mag"),
+                               (self._last_imu, "imu"), (self._last_hk, "hk")):
+            row.extend(source.get(k) for k in self._schema[stream])
+        regs = self.bus.get_cached_status(AFE_REGISTERS_TOPIC) or {}
+        row.append(json.dumps(regs.get("registers", {}), sort_keys=True, separators=(",", ":")))
         try:
             self._writer.writerow(row)
             self._fh.flush()
