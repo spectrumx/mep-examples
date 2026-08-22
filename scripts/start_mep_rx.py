@@ -3196,11 +3196,13 @@ class ControllerRx:
 
         self.bus.recorder_config_set("packet.freq_idx_offset", str(freq_idx_offset))
 
+        # channel_dir must stay relative: drf_sink joins it onto output_path (the RAM
+        # ringbuffer), so an absolute path silently bypasses the tmpfs staging.
         if self.capture_name:
             channel_dir = f"{self.capture_name}/data/ch{self.channel}"
             spectrogram_subdir = f"{self.capture_name}/data/ch{self.channel}_spectrogram_images"
         else:
-            channel_dir = f"/data/captures/preview/data/ch{self.channel}"
+            channel_dir = f"preview/data/ch{self.channel}"
             spectrogram_subdir = f"preview/data/ch{self.channel}_spectrogram_images"
 
         self.bus.recorder_config_set("drf_sink.channel_dir", channel_dir)
@@ -3267,7 +3269,7 @@ class ControllerRx:
         _normalize_recorder_pipeline(config)
 
         _set_dotted_value(config, "basic_network.dst_port", RECORDER_CHANNEL_PORTS[self.channel])
-        _set_dotted_value(config, "drf_sink.channel_dir", f"{PREVIEW_DATA_DIR}/ch{self.channel}")
+        _set_dotted_value(config, "drf_sink.channel_dir", f"preview/data/ch{self.channel}")
         _set_dotted_value(config, "spectrogram_output.plot_subdir", f"preview/data/ch{self.channel}_spectrogram_images")
         _set_dotted_value(config, "packet.freq_idx_offset", 0)
 
@@ -3368,7 +3370,7 @@ class ControllerRx:
                 "python3", "/app/mep_recorder.py",
                 "--config", config_json,
                 "--ram_ringbuffer_path", "/ramdisk",
-                "--output_path", "/data/captures/preview/data",
+                "--output_path", CAPTURES_ROOT_DIR,
             ]
 
             # Log a copy-pasteable equivalent. The real cmd passes the config as a huge inline
@@ -3384,7 +3386,7 @@ class ControllerRx:
                 "  python3 /app/mep_recorder.py \\\n"
                 f"  --config {yaml_file} \\\n"
                 "  --ram_ringbuffer_path /ramdisk \\\n"
-                "  --output_path /data/captures/preview/data"
+                f"  --output_path {CAPTURES_ROOT_DIR}"
             )
             logging.info(
                 "Profiling command (run inside the 'recorder' container to reproduce):\n%s",
