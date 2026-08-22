@@ -901,7 +901,7 @@ class MEPGui:
     def _build_status_grid(self, parent: ttk.Frame):
         specs = [
             ("mqtt", "MQTT", 0, 0),
-            ("rfsoc", "RFSoC", 0, 1),
+            ("rfsoc", "RFSOC", 0, 1),
             ("afe", "AFE", 0, 2),
             ("tuner", "Tuner", 1, 0),
             ("recorder", "Recorder", 1, 1),
@@ -1030,18 +1030,31 @@ class MEPGui:
             f_if_hz = self._safe_float(tlm.get("f_if_hz"), 0.0)
             f_if_mhz = f_if_hz / 1e6
             f_if_mhz_rounded = round(f_if_mhz)
-            bad_states = {"error", "offline", "disconnected", "fault"}
-            level = "red" if state in bad_states else "green"
+            level = "yellow" if state == "starting" else (
+                "green" if state in {"ready", "active"} else "red"
+            )
+            if state not in {"ready", "active"}:
+                activity = state
+            else:
+                adc_active = str(tlm.get("state_ADC", "")).lower() == "active"
+                dac_active = str(tlm.get("state_DAC", "")).lower() == "active"
+                if adc_active and dac_active:
+                    activity = "ADC+DAC active"
+                elif adc_active:
+                    activity = "ADC active"
+                elif dac_active:
+                    activity = "DAC active"
+                else:
+                    activity = "ready"
             pps = tlm.get("pps_count", "?")
             self._set_status_cell(
                 "rfsoc",
                 level,
-                state,
+                activity,
                 detail=f"state={state}, f_if_hz={f_if_hz}, pps={pps}",
             )
         else:
-            level = "yellow" if mqtt_ok else "red"
-            self._set_status_cell("rfsoc", level, "no tlm", detail="No RFSoC telemetry in cache")
+            self._set_status_cell("rfsoc", "red", "unknown", detail="No RFSoC telemetry in cache")
 
         afe_status = self.bus.get_cached_status(AFE_STATUS_TOPIC)
         afe_regs = self.bus.get_cached_status(AFE_REGISTERS_TOPIC)
@@ -3223,7 +3236,25 @@ class MEPGui:
         st_f = ttk.LabelFrame(frame, text="Current Status")
         st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
         st_f.columnconfigure(1, weight=1)
-        _ro_row(st_f, 0, "State",                "soc_state")
+        for key in ("soc_state", "soc_state_ADC", "soc_state_DAC"):
+            self._vars[key] = tk.StringVar(value="—")
+        state_row = ttk.Frame(st_f)
+        state_row.grid(row=0, column=0, columnspan=3, sticky="ew", padx=5, pady=2)
+        for column in range(3):
+            state_row.columnconfigure(column * 2 + 1, weight=1)
+        for column, (label, key) in enumerate((
+            ("State", "soc_state"),
+            ("State_ADC", "soc_state_ADC"),
+            ("State_DAC", "soc_state_DAC"),
+        )):
+            ttk.Label(state_row, text=label).grid(
+                row=0, column=column * 2, sticky="w", padx=(0, 4)
+            )
+            state_value = ttk.Entry(
+                state_row, textvariable=self._vars[key], state="readonly", width=12
+            )
+            state_value.grid(row=0, column=column * 2 + 1, sticky="ew", padx=(0, 8))
+            self._bind_copy_menu(state_value, self._vars[key])
         _ro_row(st_f, 1, "Center Freq Metadata", "soc_fc",  "MHz")
         _ro_row(st_f, 2, "NCO Frequency (IF)",   "soc_fif", "MHz")
         _ro_row(st_f, 3, "Sample Rate",          "soc_fs",  "MHz")
@@ -5391,6 +5422,8 @@ class MEPGui:
         if "soc_state" not in self._vars:
             return  # SOC tab not yet built; skip until user opens it
         self._vars["soc_state"].set(tlm.get("state", "—"))
+        self._vars["soc_state_ADC"].set(tlm.get("state_ADC", "—"))
+        self._vars["soc_state_DAC"].set(tlm.get("state_DAC", "—"))
         f_c_hz = self._safe_float(tlm.get("f_c_hz"), 0.0)
         f_if_hz = self._safe_float(tlm.get("f_if_hz"), 0.0)
         f_s_hz = self._safe_float(tlm.get("f_s"), 0.0)

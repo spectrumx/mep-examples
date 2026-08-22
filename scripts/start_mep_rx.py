@@ -1677,11 +1677,11 @@ class MEPBus:
             return self._sync_data[topic]
         return None
 
-    def get_tlm(self, timeout_s: float = 2.0, expected_state: str = None) -> Optional[dict]:
+    def get_tlm(self, timeout_s: float = 2.0, expected_adc_state: str = None) -> Optional[dict]:
         """Publish a "get tlm" request and wait for the reply.
 
         Used by RX (arm verification, dwell polling) and firmware readiness.
-        When expected_state is set, intermediate status messages are ignored.
+        When expected_adc_state is set, intermediate status messages are ignored.
         """
         if not self.is_connected():
             return None
@@ -1703,8 +1703,8 @@ class MEPBus:
                 timeout_s=remaining,
                 pre_armed=True,
             )
-            if expected_state is None or (
-                isinstance(tlm, dict) and tlm.get("state") == expected_state
+            if expected_adc_state is None or (
+                isinstance(tlm, dict) and tlm.get("state_ADC") == expected_adc_state
             ):
                 return tlm
             self._sync_events[RFSOC_STATUS_TOPIC].clear()
@@ -1728,15 +1728,17 @@ class MEPBus:
             return None
 
         logging.info("Waiting for RFSoC firmware to be ready...")
-        f_s = _f_s_ready(self.get_cached_status(RFSOC_STATUS_TOPIC))
-        if f_s is not None:
+        tlm = self.get_cached_status(RFSOC_STATUS_TOPIC)
+        f_s = _f_s_ready(tlm)
+        if isinstance(tlm, dict) and tlm.get("state") in ("ready", "active") and f_s is not None:
             logging.info(f"RFSoC firmware ready: f_s={f_s / 1e6:.2f} MHz")
             return True
 
         deadline = time.time() + max_wait_s
         while time.time() < deadline:
-            f_s = _f_s_ready(self.get_tlm(timeout_s=2.0))
-            if f_s is not None:
+            tlm = self.get_tlm(timeout_s=2.0)
+            f_s = _f_s_ready(tlm)
+            if isinstance(tlm, dict) and tlm.get("state") in ("ready", "active") and f_s is not None:
                 logging.info(f"RFSoC firmware ready: f_s={f_s / 1e6:.2f} MHz")
                 return True
             logging.debug("RFSoC not ready yet, waiting...")
@@ -2445,12 +2447,7 @@ class MEPBus:
 
         Owns the RFSoC TX wire-field schema so consumers never read raw keys.
 
-        Prefers the firmware's explicit "tx_enabled" flag when present. Older
-        firmware without that field falls back to inference: a function
-        generator radiates when a channel is selected and amplitude is above
-        zero. That fallback is unreliable across tx_stop, since tx_channels/
-        tx_amplitude_bins are staged config that stop does not clear — offset 0
-        still emits a CW carrier, so offset is not part of either test.
+        Uses the firmware's explicit "state_DAC" field for transmission state.
 
         Returns:
           {
@@ -2466,11 +2463,7 @@ class MEPBus:
             return None
         channels = payload.get("tx_channels") or []
         amplitude_bins = payload.get("tx_amplitude_bins")
-        tx_enabled = payload.get("tx_enabled")
-        if isinstance(tx_enabled, bool):
-            transmitting = tx_enabled
-        else:
-            transmitting = bool(channels) and isinstance(amplitude_bins, (int, float)) and amplitude_bins > 0
+        transmitting = payload.get("state_DAC") == "active"
         return {
             "channels": channels,
             "center_freq": payload.get("tx_center_freq"),
@@ -3490,9 +3483,9 @@ class ControllerRx:
 
         # Ignore status packets from the reset/configuration sequence; this
         # command's postcondition is an active RFSoC capture.
-        tlm = self.bus.get_tlm(timeout_s=2.0, expected_state="active")
+        tlm = self.bus.get_tlm(timeout_s=2.0, expected_adc_state="active")
 
-        if not tlm or tlm.get("state") != "active":
+        if not tlm or tlm.get("state_ADC") != "active":
             logging.error(f"RFSoC capture failed or inactive: {MEPBus._tlm_to_str(tlm)}")
             return False
         logging.info(f"Armed — {MEPBus._tlm_to_str(tlm)}")
