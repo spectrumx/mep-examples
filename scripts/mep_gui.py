@@ -336,7 +336,7 @@ class MEPGui:
         # _spec_lock guards _spec_pending only (MQTT-to-Tk handoff).
         # All other spec state is Tk-thread-only.
         self._spec_topic = ""             # populated from bus after construction
-        self._spec_stream_requested = False   # user clicked Stream
+        self._spec_stream_requested = True    # SPEC streams by default at startup
         self._spec_tab_visible = False        # SPEC tab is currently showing
         self._spec_is_active = False          # derived: stream_requested AND tab_visible
         self._spec_pending = deque(maxlen=SPEC_PENDING_MAX_ROWS)  # bounded MQTT->Tk frame queue
@@ -419,6 +419,14 @@ class MEPGui:
         self._spec_topic = self.bus.spec_topic
         if "spec_topic" in self._vars:
             self._vars["spec_topic"].set(self._spec_topic)
+
+        # Start with Advanced Options open on the SPEC tab. The bus and SPEC
+        # listener must exist before activating the default stream.
+        self._adv_frame.grid()
+        self._adv_btn_text.set("Hide Advanced Options \u25c0")
+        self._adv_nb.select(self._tab_frames["SPEC"])
+        self._ensure_tab_built("SPEC")
+        self._on_adv_tab_changed()
 
         # ---- Startup sequence with intentional delays ----
         self.root.after(50, self._schedule_housekeeping)
