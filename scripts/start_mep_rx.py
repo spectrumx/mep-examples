@@ -1633,11 +1633,11 @@ class MEPBus:
             return self._sync_data[topic]
         return None
 
-    def get_tlm(self, timeout_s: float = 2.0, expected_adc_state: str = None) -> Optional[dict]:
+    def get_tlm(self, timeout_s: float = 2.0, expected_rx_state: str = None) -> Optional[dict]:
         """Publish a "get tlm" request and wait for the reply.
 
         Used by RX (arm verification, dwell polling) and firmware readiness.
-        When expected_adc_state is set, intermediate status messages are ignored.
+        When expected_rx_state is set, intermediate status messages are ignored.
         """
         if not self.is_connected():
             return None
@@ -1659,8 +1659,8 @@ class MEPBus:
                 timeout_s=remaining,
                 pre_armed=True,
             )
-            if expected_adc_state is None or (
-                isinstance(tlm, dict) and tlm.get("state_ADC") == expected_adc_state
+            if expected_rx_state is None or (
+                isinstance(tlm, dict) and tlm.get("state_RX") == expected_rx_state
             ):
                 return tlm
             self._sync_events[RFSOC_STATUS_TOPIC].clear()
@@ -2403,7 +2403,7 @@ class MEPBus:
 
         Owns the RFSoC TX wire-field schema so consumers never read raw keys.
 
-        Uses the firmware's explicit "state_DAC" field for transmission state.
+        Uses the firmware's explicit "state_TX" field for transmission state.
         Reports only what the DAC itself is doing — nothing downstream of the RFSoC
         output connector is observable, so a caller must not read "idle" as "no RF".
 
@@ -2422,12 +2422,12 @@ class MEPBus:
             return None
         channels = payload.get("tx_channels") or []
         amplitude_bins = payload.get("tx_amplitude_bins")
-        dac = payload.get("state_DAC")
+        tx = payload.get("state_TX")
         # A dead service (retained LWT) or a payload with no DAC field proves nothing;
         # report unknown rather than letting it read as "not transmitting".
-        if payload.get("state") == "offline" or dac is None:
+        if payload.get("state") == "offline" or tx is None:
             tx_state = "unknown"
-        elif dac == "active":
+        elif tx == "active":
             tx_state = "transmitting"
         else:
             tx_state = "idle"
@@ -3483,9 +3483,9 @@ class ControllerRx:
 
         # Ignore status packets from the reset/configuration sequence; this
         # command's postcondition is an active RFSoC capture.
-        tlm = self.bus.get_tlm(timeout_s=2.0, expected_adc_state="active")
+        tlm = self.bus.get_tlm(timeout_s=2.0, expected_rx_state="active")
 
-        if not tlm or tlm.get("state_ADC") != "active":
+        if not tlm or tlm.get("state_RX") != "active":
             logging.error(f"RFSoC capture failed or inactive: {MEPBus._tlm_to_str(tlm)}")
             return False
         logging.info(f"Armed — {MEPBus._tlm_to_str(tlm)}")

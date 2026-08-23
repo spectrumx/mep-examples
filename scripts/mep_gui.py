@@ -1063,14 +1063,14 @@ class MEPGui:
             if state not in {"ready", "active"}:
                 activity = state
             else:
-                adc_active = str(tlm.get("state_ADC", "")).lower() == "active"
-                dac_active = str(tlm.get("state_DAC", "")).lower() == "active"
-                if adc_active and dac_active:
-                    activity = "ADC+DAC active"
-                elif adc_active:
-                    activity = "ADC active"
-                elif dac_active:
-                    activity = "DAC active"
+                rx_active = str(tlm.get("state_RX", "")).lower() == "active"
+                tx_active = str(tlm.get("state_TX", "")).lower() == "active"
+                if rx_active and tx_active:
+                    activity = "RX+TX active"
+                elif rx_active:
+                    activity = "RX active"
+                elif tx_active:
+                    activity = "TX active"
                 else:
                     activity = "ready"
             pps = tlm.get("pps_count", "?")
@@ -3062,7 +3062,7 @@ class MEPGui:
         st_f = ttk.LabelFrame(frame, text="Current Status")
         st_f.grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
         st_f.columnconfigure(1, weight=1)
-        for key in ("soc_state", "soc_state_ADC", "soc_state_DAC"):
+        for key in ("soc_state", "soc_state_RX", "soc_state_TX"):
             self._vars[key] = tk.StringVar(value="—")
         state_row = ttk.Frame(st_f)
         state_row.grid(row=0, column=0, columnspan=3, sticky="ew", padx=5, pady=2)
@@ -3070,8 +3070,8 @@ class MEPGui:
             state_row.columnconfigure(column * 2 + 1, weight=1)
         for column, (label, key) in enumerate((
             ("State", "soc_state"),
-            ("State_ADC", "soc_state_ADC"),
-            ("State_DAC", "soc_state_DAC"),
+            ("State_RX", "soc_state_RX"),
+            ("State_TX", "soc_state_TX"),
         )):
             ttk.Label(state_row, text=label).grid(
                 row=0, column=column * 2, sticky="w", padx=(0, 4)
@@ -5234,8 +5234,8 @@ class MEPGui:
         if "soc_state" not in self._vars:
             return  # SOC tab not yet built; skip until user opens it
         self._vars["soc_state"].set(tlm.get("state", "—"))
-        self._vars["soc_state_ADC"].set(tlm.get("state_ADC", "—"))
-        self._vars["soc_state_DAC"].set(tlm.get("state_DAC", "—"))
+        self._vars["soc_state_RX"].set(tlm.get("state_RX", "—"))
+        self._vars["soc_state_TX"].set(tlm.get("state_TX", "—"))
         f_c_hz = self._safe_float(tlm.get("f_c_hz"), 0.0)
         f_if_hz = self._safe_float(tlm.get("f_if_hz"), 0.0)
         f_s_hz = self._safe_float(tlm.get("f_s"), 0.0)
