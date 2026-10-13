@@ -1,17 +1,19 @@
 # Jetson Orin NX Bootloader Recovery Guide
-## Target: JetPack 6.0 / L4T R36.3.0 on Ubuntu 24.04 (Noble) host
+## Target: JetPack 6.0 / L4T R36.3.0 : Ubuntu 24.04 (Noble) or Ubuntu 26.04 (Resolute) host
+
+**Host compatibility:** NVIDIA lists Ubuntu x64 20.04 and 22.04 as officially supported flashing hosts for L4T R36.3. This guide covers Ubuntu 24.04 and 26.04. [NVIDIA release notes](https://docs.nvidia.com/jetson/archives/r36.3/ReleaseNotes/Jetson_Linux_Release_Notes_r36.3.pdf).
 
 ---
 
 ## 0. Prerequisites
 - USB-C to USB-A cable
-- [Host PC] with Ubuntu 24.04 (Noble) OS
+- [Host PC] with x86_64 Ubuntu 24.04 (Noble) or Ubuntu 26.04 (Resolute) OS
 - [MEP] with Jetson Orin NX (The OS SSD does *NOT* need to be plugged in at all)
 
 ---
 
 ## 1. Physical Setup
-1. Plug USB-C into MEP Jetson (while powered off) -> USB-A into any x86_64 Ubuntu host. Ubuntu 24.04 (Noble) is known to work.
+1. Plug USB-C into MEP Jetson (while powered off) -> USB-A into any x86_64 Ubuntu host.
 2. Put Jetson into recovery mode, by shorting out the leads on the 'recovery' 2-pin port, then power on the Jetson
 
 On the host, confirm Jetson is visible in recovery mode:
@@ -23,10 +25,38 @@ lsusb | grep -i nvidia
 
 ## 2. (On the Host PC) Install dependencies
 
+### 2.1 Install dependencies for your Ubuntu version
+
+**Choose one of the following commands based on your host OS.** Run 2.1A **or** 2.1B, not both.
+
+#### 2.1A If using Ubuntu 24.04 (Noble)
+
 ```bash
 sudo apt update
 sudo apt install -y qemu-user-static binfmt-support nfs-kernel-server sshpass abootimg
 ```
+
+#### 2.1B If using Ubuntu 26.04 (Resolute)
+
+Ubuntu 26.04 uses different QEMU packages and adds `libxml2-utils` for `xmllint`.
+
+```bash
+sudo apt update
+sudo apt install -y qemu-user qemu-user-binfmt binfmt-support libxml2-utils \
+  nfs-kernel-server sshpass abootimg
+```
+
+### 2.2 Ubuntu 26.04 (Resolute) only: QEMU compatibility
+
+**Skip this step on Ubuntu 24.04.** If `/usr/bin/qemu-aarch64-static` is missing, provide the executable name expected by the NVIDIA scripts:
+
+```bash
+if [ ! -e /usr/bin/qemu-aarch64-static ]; then
+  sudo ln -s /usr/bin/qemu-aarch64 /usr/bin/qemu-aarch64-static
+fi
+```
+
+*Why:* Ubuntu 26.04 uses newer QEMU packaging; the symlink accommodates NVIDIA scripts that look for the older executable name.
 
 ---
 
@@ -40,7 +70,7 @@ sudo sh -c 'echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb'
 
 ## 4. (On the Host PC) Fix USB network interface naming
 
-Ubuntu 24.04 renames the Jetson's USB network interface away from `usb0`. This rule forces it to stay as `usb0` for NVIDIA devices only:
+Ubuntu hosts may rename the Jetson's USB network interface away from `usb0`. This rule forces it to stay as `usb0` for NVIDIA devices only:
 
 ```bash
 echo 'SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="0955", NAME="usb0"' | sudo tee /etc/udev/rules.d/72-nvidia-usb.rules
@@ -81,6 +111,23 @@ Note: the root filesystem tarball is ~1.7GB. It is needed to build the ramdisk e
 
 ## 7. (On the Host PC) Apply binaries
 
+### 7.1 Ubuntu 26.04 (Resolute) only: OpenSSH compatibility
+
+**Skip this subsection on Ubuntu 24.04.** OpenSSH 10.0 removed DSA signature support in April 2025, so an older NVIDIA recovery-image script may fail if it tries to generate a DSA host key. [OpenSSH release notes](https://www.openssh.org/releasenotes.html).
+
+```bash
+cd ~/Downloads/Linux_for_Tegra
+sudo nano tools/ota_tools/version_upgrade/ota_make_recovery_img_dtb.sh
+```
+
+Comment out the line with `dsa`, which should look like:
+
+```bash
+# ssh-keygen -t dsa -N "" -f "${_initrd_dir}/${ssh_config_dir}/ssh_host_dsa_key" >/dev/null 2>&1;check_error
+```
+
+### 7.2 Apply binaries (both Ubuntu versions)
+
 Remove conflicting device files first to prevent the script from failing silently:
 
 ```bash
@@ -112,9 +159,9 @@ The script will:
 3. SSH into it and flash the QSPI bootloader partitions
 4. Reboot the Jetson
 
-You will see repeated `Waiting for target to boot-up...` and `Waiting for device to expose ssh...` messages for several minutes — this is normal. Do not interrupt it.
+You will see repeated `Waiting for target to boot-up...` and `Waiting for device to expose ssh...` messages for several minutes : this is normal. Do not interrupt it.
 
-Once SSH connects, it will flash eMMC then QSPI. It may appear stuck at `Starting to flash to qspi` for several minutes — this is also normal. Do not interrupt it.
+Once SSH connects, it will flash eMMC then QSPI. It may appear stuck at `Starting to flash to qspi` for several minutes : this is also normal. Do not interrupt it.
 
 When complete you will see:
 ```text
@@ -122,7 +169,6 @@ Flash is successful
 Reboot device
 ```
 
----
 
 ## 9. Optional: (On the Host PC) Remove the temporary UFW rule
 
@@ -137,6 +183,6 @@ sudo ufw delete <rule-number>
 
 ## Notes
 - The board config `jetson-orin-nano-devkit` is correct for both Orin NX and Orin Nano
-- The Jetson does **not** need to boot for this to work — recovery mode bypasses the bootloader entirely
-- `l4t_initrd_flash.sh` is the official NVIDIA method for Orin NX — `flash.sh` does not work reliably for this board
-- The BSP downloads may require an NVIDIA developer account — if curl returns an HTML page instead of the tarball, log in at developer.nvidia.com and download manually
+- The Jetson does **not** need to boot for this to work : recovery mode bypasses the bootloader entirely
+- `l4t_initrd_flash.sh` is the official NVIDIA method for Orin NX : `flash.sh` does not work reliably for this board
+- The BSP downloads may require an NVIDIA developer account : if curl returns an HTML page instead of the tarball, log in at developer.nvidia.com and download manually
